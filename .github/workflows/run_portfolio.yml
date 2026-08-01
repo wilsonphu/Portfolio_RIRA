@@ -2,19 +2,18 @@ name: Daily Portfolio 12 Execution
 
 on:
   schedule:
-    # Runs at 21:15 UTC every Monday-Friday (which is 4:15 PM EST or 5:15 PM EDT)
     - cron: '15 21 * * 1-5'
-  workflow_dispatch: # Allows you to manually click a "Run" button to test it
+  workflow_dispatch: 
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4  # <-- Updated to v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5 # <-- Updated to v5
         with:
           python-version: '3.11'
 
@@ -29,4 +28,4 @@ jobs:
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
         run: |
-          python port12_cloud.py
+          python port12_cloud.py 
