@@ -20,7 +20,7 @@ BULL_ALLOCATION = {"TQQQ": 33.3, "QLD": 66.7}
 BEAR_ALLOCATION = {"SGOV": 40.0, "TLT": 40.0, "GLD": 20.0}
 
 # Alerts if QQQ drops 3% or more in a single day
-CRASH_ALERT_THRESHOLD = 100  
+CRASH_ALERT_THRESHOLD = -3.0 
 
 # ====================================================================
 # 2. EMAIL PROTOCOL
