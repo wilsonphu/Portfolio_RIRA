@@ -1,5 +1,5 @@
-import yfinance as yf
 import pandas as pd
+import yfinance as yf
 import smtplib
 import os
 from email.message import EmailMessage
@@ -15,9 +15,12 @@ SENDER_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
 RECEIVER_EMAIL = os.environ.get("RECEIVER_EMAIL")
 
 # Portfolio Allocations
+# Bull: 2.33x Synthetic Leverage | Bear: Uncorrelated Defense
 BULL_ALLOCATION = {"TQQQ": 33.3, "QLD": 66.7}
-BEAR_ALLOCATION = {"SMH": 30.0, "AVUV": 30.0, "GLD": 10.0, "SGOV": 30.0}
-CRASH_ALERT_THRESHOLD = -3.0
+BEAR_ALLOCATION = {"SGOV": 40.0, "TLT": 40.0, "GLD": 20.0}
+
+# Alerts if QQQ drops 3% or more in a single day
+CRASH_ALERT_THRESHOLD = -3.0  
 
 # ====================================================================
 # 2. EMAIL PROTOCOL
@@ -49,6 +52,8 @@ def send_institutional_alert(subject, body):
 
 def run_portfolio():
     print("[*] Initializing Port12 Cloud Engine...")
+    
+    # Download 2 years of QQQ data to ensure accurate EMA calculation
     data = yf.download("QQQ", period="2y", auto_adjust=True, progress=False)
     
     if isinstance(data.columns, pd.MultiIndex):
@@ -56,15 +61,17 @@ def run_portfolio():
     else:
         close = data["Close"].ffill().dropna()
 
-    sma200 = close.rolling(200).mean()
-    upper_band = sma200 * 1.03  
-    lower_band = sma200 * 0.97  
+    # Calculate 200-day Exponential Moving Average (faster than SMA)
+    ema200 = close.ewm(span=200, adjust=False).mean()
+    
+    # 2% Hysteresis Bands (prevents whipsaw)
+    upper_band = ema200 * 1.02  
+    lower_band = ema200 * 0.98  
 
     # Stateless Regime Calculator
     def get_regime_at_index(target_index):
-        regime = 1  
+        regime = 1  # Default to Bull
         for i in range(200, target_index + 1):
-            # Use .item() to safely extract the raw float from the Pandas Series
             price = close.iloc[i].item()
             if price > upper_band.iloc[i].item():
                 regime = 1
@@ -77,32 +84,32 @@ def run_portfolio():
 
     latest_date = close.index[-1].strftime("%Y-%m-%d")
     
-    # Use .item() here as well for safety
     latest_price = close.iloc[-1].item()
     yesterday_price = close.iloc[-2].item()
-    latest_sma = sma200.iloc[-1].item()
+    latest_ema = ema200.iloc[-1].item()
     
     daily_pct_change = ((latest_price / yesterday_price) - 1) * 100
-    distance_to_sma = ((latest_price / latest_sma) - 1) * 100
+    distance_to_ema = ((latest_price / latest_ema) - 1) * 100
 
     if current_regime == 1:
         regime_title = "BULL MARKET (Risk-On)"
         leverage_ratio = "2.33x Synthetic Leverage"
         target_dict = BULL_ALLOCATION
         instructions = (
-            "  1. LIQUIDATE all defensive assets to 0%.\n"
+            "  1. LIQUIDATE all defensive assets (SGOV, TLT, GLD) to 0%.\n"
             f"  2. ALLOCATE precisely: {BULL_ALLOCATION['TQQQ']}% TQQQ and {BULL_ALLOCATION['QLD']}% QLD."
         )
     else:
         regime_title = "BEAR MARKET (Risk-Off)"
-        leverage_ratio = "Defensive / De-leveraged"
+        leverage_ratio = "Defensive / Uncorrelated"
         target_dict = BEAR_ALLOCATION
         instructions = (
             "  1. LIQUIDATE all Nasdaq leverage (TQQQ, QLD) to 0%.\n"
-            f"  2. ALLOCATE precisely: {BEAR_ALLOCATION['SMH']}% SMH, {BEAR_ALLOCATION['AVUV']}% AVUV, "
-            f"{BEAR_ALLOCATION['GLD']}% GLD, {BEAR_ALLOCATION['SGOV']}% SGOV."
+            f"  2. ALLOCATE precisely: {BEAR_ALLOCATION['SGOV']}% SGOV, {BEAR_ALLOCATION['TLT']}% TLT, "
+            f"{BEAR_ALLOCATION['GLD']}% GLD."
         )
 
+    # Event Triggers
     is_regime_flip = current_regime != yesterday_regime
     is_new_month = close.index[-1].month != close.index[-2].month
     is_crash_event = daily_pct_change <= CRASH_ALERT_THRESHOLD
@@ -131,8 +138,8 @@ def run_portfolio():
  MARKET DATA (Nasdaq-100 / QQQ)
 ---------------------------------------------------------
  Closing Price:       ${latest_price:.2f} ({daily_pct_change:+.2f}%)
- 200-Day SMA:         ${latest_sma:.2f}
- Distance to Trend:   {distance_to_sma:+.2f}%
+ 200-Day EMA:         ${latest_ema:.2f}
+ Distance to Trend:   {distance_to_ema:+.2f}%
 
  PORTFOLIO POSTURE
 ---------------------------------------------------------
@@ -151,6 +158,7 @@ def run_portfolio():
 
     print(report)
 
+    # Dispatch email if any alerts trigger
     if event_flags:
         subject_line = "PORTFOLIO 12: Action Required" if (is_regime_flip or is_new_month) else "PORTFOLIO 12: Volatility Alert"
         send_institutional_alert(subject_line, report)
