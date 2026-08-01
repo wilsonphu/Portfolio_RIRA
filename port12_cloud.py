@@ -64,10 +64,11 @@ def run_portfolio():
     def get_regime_at_index(target_index):
         regime = 1  
         for i in range(200, target_index + 1):
-            price = float(close.iloc[i])
-            if price > float(upper_band.iloc[i]):
+            # Use .item() to safely extract the raw float from the Pandas Series
+            price = close.iloc[i].item()
+            if price > upper_band.iloc[i].item():
                 regime = 1
-            elif price < float(lower_band.iloc[i]):
+            elif price < lower_band.iloc[i].item():
                 regime = 0
         return regime
 
@@ -75,9 +76,11 @@ def run_portfolio():
     current_regime = get_regime_at_index(len(close) - 1)
 
     latest_date = close.index[-1].strftime("%Y-%m-%d")
-    latest_price = float(close.iloc[-1])
-    yesterday_price = float(close.iloc[-2])
-    latest_sma = float(sma200.iloc[-1])
+    
+    # Use .item() here as well for safety
+    latest_price = close.iloc[-1].item()
+    yesterday_price = close.iloc[-2].item()
+    latest_sma = sma200.iloc[-1].item()
     
     daily_pct_change = ((latest_price / yesterday_price) - 1) * 100
     distance_to_sma = ((latest_price / latest_sma) - 1) * 100
