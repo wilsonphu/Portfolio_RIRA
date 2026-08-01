@@ -1,0 +1,32 @@
+name: Daily Portfolio 12 Execution
+
+on:
+  schedule:
+    # Runs at 21:15 UTC every Monday-Friday (which is 4:15 PM EST or 5:15 PM EDT)
+    - cron: '15 21 * * 1-5'
+  workflow_dispatch: # Allows you to manually click a "Run" button to test it
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Quant Engine
+        env:
+          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
+        run: |
+          python port12_cloud.py
