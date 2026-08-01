@@ -17,7 +17,7 @@ RECEIVER_EMAIL = os.environ.get("RECEIVER_EMAIL")
 # Portfolio Allocations
 BULL_ALLOCATION = {"TQQQ": 33.3, "QLD": 66.7}
 BEAR_ALLOCATION = {"SMH": 30.0, "AVUV": 30.0, "GLD": 10.0, "SGOV": 30.0}
-CRASH_ALERT_THRESHOLD = -3.0  
+CRASH_ALERT_THRESHOLD = -3.0
 
 # ====================================================================
 # 2. EMAIL PROTOCOL
