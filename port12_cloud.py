@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 import yfinance as yf
 import smtplib
 import os
@@ -20,7 +21,7 @@ BULL_ALLOCATION = {"TQQQ": 33.3, "QLD": 66.7}
 BEAR_ALLOCATION = {"SGOV": 40.0, "TLT": 40.0, "GLD": 20.0}
 
 # Alerts if QQQ drops 3% or more in a single day
-CRASH_ALERT_THRESHOLD = 100 
+CRASH_ALERT_THRESHOLD = -3.0 
 
 # ====================================================================
 # 2. EMAIL PROTOCOL
@@ -53,37 +54,36 @@ def send_institutional_alert(subject, body):
 def run_portfolio():
     print("[*] Initializing Port12 Cloud Engine...")
     
-    # Download 2 years of QQQ data to ensure accurate EMA calculation
-    data = yf.download("QQQ", period="2y", auto_adjust=True, progress=False)
+    # Download 5 years of QQQ data for a highly accurate long-term EMA runway
+    data = yf.download("QQQ", period="5y", auto_adjust=True, progress=False)
     
     if isinstance(data.columns, pd.MultiIndex):
         close = data.xs("Close", axis=1, level=0).ffill().dropna()
     else:
         close = data["Close"].ffill().dropna()
 
-    # Calculate 200-day Exponential Moving Average (faster than SMA)
+    # Calculate 200-day Exponential Moving Average
     ema200 = close.ewm(span=200, adjust=False).mean()
     
-    # 2% Hysteresis Bands (prevents whipsaw)
+    # 2% Hysteresis Bands
     upper_band = ema200 * 1.02  
     lower_band = ema200 * 0.98  
 
-    # Stateless Regime Calculator
-    def calculate_regimes_vectorized(close, upper_band, lower_band):
-        regimes = np.ones(len(close), dtype=int)
-        current_regime = 1
-    
-        for i in range(200, len(close)):
-            price = close.iloc[i].item()
-            if price > upper_band.iloc[i].item():
-                current_regime = 1
-            elif price < lower_band.iloc[i].item():
-                current_regime = 0
-            regimes[i] = current_regime
-        return regimes
+    # Fast Vectorized Regime Calculator
+    regimes = np.ones(len(close), dtype=int)
+    current_regime = 1
 
-    yesterday_regime = get_regime_at_index(len(close) - 2)
-    current_regime = get_regime_at_index(len(close) - 1)
+    for i in range(200, len(close)):
+        price = close.iloc[i].item()
+        if price > upper_band.iloc[i].item():
+            current_regime = 1
+        elif price < lower_band.iloc[i].item():
+            current_regime = 0
+        regimes[i] = current_regime
+
+    # Extract the final two days from the array
+    yesterday_regime = regimes[-2]
+    current_regime = regimes[-1]
 
     latest_date = close.index[-1].strftime("%Y-%m-%d")
     
