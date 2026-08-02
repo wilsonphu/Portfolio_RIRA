@@ -18,7 +18,7 @@ RECEIVER_EMAIL = os.environ.get("RECEIVER_EMAIL")
 # Portfolio Allocations
 # Bull: 2.33x Synthetic Leverage | Bear: Uncorrelated Defense
 BULL_ALLOCATION = {"TQQQ": 33.3, "QLD": 66.7}
-BEAR_ALLOCATION = {"SGOV": 40.0, "TLT": 40.0, "GLD": 20.0}
+BEAR_ALLOCATION = {"SGOV": 70.0, "GLD": 30.0}
 
 # Alerts if QQQ drops 3% or more in a single day
 CRASH_ALERT_THRESHOLD = -3.0 
@@ -124,7 +124,7 @@ def run_portfolio():
         leverage_ratio = "2.33x Synthetic Leverage"
         target_dict = BULL_ALLOCATION
         instructions = (
-            "  1. LIQUIDATE all defensive assets (SGOV, TLT, GLD) to 0%.\n"
+            "  1. LIQUIDATE all defensive assets (SGOV, GLD) to 0%.\n"
             f"  2. ALLOCATE precisely: {BULL_ALLOCATION['TQQQ']}% TQQQ and {BULL_ALLOCATION['QLD']}% QLD."
         )
     else:
@@ -133,8 +133,7 @@ def run_portfolio():
         target_dict = BEAR_ALLOCATION
         instructions = (
             "  1. LIQUIDATE all Nasdaq leverage (TQQQ, QLD) to 0%.\n"
-            f"  2. ALLOCATE precisely: {BEAR_ALLOCATION['SGOV']}% SGOV, {BEAR_ALLOCATION['TLT']}% TLT, "
-            f"{BEAR_ALLOCATION['GLD']}% GLD."
+            f"  2. ALLOCATE precisely: {BEAR_ALLOCATION['SGOV']}% SGOV, {BEAR_ALLOCATION['GLD']}% GLD."
         )
 
     # Event Triggers
