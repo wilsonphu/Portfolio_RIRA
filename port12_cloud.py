@@ -145,7 +145,7 @@ def run_portfolio() -> None:
 
     if current_regime == 1:
         regime_title = "BULL MARKET (Risk-On)"
-        leverage_ratio = "2.33x Synthetic Leverage"
+        leverage_ratio = "1.8x Momentum"
         target_dict = BULL_ALLOCATION
         bull_alloc_str = ", ".join(
             [f"{val}% {key}" for key, val in BULL_ALLOCATION.items()]
