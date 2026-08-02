@@ -61,8 +61,8 @@ def calculate_regimes(
     Calculates raw trend signals (with ±2% hysteresis bands) and applies
     the 5-day confirmation rule for regime switches.
     """
-    upper_band = ema200 * 1.02
-    lower_band = ema200 * 0.98
+    upper_band = ema200 * 1.04
+    lower_band = ema200 * 0.96
 
     n = len(close)
     raw_signals = np.ones(n, dtype=int)
