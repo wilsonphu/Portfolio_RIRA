@@ -19,6 +19,7 @@ BULL_ALLOCATION = {"TQQQ": 33.3, "QLD": 66.7}
 BEAR_ALLOCATION = {"SGOV": 70.0, "GLD": 30.0}
 
 CRASH_ALERT_THRESHOLD = -3.0 
+VIX_PANIC_THRESHOLD = 30.0 # VIX level that triggers an immediate risk-off override
 
 # ====================================================================
 # 2. EMAIL PROTOCOL
@@ -45,35 +46,42 @@ def send_institutional_alert(subject, body):
         print(f"\n[✘] Failed to dispatch Email. System Error: {e}")
 
 # ====================================================================
-# 3. STATELESS QUANTITATIVE ENGINE (5-DAY RULE)
+# 3. MULTI-FACTOR QUANTITATIVE ENGINE (EMA + VIX)
 # ====================================================================
 
 def run_portfolio():
-    print("[*] Initializing Port12 Cloud Engine (5-Day Rule)...")
+    print("[*] Initializing Port12 Cloud Engine (Multi-Factor EMA + VIX)...")
     
-    data = yf.download("QQQ", period="5y", auto_adjust=True, progress=False)
+    # Download QQQ and VIX data
+    tickers = ["QQQ", "^VIX"]
+    data = yf.download(tickers, period="5y", auto_adjust=True, progress=False)
     
     if isinstance(data.columns, pd.MultiIndex):
         close = data.xs("Close", axis=1, level=0).ffill().dropna()
     else:
         close = data["Close"].ffill().dropna()
 
-    ema200 = close.ewm(span=200, adjust=False).mean()
+    qqq = close['QQQ']
+    vix = close['^VIX']
+
+    # Factor 1: Long-Term Trend (200-Day EMA)
+    ema200 = qqq.ewm(span=200, adjust=False).mean()
     upper_band = ema200 * 1.02  
     lower_band = ema200 * 0.98  
 
-    raw_signals = np.ones(len(close), dtype=int)
+    raw_signals = np.ones(len(qqq), dtype=int)
     current_raw = 1
 
-    for i in range(200, len(close)):
-        price = close.iloc[i].item()
+    for i in range(200, len(qqq)):
+        price = qqq.iloc[i].item()
         if price > upper_band.iloc[i].item():
             current_raw = 1
         elif price < lower_band.iloc[i].item():
             current_raw = 0
         raw_signals[i] = current_raw
 
-    confirmed_regimes = np.ones(len(close), dtype=int)
+    # Apply 5-Day Confirmation to the EMA Trend
+    confirmed_ema = np.ones(len(qqq), dtype=int)
     current_regime = 1
     days_in_new_state = 0
 
@@ -93,14 +101,28 @@ def run_portfolio():
         else:
             days_in_new_state = 0 
             
-        confirmed_regimes[i] = current_regime
+        confirmed_ema[i] = current_regime
 
-    yesterday_regime = confirmed_regimes[-2]
-    current_regime = confirmed_regimes[-1]
+    # Factor 2: Volatility Override
+    # If the VIX spikes above 30, we override the EMA and force a Bear regime immediately to cap drawdowns.
+    final_regimes = np.ones(len(qqq), dtype=int)
+    for i in range(len(qqq)):
+        if confirmed_ema[i] == 1 and vix.iloc[i].item() < VIX_PANIC_THRESHOLD:
+            final_regimes[i] = 1 # Bull
+        else:
+            final_regimes[i] = 0 # Bear (Either EMA broke OR VIX spiked)
 
-    latest_date = close.index[-1].strftime("%Y-%m-%d")
-    latest_price = close.iloc[-1].item()
-    yesterday_price = close.iloc[-2].item()
+    yesterday_regime = final_regimes[-2]
+    current_regime = final_regimes[-1]
+    
+    # Check what specifically triggered the current state
+    latest_vix = vix.iloc[-1].item()
+    is_vix_panic = latest_vix >= VIX_PANIC_THRESHOLD
+    ema_state_str = "BULL" if confirmed_ema[-1] == 1 else "BEAR"
+
+    latest_date = qqq.index[-1].strftime("%Y-%m-%d")
+    latest_price = qqq.iloc[-1].item()
+    yesterday_price = qqq.iloc[-2].item()
     latest_ema = ema200.iloc[-1].item()
     
     daily_pct_change = ((latest_price / yesterday_price) - 1) * 100
@@ -119,7 +141,8 @@ def run_portfolio():
             f"  2. ALLOCATE precisely: {bull_alloc_str}."
         )
     else:
-        regime_title = "BEAR MARKET (Risk-Off)"
+        reason = "(Volatility Panic)" if is_vix_panic else "(Trend Failure)"
+        regime_title = f"BEAR MARKET {reason} (Risk-Off)"
         leverage_ratio = "Defensive / Uncorrelated"
         target_dict = BEAR_ALLOCATION
         bear_alloc_str = ", ".join([f"{val}% {key}" for key, val in BEAR_ALLOCATION.items()])
@@ -129,20 +152,21 @@ def run_portfolio():
         )
 
     is_regime_flip = current_regime != yesterday_regime
-    is_new_month = close.index[-1].month != close.index[-2].month
+    is_new_month = qqq.index[-1].month != qqq.index[-2].month
     is_crash_event = daily_pct_change <= CRASH_ALERT_THRESHOLD
 
     event_flags = []
     if is_regime_flip: event_flags.append("[!] MACRO TREND SHIFT DETECTED")
     if is_new_month: event_flags.append("[!] MONTHLY REBALANCE REQUIRED")
     if is_crash_event: event_flags.append("[!] HIGH VOLATILITY EVENT LOGGED")
+    if is_vix_panic: event_flags.append("[!] VIX OVERRIDE ACTIVE: Extreme market fear detected.")
     
-    if days_in_new_state > 0:
+    if days_in_new_state > 0 and not is_vix_panic:
         event_flags.append(f"[*] WHIPSAW FILTER: Raw trend broke {days_in_new_state} day(s) ago. Awaiting 5-day confirmation.")
 
     report = f"""
 =========================================================
- PORTFOLIO 12: CLOUD SYSTEM ALLOCATION REPORT
+ PORTFOLIO 12: MULTI-FACTOR CLOUD ENGINE
 =========================================================
  Date Generated:      {latest_date}
  Run Time (UTC):      {datetime.now().strftime("%H:%M:%S")}
@@ -159,8 +183,9 @@ def run_portfolio():
  MARKET DATA (Nasdaq-100 / QQQ)
 ---------------------------------------------------------
  Closing Price:       ${latest_price:.2f} ({daily_pct_change:+.2f}%)
- 200-Day EMA:         ${latest_ema:.2f}
+ 200-Day EMA:         ${latest_ema:.2f} (Status: {ema_state_str})
  Distance to Trend:   {distance_to_ema:+.2f}%
+ CBOE VIX Index:      {latest_vix:.2f}
 
  PORTFOLIO POSTURE
 ---------------------------------------------------------
@@ -179,9 +204,4 @@ def run_portfolio():
 
     print(report)
 
-    if is_regime_flip or is_new_month or is_crash_event:
-        subject_line = "PORTFOLIO 12: Action Required" if (is_regime_flip or is_new_month) else "PORTFOLIO 12: Volatility Alert"
-        send_institutional_alert(subject_line, report)
-
-if __name__ == "__main__":
-    run_portfolio()
+    if is_regime_flip or 
