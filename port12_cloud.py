@@ -69,15 +69,18 @@ def run_portfolio():
     lower_band = ema200 * 0.98  
 
     # Stateless Regime Calculator
-    def get_regime_at_index(target_index):
-        regime = 1  # Default to Bull
-        for i in range(200, target_index + 1):
+    def calculate_regimes_vectorized(close, upper_band, lower_band):
+        regimes = np.ones(len(close), dtype=int)
+        current_regime = 1
+    
+        for i in range(200, len(close)):
             price = close.iloc[i].item()
             if price > upper_band.iloc[i].item():
-                regime = 1
+                current_regime = 1
             elif price < lower_band.iloc[i].item():
-                regime = 0
-        return regime
+                current_regime = 0
+            regimes[i] = current_regime
+        return regimes
 
     yesterday_regime = get_regime_at_index(len(close) - 2)
     current_regime = get_regime_at_index(len(close) - 1)
