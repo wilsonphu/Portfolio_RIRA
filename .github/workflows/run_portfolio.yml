@@ -39,6 +39,6 @@ jobs:
       - name: Keepalive Workflow
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
         run: |
-          gh workflow enable "Daily Portfolio 12 Execution"
+          # Use the exact current workflow filename/ID dynamically
+          gh workflow enable "${{ github.workflow }}" || gh workflow enable "main.yml"
