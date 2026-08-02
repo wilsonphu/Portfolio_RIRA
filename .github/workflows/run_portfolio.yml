@@ -10,10 +10,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5  # <-- Changed to v5
+        uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v6 # <-- Changed to v6
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
@@ -28,4 +28,13 @@ jobs:
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
         run: |
-          python port12_cloud.py 
+          python port12_cloud.py
+
+  keepalive-job:
+    name: Keep GitHub Actions Alive
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: gautamkrishnar/keepalive-workflow@v1
