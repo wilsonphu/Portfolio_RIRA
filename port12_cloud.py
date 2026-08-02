@@ -48,11 +48,11 @@ def send_institutional_alert(subject, body):
         print(f"\n[✘] Failed to dispatch Email. System Error: {e}")
 
 # ====================================================================
-# 3. STATELESS QUANTITATIVE ENGINE
+# 3. STATELESS QUANTITATIVE ENGINE (5-DAY RULE)
 # ====================================================================
 
 def run_portfolio():
-    print("[*] Initializing Port12 Cloud Engine...")
+    print("[*] Initializing Port12 Cloud Engine (5-Day Rule)...")
     
     # Download 5 years of QQQ data for a highly accurate long-term EMA runway
     data = yf.download("QQQ", period="5y", auto_adjust=True, progress=False)
@@ -69,21 +69,46 @@ def run_portfolio():
     upper_band = ema200 * 1.02  
     lower_band = ema200 * 0.98  
 
-    # Fast Vectorized Regime Calculator
-    regimes = np.ones(len(close), dtype=int)
-    current_regime = 1
+    # Step 1: Calculate Raw Instant Signals
+    raw_signals = np.ones(len(close), dtype=int)
+    current_raw = 1
 
     for i in range(200, len(close)):
         price = close.iloc[i].item()
         if price > upper_band.iloc[i].item():
-            current_regime = 1
+            current_raw = 1
         elif price < lower_band.iloc[i].item():
-            current_regime = 0
-        regimes[i] = current_regime
+            current_raw = 0
+        raw_signals[i] = current_raw
 
-    # Extract the final two days from the array
-    yesterday_regime = regimes[-2]
-    current_regime = regimes[-1]
+    # Step 2: Apply the 5-Day Confirmation Filter
+    confirmed_regimes = np.ones(len(close), dtype=int)
+    current_regime = 1
+    days_in_new_state = 0
+
+    for i in range(1, len(raw_signals)):
+        prev_raw = raw_signals[i-1]
+        curr_raw = raw_signals[i]
+        
+        # If the raw signal disagrees with our confirmed portfolio regime
+        if curr_raw != current_regime:
+            if curr_raw == prev_raw:
+                days_in_new_state += 1
+            else:
+                days_in_new_state = 1
+                
+            # If the raw signal holds the new direction for 5 consecutive days, confirm the flip
+            if days_in_new_state >= 5:
+                current_regime = curr_raw
+                days_in_new_state = 0
+        else:
+            days_in_new_state = 0 # Reset counter if it returns to normal
+            
+        confirmed_regimes[i] = current_regime
+
+    # Extract the final two days from the confirmed array
+    yesterday_regime = confirmed_regimes[-2]
+    current_regime = confirmed_regimes[-1]
 
     latest_date = close.index[-1].strftime("%Y-%m-%d")
     
@@ -121,6 +146,10 @@ def run_portfolio():
     if is_regime_flip: event_flags.append("[!] MACRO TREND SHIFT DETECTED")
     if is_new_month: event_flags.append("[!] MONTHLY REBALANCE REQUIRED")
     if is_crash_event: event_flags.append("[!] HIGH VOLATILITY EVENT LOGGED")
+    
+    # Add a quiet warning if we are currently counting days toward a flip
+    if days_in_new_state > 0:
+        event_flags.append(f"[*] WHIPSAW FILTER: Raw trend broke {days_in_new_state} day(s) ago. Awaiting 5-day confirmation.")
 
     report = f"""
 =========================================================
@@ -162,7 +191,7 @@ def run_portfolio():
     print(report)
 
     # Dispatch email if any alerts trigger
-    if event_flags:
+    if is_regime_flip or is_new_month or is_crash_event:
         subject_line = "PORTFOLIO 12: Action Required" if (is_regime_flip or is_new_month) else "PORTFOLIO 12: Volatility Alert"
         send_institutional_alert(subject_line, report)
 
