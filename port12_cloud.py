@@ -10,17 +10,14 @@ from datetime import datetime
 # 1. CLOUD CONFIGURATION & SECRETS
 # ====================================================================
 
-# Pulls secure credentials from GitHub Actions secrets
 SENDER_EMAIL = os.environ.get("GMAIL_ADDRESS")
 SENDER_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
 RECEIVER_EMAIL = os.environ.get("RECEIVER_EMAIL")
 
 # Portfolio Allocations
-# Bull: 2.33x Synthetic Leverage | Bear: Uncorrelated Defense
 BULL_ALLOCATION = {"TQQQ": 33.3, "QLD": 66.7}
 BEAR_ALLOCATION = {"SGOV": 70.0, "GLD": 30.0}
 
-# Alerts if QQQ drops 3% or more in a single day
 CRASH_ALERT_THRESHOLD = -3.0 
 
 # ====================================================================
@@ -54,7 +51,6 @@ def send_institutional_alert(subject, body):
 def run_portfolio():
     print("[*] Initializing Port12 Cloud Engine (5-Day Rule)...")
     
-    # Download 5 years of QQQ data for a highly accurate long-term EMA runway
     data = yf.download("QQQ", period="5y", auto_adjust=True, progress=False)
     
     if isinstance(data.columns, pd.MultiIndex):
@@ -62,14 +58,10 @@ def run_portfolio():
     else:
         close = data["Close"].ffill().dropna()
 
-    # Calculate 200-day Exponential Moving Average
     ema200 = close.ewm(span=200, adjust=False).mean()
-    
-    # 2% Hysteresis Bands
     upper_band = ema200 * 1.02  
     lower_band = ema200 * 0.98  
 
-    # Step 1: Calculate Raw Instant Signals
     raw_signals = np.ones(len(close), dtype=int)
     current_raw = 1
 
@@ -81,7 +73,6 @@ def run_portfolio():
             current_raw = 0
         raw_signals[i] = current_raw
 
-    # Step 2: Apply the 5-Day Confirmation Filter
     confirmed_regimes = np.ones(len(close), dtype=int)
     current_regime = 1
     days_in_new_state = 0
@@ -90,28 +81,24 @@ def run_portfolio():
         prev_raw = raw_signals[i-1]
         curr_raw = raw_signals[i]
         
-        # If the raw signal disagrees with our confirmed portfolio regime
         if curr_raw != current_regime:
             if curr_raw == prev_raw:
                 days_in_new_state += 1
             else:
                 days_in_new_state = 1
                 
-            # If the raw signal holds the new direction for 5 consecutive days, confirm the flip
             if days_in_new_state >= 5:
                 current_regime = curr_raw
                 days_in_new_state = 0
         else:
-            days_in_new_state = 0 # Reset counter if it returns to normal
+            days_in_new_state = 0 
             
         confirmed_regimes[i] = current_regime
 
-    # Extract the final two days from the confirmed array
     yesterday_regime = confirmed_regimes[-2]
     current_regime = confirmed_regimes[-1]
 
     latest_date = close.index[-1].strftime("%Y-%m-%d")
-    
     latest_price = close.iloc[-1].item()
     yesterday_price = close.iloc[-2].item()
     latest_ema = ema200.iloc[-1].item()
@@ -119,24 +106,28 @@ def run_portfolio():
     daily_pct_change = ((latest_price / yesterday_price) - 1) * 100
     distance_to_ema = ((latest_price / latest_ema) - 1) * 100
 
+    bull_assets = ", ".join(BULL_ALLOCATION.keys())
+    bear_assets = ", ".join(BEAR_ALLOCATION.keys())
+
     if current_regime == 1:
         regime_title = "BULL MARKET (Risk-On)"
         leverage_ratio = "2.33x Synthetic Leverage"
         target_dict = BULL_ALLOCATION
+        bull_alloc_str = ", ".join([f"{val}% {key}" for key, val in BULL_ALLOCATION.items()])
         instructions = (
-            "  1. LIQUIDATE all defensive assets (SGOV, GLD) to 0%.\n"
-            f"  2. ALLOCATE precisely: {BULL_ALLOCATION['TQQQ']}% TQQQ and {BULL_ALLOCATION['QLD']}% QLD."
+            f"  1. LIQUIDATE all defensive assets ({bear_assets}) to 0%.\n"
+            f"  2. ALLOCATE precisely: {bull_alloc_str}."
         )
     else:
         regime_title = "BEAR MARKET (Risk-Off)"
         leverage_ratio = "Defensive / Uncorrelated"
         target_dict = BEAR_ALLOCATION
+        bear_alloc_str = ", ".join([f"{val}% {key}" for key, val in BEAR_ALLOCATION.items()])
         instructions = (
-            "  1. LIQUIDATE all Nasdaq leverage (TQQQ, QLD) to 0%.\n"
-            f"  2. ALLOCATE precisely: {BEAR_ALLOCATION['SGOV']}% SGOV, {BEAR_ALLOCATION['GLD']}% GLD."
+            f"  1. LIQUIDATE all Nasdaq leverage ({bull_assets}) to 0%.\n"
+            f"  2. ALLOCATE precisely: {bear_alloc_str}."
         )
 
-    # Event Triggers
     is_regime_flip = current_regime != yesterday_regime
     is_new_month = close.index[-1].month != close.index[-2].month
     is_crash_event = daily_pct_change <= CRASH_ALERT_THRESHOLD
@@ -146,7 +137,6 @@ def run_portfolio():
     if is_new_month: event_flags.append("[!] MONTHLY REBALANCE REQUIRED")
     if is_crash_event: event_flags.append("[!] HIGH VOLATILITY EVENT LOGGED")
     
-    # Add a quiet warning if we are currently counting days toward a flip
     if days_in_new_state > 0:
         event_flags.append(f"[*] WHIPSAW FILTER: Raw trend broke {days_in_new_state} day(s) ago. Awaiting 5-day confirmation.")
 
@@ -189,7 +179,6 @@ def run_portfolio():
 
     print(report)
 
-    # Dispatch email if any alerts trigger
     if is_regime_flip or is_new_month or is_crash_event:
         subject_line = "PORTFOLIO 12: Action Required" if (is_regime_flip or is_new_month) else "PORTFOLIO 12: Volatility Alert"
         send_institutional_alert(subject_line, report)
