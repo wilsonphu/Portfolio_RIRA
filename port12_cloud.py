@@ -26,7 +26,6 @@ CRASH_ALERT_THRESHOLD = -5.0
 # 2. EMAIL PROTOCOL
 # ====================================================================
 
-
 def send_institutional_alert(subject: str, body: str) -> None:
     """Dispatches automated summary reports via Gmail SMTP SSL."""
     if not SENDER_EMAIL or not SENDER_APP_PASSWORD or not RECEIVER_EMAIL:
@@ -48,17 +47,15 @@ def send_institutional_alert(subject: str, body: str) -> None:
     except Exception as e:
         print(f"\n[✘] Failed to dispatch Email. System Error: {e}")
 
-
 # ====================================================================
 # 3. QUANTITATIVE HELPERS
 # ====================================================================
-
 
 def calculate_regimes(
     close: pd.Series, ema200: pd.Series
 ) -> Tuple[np.ndarray, np.ndarray, int]:
     """
-    Calculates raw trend signals (with ±2% hysteresis bands) and applies
+    Calculates raw trend signals (with ±4% hysteresis bands) and applies
     the 5-day confirmation rule for regime switches.
     """
     upper_band = ema200 * 1.04
@@ -102,11 +99,9 @@ def calculate_regimes(
 
     return raw_signals, confirmed_regimes, days_in_new_state
 
-
 # ====================================================================
 # 4. STATELESS QUANTITATIVE ENGINE (5-DAY RULE)
 # ====================================================================
-
 
 def run_portfolio() -> None:
     print("[*] Initializing Port12 Cloud Engine (5-Day Rule)...")
@@ -121,7 +116,6 @@ def run_portfolio() -> None:
     else:
         close = data["Close"].ffill().dropna()
 
-    # If yfinance returns a DataFrame with 1 column, convert to Series
     if isinstance(close, pd.DataFrame):
         close = close.iloc[:, 0]
 
@@ -145,7 +139,7 @@ def run_portfolio() -> None:
 
     if current_regime == 1:
         regime_title = "BULL MARKET (Risk-On)"
-        leverage_ratio = "1.8x Momentum"
+        leverage_ratio = "1.8x Blended Tech/Semi Leverage"
         target_dict = BULL_ALLOCATION
         bull_alloc_str = ", ".join(
             [f"{val}% {key}" for key, val in BULL_ALLOCATION.items()]
@@ -156,15 +150,19 @@ def run_portfolio() -> None:
         )
     else:
         regime_title = "BEAR MARKET (Risk-Off)"
-        leverage_ratio = "Defensive / Uncorrelated"
+        leverage_ratio = "S&P 500 Momentum (Defensive)"
         target_dict = BEAR_ALLOCATION
         bear_alloc_str = ", ".join(
             [f"{val}% {key}" for key, val in BEAR_ALLOCATION.items()]
         )
         instructions = (
-            f" 1. LIQUIDATE all Nasdaq leverage ({bull_assets}) to 0%.\n"
+            f" 1. LIQUIDATE all tech leverage ({bull_assets}) to 0%.\n"
             f" 2. ALLOCATE precisely: {bear_alloc_str}."
         )
+
+    # Weekend / Holiday Safeguard
+    # Ensures emails only fire if the latest data is actually from today
+    is_fresh_data = close.index[-1].date() == datetime.now().date()
 
     is_regime_flip = current_regime != yesterday_regime
     is_new_month = close.index[-1].month != close.index[-2].month
@@ -248,14 +246,17 @@ def run_portfolio() -> None:
     report = "\n".join(report_lines)
     print(report)
 
-    if is_regime_flip or is_new_month or is_crash_event:
-        subject_line = (
-            "PORTFOLIO 12: Action Required"
-            if (is_regime_flip or is_new_month)
-            else "PORTFOLIO 12: Volatility Alert"
-        )
-        send_institutional_alert(subject_line, report)
-
+    # Only send the email if conditions are met AND the data is fresh
+    if (is_regime_flip or is_new_month or is_crash_event):
+        if is_fresh_data:
+            subject_line = (
+                "PORTFOLIO 12: Action Required"
+                if (is_regime_flip or is_new_month)
+                else "PORTFOLIO 12: Volatility Alert"
+            )
+            send_institutional_alert(subject_line, report)
+        else:
+            print("\n[!] Event flagged, but data is stale (likely a weekend). Email suppressed.")
 
 if __name__ == "__main__":
     run_portfolio()
