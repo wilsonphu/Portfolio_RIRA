@@ -34,12 +34,20 @@ jobs:
     name: Keep GitHub Actions Alive
     runs-on: ubuntu-latest
     permissions:
-      actions: write
+      contents: write # Needed to push a commit
     steps:
-      - name: Keepalive Workflow
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        
+      - name: Keepalive Commit
         run: |
-          # explicitly pass the repo flag so it doesn't look for a local .git folder
-          gh workflow enable "${{ github.workflow }}" --repo wilsonphu/Portfolio_RIRA || \
-          gh workflow enable "main.yml" --repo wilsonphu/Portfolio_RIRA
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          
+          # Write the current date to a hidden file to create a tiny change
+          date +%s > .github/keepalive.txt
+          
+          # Commit and push
+          git add .github/keepalive.txt
+          git commit -m "chore: keep workflow alive" || echo "No changes to commit"
+          git push
