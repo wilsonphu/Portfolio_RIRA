@@ -17,7 +17,7 @@ SENDER_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
 RECEIVER_EMAIL = os.environ.get("RECEIVER_EMAIL")
 
 # Portfolio Allocations
-BULL_ALLOCATION: Dict[str, float] = {"TQQQ": 30.0, "SMH": 60.0}
+BULL_ALLOCATION: Dict[str, float] = {"TECL": 30.0, "SMH": 60.0}
 BEAR_ALLOCATION: Dict[str, float] = {"SPMO": 100.0}
 
 CRASH_ALERT_THRESHOLD = -5.0
