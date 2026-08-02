@@ -35,7 +35,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       actions: write
-      contents: write  # <--- ADD THIS LINE
     steps:
-      - uses: actions/checkout@v5
-      - uses: gautamkrishnar/keepalive-workflow@v1
+      - name: Keepalive Workflow
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh workflow enable "Daily Portfolio 12 Execution"
