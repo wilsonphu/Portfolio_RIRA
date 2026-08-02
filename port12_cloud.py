@@ -18,7 +18,7 @@ RECEIVER_EMAIL = os.environ.get("RECEIVER_EMAIL")
 
 # Portfolio Allocations
 BULL_ALLOCATION: Dict[str, float] = {"TECL": 20.0, "SOXL": 20.0, "SMH": 60.0}
-BEAR_ALLOCATION: Dict[str, float] = {"SPYM": 100.0}
+BEAR_ALLOCATION: Dict[str, float] = {"SPMO": 100.0}
 
 CRASH_ALERT_THRESHOLD = -5.0
 
