@@ -1,222 +1,168 @@
-import os
-import smtplib
-import traceback
-from datetime import datetime
-from zoneinfo import ZoneInfo
-from email.message import EmailMessage
-from typing import Dict, Tuple
-
 import numpy as np
 import pandas as pd
 import yfinance as yf
 
-# ==================================================================== #
-# 1. CLOUD CONFIGURATION & SECRETS                                     #
-# ==================================================================== #
-SENDER_EMAIL = os.environ.get("GMAIL_ADDRESS")
-SENDER_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
-RECEIVER_EMAIL = os.environ.get("RECEIVER_EMAIL")
+START_DATE = "2014-01-01"
+END_DATE = "2026-08-01"
+BACKTEST_START = "2016-01-01"
 
-# V1 Aggressive Strategy Allocations
-BULL_ALLOCATION: Dict[str, float] = {"TECL": 20.0, "SOXL": 20.0, "SMH": 60.0}
-BEAR_ALLOCATION: Dict[str, float] = {"SPMO": 100.0}
+TICKERS = ["QQQ", "TECL", "SOXL", "SMH", "SPMO", "SPY", "GLD", "^IRX"]
 
-CRASH_ALERT_THRESHOLD = -5.0
-NY_TZ = ZoneInfo("America/New_York")
+BAND_PCT = 0.04
+CONFIRM_DAYS = 5
 
-# ==================================================================== #
-# 2. EMAIL PROTOCOL                                                    #
-# ==================================================================== #
-def send_institutional_alert(subject: str, body: str) -> None:
-    """Dispatches automated summary reports via Gmail SMTP SSL."""
-    if not SENDER_EMAIL or not SENDER_APP_PASSWORD or not RECEIVER_EMAIL:
-        print("\n[✘] Error: Email credentials not found in environment variables.")
-        return
-    try:
-        msg = EmailMessage()
-        msg.set_content(body)
-        msg["Subject"] = subject
-        msg["From"] = f"Port12 Quant System <{SENDER_EMAIL}>"
-        msg["To"] = RECEIVER_EMAIL
-        
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(SENDER_EMAIL, SENDER_APP_PASSWORD)
-            server.send_message(msg)
-        print(f"\n[✔] Alert '{subject}' successfully dispatched via Email.")
-    except Exception as e:
-        print(f"\n[✘] Failed to dispatch Email. System Error: {e}")
+LOW_VOL_THRESHOLD = 0.20
+HIGH_VOL_THRESHOLD = 0.25
+VOL_LOOKBACK = 10
 
-# ==================================================================== #
-# 3. VECTORIZED QUANTITATIVE ENGINE                                    #
-# ==================================================================== #
-def calculate_regimes(close: pd.Series, ema200: pd.Series) -> Tuple[np.ndarray, np.ndarray, int]:
-    """Calculates trend signals with a 4% hysteresis band and 5-day confirmation."""
-    n = len(close)
-    raw_signals = np.ones(n, dtype=int)
-    confirmed_regimes = np.ones(n, dtype=int)
-    
-    if n <= 200:
-        return raw_signals, confirmed_regimes, 0
 
-    upper_band = (ema200 * 1.04).values
-    lower_band = (ema200 * 0.96).values
-    close_vals = close.values
-    
-    current_raw = 1
-    for i in range(200, n):
-        if close_vals[i] > upper_band[i]:
-            current_raw = 1
-        elif close_vals[i] < lower_band[i]:
-            current_raw = 0
-        raw_signals[i] = current_raw
+def download_close_data(tickers, start, end):
+    data = yf.download(tickers, start=start, end=end, auto_adjust=True, progress=False)
+    if isinstance(data.columns, pd.MultiIndex):
+        close = data.xs("Close", axis=1, level=0).copy()
+    else:
+        close = data["Close"].copy()
+    return close
 
+
+def build_regime_filter(qqq_close):
+    ema200 = qqq_close.ewm(span=200, adjust=False).mean()
+
+    upper = ema200 * (1 + BAND_PCT)
+    lower = ema200 * (1 - BAND_PCT)
+
+    raw = np.ones(len(qqq_close), dtype=int)
+    current = 1
+
+    q = qqq_close.values
+    u = upper.values
+    l = lower.values
+
+    for i in range(200, len(qqq_close)):
+        if q[i] > u[i]:
+            current = 1
+        elif q[i] < l[i]:
+            current = 0
+        raw[i] = current
+
+    confirmed = np.ones(len(qqq_close), dtype=int)
     current_regime = 1
-    days_in_new_state = 0
-    
-    for i in range(200, n):
-        curr_raw = raw_signals[i]
-        prev_raw = raw_signals[i - 1] if i > 0 else curr_raw
-        
-        if curr_raw != current_regime:
-            if curr_raw == prev_raw:
-                days_in_new_state += 1
-            else:
-                days_in_new_state = 1
-                
-            if days_in_new_state >= 5:
-                current_regime = curr_raw
-                days_in_new_state = 0
+    days = 0
+
+    for i in range(1, len(qqq_close)):
+        if raw[i] != current_regime:
+            days = days + 1 if raw[i] == raw[i - 1] else 1
+            if days >= CONFIRM_DAYS:
+                current_regime = raw[i]
+                days = 0
         else:
-            days_in_new_state = 0
-            
-        confirmed_regimes[i] = current_regime
-        
-    return raw_signals, confirmed_regimes, days_in_new_state
+            days = 0
+        confirmed[i] = current_regime
 
-# ==================================================================== #
-# 4. EXECUTION RUNTIME                                                 #
-# ==================================================================== #
-def run_portfolio() -> None:
-    print("[*] Initializing Port12 Cloud Engine (V1 Momentum Strategy)...")
-    
-    # Fetch 10 years to wash out EMA seed pollution
-    data = yf.download("QQQ", period="10y", auto_adjust=True, progress=False)
-    if data.empty:
-        raise ValueError("Failed to fetch market data from Yahoo Finance.")
-        
-    close = data.xs("Close", axis=1, level=0).ffill().dropna() if isinstance(data.columns, pd.MultiIndex) else data["Close"].ffill().dropna()
-    if isinstance(close, pd.DataFrame):
-        close = close.iloc[:, 0]
-        
-    # Localize index to NY time to avoid cloud timezone drift
-    if close.index.tz is None:
-        close.index = close.index.tz_localize('America/New_York')
-    else:
-        close.index = close.index.tz_convert('America/New_York')
-        
-    ema200 = close.ewm(span=200, adjust=False, min_periods=200).mean()
-    raw_signals, confirmed_regimes, days_in_new_state = calculate_regimes(close, ema200)
-    
-    regime_diff = np.diff(confirmed_regimes)
-    is_regime_flip = bool(regime_diff[-1] != 0) if len(regime_diff) > 0 else False
-    current_regime = int(confirmed_regimes[-1])
-    
-    latest_date = close.index[-1].strftime("%Y-%m-%d")
-    latest_price = float(close.iloc[-1])
-    daily_pct_change = ((latest_price / float(close.iloc[-2])) - 1.0) * 100.0
-    latest_ema = float(ema200.iloc[-1])
-    distance_to_ema = ((latest_price / latest_ema) - 1.0) * 100.0
-    
-    if current_regime == 1:
-        regime_title = "BULL MARKET (Risk-On)"
-        leverage_ratio = "1.8x Blended Tech/Semi Leverage"
-        target_dict = BULL_ALLOCATION
-        bear_assets = ", ".join(BEAR_ALLOCATION.keys())
-        instructions = (f" 1. LIQUIDATE all defensive assets ({bear_assets}) to 0%.\n"
-                        f" 2. ALLOCATE: " + ", ".join([f"{v}% {k}" for k, v in BULL_ALLOCATION.items()]))
-    else:
-        regime_title = "BEAR MARKET (Risk-Off)"
-        leverage_ratio = "S&P 500 Momentum (Defensive)"
-        target_dict = BEAR_ALLOCATION
-        bull_assets = ", ".join(BULL_ALLOCATION.keys())
-        instructions = (f" 1. LIQUIDATE all tech leverage ({bull_assets}) to 0%.\n"
-                        f" 2. ALLOCATE: " + ", ".join([f"{v}% {k}" for k, v in BEAR_ALLOCATION.items()]))
+    return ema200, raw, confirmed
 
-    now_ny = datetime.now(NY_TZ)
-    is_fresh_data = close.index[-1].date() == now_ny.date()
-    is_new_month = close.index[-1].month != close.index[-2].month
-    is_crash_event = daily_pct_change <= CRASH_ALERT_THRESHOLD
-    
-    event_flags = []
-    if is_regime_flip: event_flags.append("[!] MACRO TREND SHIFT DETECTED")
-    if is_new_month: event_flags.append("[!] MONTHLY REBALANCE REQUIRED")
-    if is_crash_event: event_flags.append(f"[!] HIGH VOLATILITY EVENT LOGGED ({daily_pct_change:.2f}%)")
-    if days_in_new_state > 0:
-        event_flags.append(f"[*] WHIPSAW FILTER: Raw trend broke {days_in_new_state} day(s) ago.")
 
-    report_lines = [
-        "=========================================================",
-        "PORTFOLIO 12: CLOUD SYSTEM ALLOCATION REPORT (V1)",
-        "=========================================================",
-        f"Date Generated: {latest_date}",
-        f"Run Time (NY) : {now_ny.strftime('%H:%M:%S ET')}\n",
-        "EXECUTIVE SUMMARY",
-        "---------------------------------------------------------"
-    ]
-    
-    if event_flags:
-        for flag in event_flags: report_lines.append(f" {flag}")
-    else:
-        report_lines.append(" [✔] Normal Operations. No immediate action required.")
-        
-    report_lines.extend([
-        "\nMARKET DATA (Nasdaq-100 / QQQ)",
-        "---------------------------------------------------------",
-        f"Closing Price: ${latest_price:.2f} ({daily_pct_change:+.2f}%)",
-        f"200-Day EMA: ${latest_ema:.2f}",
-        f"Distance to Trend: {distance_to_ema:+.2f}%\n",
-        "PORTFOLIO POSTURE",
-        "---------------------------------------------------------",
-        f"Current Regime: {regime_title}",
-        f"Exposure Profile: {leverage_ratio}\n",
-        "TARGET ALLOCATIONS"
-    ])
-    
-    for asset, weight in target_dict.items():
-        report_lines.append(f" - {asset:<6} : {weight:>5.1f}%")
-        
-    if is_regime_flip or is_new_month:
-        report_lines.extend([
-            "\n=========================================================", 
-            " TRADE EXECUTION INSTRUCTIONS", 
-            "=========================================================", 
-            " Execute at next market open:", 
-            instructions, 
-            "========================================================="
-        ])
-    else:
-        report_lines.extend(["\n=========================================================", " INSTRUCTIONS: Maintain current allocations.", "========================================================="])
+def compute_returns(close):
+    rets = {t: close[t].pct_change() for t in close.columns}
 
-    report = "\n".join(report_lines)
-    print(report)
-    
-    # Crash alerts fire unconditionally (bypassing fresh data check for weekend awareness)
-    if is_crash_event:
-        send_institutional_alert("PORTFOLIO 12: Volatility Alert", report)
-    # Standard flips and rebalances only fire if data is fresh
-    elif (is_regime_flip or is_new_month):
-        if is_fresh_data:
-            send_institutional_alert("PORTFOLIO 12: Action Required", report)
+    if "SPMO" in close.columns and "SPY" in close.columns:
+        rets["SPMO"] = rets["SPMO"].fillna(rets["SPY"])
+
+    for k in rets:
+        rets[k] = rets[k].fillna(0.0)
+
+    rf_daily = ((close["^IRX"].ffill() / 100.0) / 252.0).fillna(0.0)
+    return rets, rf_daily
+
+
+def barbell_weights(v10):
+    if np.isnan(v10) or v10 < LOW_VOL_THRESHOLD:
+        return {"TECL": 0.20, "SOXL": 0.20, "SMH": 0.60, "GLD": 0.00}
+    elif v10 < HIGH_VOL_THRESHOLD:
+        return {"TECL": 0.10, "SOXL": 0.10, "SMH": 0.80, "GLD": 0.00}
+    else:
+        return {"TECL": 0.00, "SOXL": 0.00, "SMH": 0.80, "GLD": 0.20}
+
+
+def performance_stats(daily_returns, rf_daily):
+    daily_returns = np.asarray(daily_returns)
+    rf_daily = np.asarray(rf_daily)
+
+    equity = np.cumprod(1 + daily_returns)
+    years = len(daily_returns) / 252.0
+
+    cagr = equity[-1] ** (1 / years) - 1
+    peak = np.maximum.accumulate(equity)
+    drawdown = (equity - peak) / peak
+    max_dd = drawdown.min()
+
+    excess = daily_returns - rf_daily
+    sharpe = np.mean(excess) / np.std(excess) * np.sqrt(252) if np.std(excess) > 0 else np.nan
+
+    return {
+        "CAGR": cagr,
+        "MaxDrawdown": max_dd,
+        "Sharpe": sharpe,
+        "EquityCurve": equity,
+    }
+
+
+def run_backtest():
+    close = download_close_data(TICKERS, START_DATE, END_DATE)
+    close = close.ffill()
+
+    qqq = close["QQQ"]
+    _, _, regime = build_regime_filter(qqq)
+
+    rets, rf_daily = compute_returns(close)
+
+    vol_10 = qqq.pct_change().rolling(VOL_LOOKBACK).std() * np.sqrt(252)
+
+    start_idx = qqq.index.get_loc(qqq[qqq.index >= pd.to_datetime(BACKTEST_START)].index[0])
+
+    strategy_returns = np.zeros(len(qqq))
+
+    for i in range(start_idx, len(qqq)):
+        if regime[i - 1] == 1:
+            w = barbell_weights(vol_10.iloc[i - 1])
+            strategy_returns[i] = (
+                w["TECL"] * rets["TECL"].iloc[i]
+                + w["SOXL"] * rets["SOXL"].iloc[i]
+                + w["SMH"] * rets["SMH"].iloc[i]
+                + w["GLD"] * rets["GLD"].iloc[i]
+            )
         else:
-            print("\n[!] Event flagged, but data is stale (weekend). Action Email suppressed.")
+            strategy_returns[i] = rets["SPMO"].iloc[i]
 
-# ==================================================================== #
-# 5. GLOBAL EXCEPTION WRAPPER                                          #
-# ==================================================================== #
+    bt_returns = strategy_returns[start_idx:]
+    bt_rf = rf_daily.iloc[start_idx:].values
+    bt_dates = qqq.index[start_idx:]
+
+    stats = performance_stats(bt_returns, bt_rf)
+
+    out = pd.DataFrame({
+        "Date": bt_dates,
+        "DailyReturn": bt_returns,
+        "EquityCurve": stats["EquityCurve"],
+        "Regime": regime[start_idx:],
+        "Vol10": vol_10.iloc[start_idx:].values,
+    })
+    out.to_csv("barbell_backtest_results.csv", index=False)
+
+    print("Original Barbell Backtest Complete")
+    print(f"CAGR: {stats['CAGR']:.2%}")
+    print(f"Max Drawdown: {stats['MaxDrawdown']:.2%}")
+    print(f"Sharpe Ratio: {stats['Sharpe']:.3f}")
+
+    latest_vol = vol_10.iloc[-1]
+    latest_regime = "BULL" if regime[-1] == 1 else "BEAR"
+    latest_weights = barbell_weights(latest_vol) if regime[-1] == 1 else {"SPMO": 1.00}
+
+    print(f"Current Regime: {latest_regime}")
+    print("Current Allocation:")
+    for k, v in latest_weights.items():
+        print(f"  {k}: {v:.0%}")
+
+
 if __name__ == "__main__":
-    try:
-        run_portfolio()
-    except Exception as e:
-        error_msg = f"CRITICAL SYSTEM FAILURE DETECTED:\n\n{traceback.format_exc()}"
-        print(error_msg)
-        send_institutional_alert("PORTFOLIO 12: CRITICAL SCRIPT FAILURE", error_msg)
+    run_backtest()
