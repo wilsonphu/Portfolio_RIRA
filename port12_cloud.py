@@ -4,7 +4,7 @@ import traceback
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from email.message import EmailMessage
-from typing import Dict, List, Tuple
+from typing import Dict, Tuple
 
 import numpy as np
 import pandas as pd
@@ -17,20 +17,15 @@ SENDER_EMAIL = os.environ.get("GMAIL_ADDRESS")
 SENDER_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
 RECEIVER_EMAIL = os.environ.get("RECEIVER_EMAIL")
 
-# Base Allocations
+# V1 Aggressive Strategy Allocations
 BULL_ALLOCATION: Dict[str, float] = {"TECL": 20.0, "SOXL": 20.0, "SMH": 60.0}
-# Volatility-Targeted Bull (If QQQ 20d Vol > 25%)
-DELEVERAGED_BULL: Dict[str, float] = {"TECL": 10.0, "SOXL": 10.0, "SMH": 80.0}
-
-# Institutional Defensive Sleeve (Cash / Long Bonds / Gold)
-BEAR_ALLOCATION: Dict[str, float] = {"SGOV": 40.0, "TLT": 30.0, "GLD": 30.0}
+BEAR_ALLOCATION: Dict[str, float] = {"SPMO": 100.0}
 
 CRASH_ALERT_THRESHOLD = -5.0
-VOLATILITY_TARGET_LIMIT = 0.25 # 25% Annualized Volatility
 NY_TZ = ZoneInfo("America/New_York")
 
 # ==================================================================== #
-# 2. EMAIL PROTOCOL & EXCEPTION HANDLING                               #
+# 2. EMAIL PROTOCOL                                                    #
 # ==================================================================== #
 def send_institutional_alert(subject: str, body: str) -> None:
     """Dispatches automated summary reports via Gmail SMTP SSL."""
@@ -55,7 +50,7 @@ def send_institutional_alert(subject: str, body: str) -> None:
 # 3. VECTORIZED QUANTITATIVE ENGINE                                    #
 # ==================================================================== #
 def calculate_regimes(close: pd.Series, ema200: pd.Series) -> Tuple[np.ndarray, np.ndarray, int]:
-    """Calculates trend signals with a 4% hysteresis band and 5-day lag."""
+    """Calculates trend signals with a 4% hysteresis band and 5-day confirmation."""
     n = len(close)
     raw_signals = np.ones(n, dtype=int)
     confirmed_regimes = np.ones(n, dtype=int)
@@ -102,9 +97,9 @@ def calculate_regimes(close: pd.Series, ema200: pd.Series) -> Tuple[np.ndarray, 
 # 4. EXECUTION RUNTIME                                                 #
 # ==================================================================== #
 def run_portfolio() -> None:
-    print("[*] Initializing Port12 Cloud Engine (V2 - Institutionally Hardened)...")
+    print("[*] Initializing Port12 Cloud Engine (V1 Momentum Strategy)...")
     
-    # Pulled 10 years of data to wash out EMA seed pollution
+    # Fetch 10 years to wash out EMA seed pollution
     data = yf.download("QQQ", period="10y", auto_adjust=True, progress=False)
     if data.empty:
         raise ValueError("Failed to fetch market data from Yahoo Finance.")
@@ -113,7 +108,7 @@ def run_portfolio() -> None:
     if isinstance(close, pd.DataFrame):
         close = close.iloc[:, 0]
         
-    # Localize index to NY time to avoid timezone drift
+    # Localize index to NY time to avoid cloud timezone drift
     if close.index.tz is None:
         close.index = close.index.tz_localize('America/New_York')
     else:
@@ -121,11 +116,6 @@ def run_portfolio() -> None:
         
     ema200 = close.ewm(span=200, adjust=False, min_periods=200).mean()
     raw_signals, confirmed_regimes, days_in_new_state = calculate_regimes(close, ema200)
-    
-    # Calculate 20-day Realized Volatility for Risk Targeting
-    daily_returns = close.pct_change()
-    realized_vol_20d = daily_returns.rolling(20).std() * np.sqrt(252)
-    current_vol = float(realized_vol_20d.iloc[-1])
     
     regime_diff = np.diff(confirmed_regimes)
     is_regime_flip = bool(regime_diff[-1] != 0) if len(regime_diff) > 0 else False
@@ -138,20 +128,19 @@ def run_portfolio() -> None:
     distance_to_ema = ((latest_price / latest_ema) - 1.0) * 100.0
     
     if current_regime == 1:
-        if current_vol > VOLATILITY_TARGET_LIMIT:
-            regime_title = "BULL MARKET (Risk-On / Volatility De-leveraged)"
-            leverage_ratio = "1.4x Blended Leverage"
-            target_dict = DELEVERAGED_BULL
-        else:
-            regime_title = "BULL MARKET (Risk-On / Max Allocation)"
-            leverage_ratio = "1.8x Blended Tech/Semi Leverage"
-            target_dict = BULL_ALLOCATION
+        regime_title = "BULL MARKET (Risk-On)"
+        leverage_ratio = "1.8x Blended Tech/Semi Leverage"
+        target_dict = BULL_ALLOCATION
+        bear_assets = ", ".join(BEAR_ALLOCATION.keys())
+        instructions = (f" 1. LIQUIDATE all defensive assets ({bear_assets}) to 0%.\n"
+                        f" 2. ALLOCATE: " + ", ".join([f"{v}% {k}" for k, v in BULL_ALLOCATION.items()]))
     else:
-        regime_title = "BEAR MARKET (Risk-Off / Defensive Sleeve)"
-        leverage_ratio = "Uncorrelated Parachute (Cash/Bonds/Gold)"
+        regime_title = "BEAR MARKET (Risk-Off)"
+        leverage_ratio = "S&P 500 Momentum (Defensive)"
         target_dict = BEAR_ALLOCATION
-
-    instructions = " 1. LIQUIDATE out-of-regime assets to 0%.\n 2. ALLOCATE: " + ", ".join([f"{v}% {k}" for k, v in target_dict.items()])
+        bull_assets = ", ".join(BULL_ALLOCATION.keys())
+        instructions = (f" 1. LIQUIDATE all tech leverage ({bull_assets}) to 0%.\n"
+                        f" 2. ALLOCATE: " + ", ".join([f"{v}% {k}" for k, v in BEAR_ALLOCATION.items()]))
 
     now_ny = datetime.now(NY_TZ)
     is_fresh_data = close.index[-1].date() == now_ny.date()
@@ -161,13 +150,13 @@ def run_portfolio() -> None:
     event_flags = []
     if is_regime_flip: event_flags.append("[!] MACRO TREND SHIFT DETECTED")
     if is_new_month: event_flags.append("[!] MONTHLY REBALANCE REQUIRED")
-    if is_crash_event: event_flags.append("[!] HIGH VOLATILITY EVENT LOGGED")
+    if is_crash_event: event_flags.append(f"[!] HIGH VOLATILITY EVENT LOGGED ({daily_pct_change:.2f}%)")
     if days_in_new_state > 0:
         event_flags.append(f"[*] WHIPSAW FILTER: Raw trend broke {days_in_new_state} day(s) ago.")
 
     report_lines = [
         "=========================================================",
-        "PORTFOLIO 12: CLOUD SYSTEM ALLOCATION REPORT",
+        "PORTFOLIO 12: CLOUD SYSTEM ALLOCATION REPORT (V1)",
         "=========================================================",
         f"Date Generated: {latest_date}",
         f"Run Time (NY) : {now_ny.strftime('%H:%M:%S ET')}\n",
@@ -185,8 +174,7 @@ def run_portfolio() -> None:
         "---------------------------------------------------------",
         f"Closing Price: ${latest_price:.2f} ({daily_pct_change:+.2f}%)",
         f"200-Day EMA: ${latest_ema:.2f}",
-        f"Distance to Trend: {distance_to_ema:+.2f}%",
-        f"20-Day Realized Vol: {current_vol:.2%} (Limit: {VOLATILITY_TARGET_LIMIT:.2%})\n",
+        f"Distance to Trend: {distance_to_ema:+.2f}%\n",
         "PORTFOLIO POSTURE",
         "---------------------------------------------------------",
         f"Current Regime: {regime_title}",
@@ -200,9 +188,9 @@ def run_portfolio() -> None:
     if is_regime_flip or is_new_month:
         report_lines.extend([
             "\n=========================================================", 
-            " TRADE EXECUTION INSTRUCTIONS (MOC)", 
+            " TRADE EXECUTION INSTRUCTIONS", 
             "=========================================================", 
-            " Execute via Market-On-Close (MOC) prior to 4:00 PM ET:", 
+            " Execute at next market open:", 
             instructions, 
             "========================================================="
         ])
@@ -218,7 +206,7 @@ def run_portfolio() -> None:
     # Standard flips and rebalances only fire if data is fresh
     elif (is_regime_flip or is_new_month):
         if is_fresh_data:
-            send_institutional_alert("PORTFOLIO 12: Action Required (MOC)", report)
+            send_institutional_alert("PORTFOLIO 12: Action Required", report)
         else:
             print("\n[!] Event flagged, but data is stale (weekend). Action Email suppressed.")
 
