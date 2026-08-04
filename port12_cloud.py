@@ -11,7 +11,7 @@ import yfinance as yf
 # ==========================================
 # 1. USER CONFIGURATION
 # ==========================================
-# Includes TECL so if you currently hold TECL, the script automatically generates the SELL transition trade.
+# Includes TECL so if you currently hold TECL, the script generates the transition trades.
 CURRENT_HOLDINGS = {
     "QLD": 0.0,
     "TECL": 5.9043,
@@ -29,7 +29,6 @@ MIN_NOTIONAL_TRADE = 25.00  # Ignore tiny trades under $25
 # ==========================================
 # 2. SYSTEM PARAMETERS (STRATEGY C HIGH-GROWTH)
 # ==========================================
-# Extended lookback window to 750 days for 200 EMA warmup stability
 START_DATE = (datetime.today() - timedelta(days=750)).strftime("%Y-%m-%d")
 END_DATE = datetime.today().strftime("%Y-%m-%d")
 
@@ -102,7 +101,7 @@ def build_regime_filter(
 def strategy_c_high_growth_weights(
     regime_value: int, latest_vol: float
 ) -> Dict[str, float]:
-  """Target weights for Strategy C High-Growth Variant (20% TECL / 30% QLD / 15% SOXL / 35% SMH)."""
+  """Target weights for Strategy C High-Growth Variant."""
   if regime_value == 1:
     # Bull Regime Allocation (Risk-On)
     if np.isnan(latest_vol) or latest_vol < LOW_VOL_THRESHOLD:
@@ -193,7 +192,9 @@ def build_rebalance_table(
     if actionable:
       needs_rebalance = True
       action = (
-          f"BUY {share_diff}" if share_diff > 0 else f"SELL {abs(share_diff)}"
+          f"BUY {share_diff} sh"
+          if share_diff > 0
+          else f"SELL {abs(share_diff)} sh"
       )
     else:
       action = "HOLD"
@@ -216,48 +217,226 @@ def build_rebalance_table(
 
 
 # ==========================================
-# 5. EMAIL ALERT ENGINE
+# 5. EXECUTIVE DASHBOARD & EMAIL FORMATTER
 # ==========================================
-def build_email_body(
+def format_console_dashboard(
     report_date: str,
     regime_label: str,
-    latest_vol: float,
     latest_qqq: float,
-    rebalance_df: pd.DataFrame,
+    latest_vol: float,
+    lower_band_val: float,
     portfolio_value: float,
+    df: pd.DataFrame,
 ) -> str:
-  """Formats the rebalance alert email."""
+  """Formats clean, high-readability terminal logs."""
+  border = "═" * 72
+  sub_border = "─" * 72
+
   lines = [
-      "ROTH IRA Rebalance Alert",
-      "",
-      f"Date: {report_date}",
-      f"Regime: {regime_label}",
-      f"QQQ Price: ${latest_qqq:,.2f}",
-      f"QQQ 10-Day Volatility: {latest_vol:.2%}",
-      f"Portfolio Value: ${portfolio_value:,.2f}",
-      "",
-      "Actionable Trades Required:",
+      border,
+      "  🚀 ROTH IRA STRATEGY C EXECUTIVE DASHBOARD",
+      border,
+      (
+          f"  Date: {report_date:<15} | Portfolio Value:"
+          f" ${portfolio_value:,.2f}"
+      ),
+      (
+          f"  Regime: {regime_label:<20} | QQQ Volatility:"
+          f" {latest_vol:.1%}"
+      ),
+      (
+          f"  QQQ Price: ${latest_qqq:<13,.2f} | Bear Regime Pivot Price: <"
+          f" ${lower_band_val:,.2f}"
+      ),
+      sub_border,
+      "  1. ACTIONABLE TRADE EXECUTION PLAN",
+      sub_border,
   ]
 
-  actionable = rebalance_df[rebalance_df["Action"] != "HOLD"]
-  for _, row in actionable.iterrows():
+  trades = df[df["TradeValue"] >= MIN_NOTIONAL_TRADE]
+  if len(trades) > 0:
+    for _, r in trades.iterrows():
+      lines.append(
+          f"  • {r['Ticker']:<5} : {r['Action']:<16} | Approx"
+          f" ${r['TradeValue']:<9,.2f} | ({r['CurrentPct']:.1%} ➔"
+          f" {r['TargetPct']:.1%})"
+      )
+  else:
     lines.append(
-        f"- {row['Ticker']}: {row['Action']} | "
-        f"Current {row['CurrentPct']:.1%} -> Target {row['TargetPct']:.1%} | "
-        f"Approx ${row['TradeValue']:.2f}"
+        "  • No trades required. Portfolio is fully aligned with target"
+        " weights."
     )
 
-  lines.extend(["", "Full Allocation Snapshot:"])
-  for _, row in rebalance_df.iterrows():
+  lines.extend([
+      sub_border,
+      "  2. PORTFOLIO BREAKDOWN (CURRENT vs PROPOSED TARGET)",
+      sub_border,
+      (
+          f"  {'Ticker':<8} {'Price':<10} {'Current %':<12} {'Target %':<10}"
+          f" {'Current $':<12} {'Target $':<12}"
+      ),
+      "  " + "─" * 68,
+  ])
+
+  for _, r in df.iterrows():
+    curr_val = r["CurrentShares"] * r["Price"]
+    tgt_val = r["TargetPct"] * portfolio_value
     lines.append(
-        f"- {row['Ticker']}: Current {row['CurrentPct']:.1%}, "
-        f"Target {row['TargetPct']:.1%}, Action: {row['Action']}"
+        f"  {r['Ticker']:<8} ${r['Price']:<9.2f} {r['CurrentPct']*100:<11.1f}%"
+        f" {r['TargetPct']*100:<9.1f}% ${curr_val:<11.2f} ${tgt_val:<11.2f}"
     )
+
+  lines.extend([
+      sub_border,
+      "  3. FUTURE PLAYS & MARKET WATCH TRIGGERS",
+      sub_border,
+      "  • NEXT VOLATILITY STEP-DOWN TRIGGER:",
+      (
+          f"    If QQQ 10-day volatility rises from {latest_vol:.1%} to 20.0%,"
+          " strategy steps down"
+      ),
+      "    leverage to: 10% TECL / 15% QLD / 10% SOXL / 65% SMH.",
+      "",
+      "  • BEAR REGIME ROTATION TRIGGER:",
+      (
+          f"    If QQQ drops below ${lower_band_val:,.2f} (200 EMA - 4%),"
+          " strategy triggers risk-off"
+      ),
+      "    rotation to: 80% SPMO / 20% GLD.",
+      border,
+  ])
 
   return "\n".join(lines)
 
 
-def send_email(subject, body):
+def build_html_email(
+    report_date: str,
+    regime_label: str,
+    latest_qqq: float,
+    latest_vol: float,
+    lower_band_val: float,
+    portfolio_value: float,
+    df: pd.DataFrame,
+) -> str:
+  """Formats rich executive HTML report for Gmail alerts."""
+  trades = df[df["TradeValue"] >= MIN_NOTIONAL_TRADE]
+
+  trade_rows_html = ""
+  if len(trades) > 0:
+    for _, r in trades.iterrows():
+      badge_color = "#28a745" if "BUY" in r["Action"] else "#dc3545"
+      trade_rows_html += f"""
+            <tr style="border-bottom: 1px solid #eee;">
+                <td style="padding: 10px; font-weight: bold;">{r['Ticker']}</td>
+                <td style="padding: 10px;"><span style="background-color: {badge_color}; color: white; padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: bold;">{r['Action']}</span></td>
+                <td style="padding: 10px; font-weight: bold;">${r['TradeValue']:,.2f}</td>
+                <td style="padding: 10px; color: #555;">{r['CurrentPct']:.1%} ➔ {r['TargetPct']:.1%}</td>
+            </tr>
+            """
+  else:
+    trade_rows_html = (
+        "<tr><td colspan='4' style='padding: 12px; text-align: center; color:"
+        " #28a745; font-weight: bold;'>Portfolio fully aligned. No trades"
+        " required.</td></tr>"
+    )
+
+  table_rows_html = ""
+  for _, r in df.iterrows():
+    curr_val = r["CurrentShares"] * r["Price"]
+    tgt_val = r["TargetPct"] * portfolio_value
+    table_rows_html += f"""
+        <tr style="border-bottom: 1px solid #f2f2f2;">
+            <td style="padding: 8px; font-weight: bold;">{r['Ticker']}</td>
+            <td style="padding: 8px;">${r['Price']:,.2f}</td>
+            <td style="padding: 8px;">{r['CurrentPct']*100:.1f}% (${curr_val:,.2f})</td>
+            <td style="padding: 8px; font-weight: bold; color: #0056b3;">{r['TargetPct']*100:.1f}% (${tgt_val:,.2f})</td>
+        </tr>
+        """
+
+  return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <style>
+            body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #f8f9fa; color: #333; margin: 0; padding: 20px; }}
+            .container {{ max-width: 650px; background: #ffffff; margin: 0 auto; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); overflow: hidden; }}
+            .header {{ background-color: #1a252f; color: #ffffff; padding: 24px; text-align: center; }}
+            .header h2 {{ margin: 0; font-size: 20px; letter-spacing: 0.5px; }}
+            .header p {{ margin: 6px 0 0 0; color: #bdc3c7; font-size: 13px; }}
+            .card {{ padding: 20px; border-bottom: 1px solid #e9ecef; }}
+            .card-title {{ font-size: 14px; font-weight: bold; color: #2c3e50; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 12px; }}
+            .metric-grid {{ display: flex; justify-content: space-between; background: #f1f4f8; padding: 12px 16px; border-radius: 6px; }}
+            .metric {{ text-align: center; }}
+            .metric-val {{ font-size: 16px; font-weight: bold; color: #2c3e50; }}
+            .metric-lbl {{ font-size: 11px; color: #7f8c8d; text-transform: uppercase; }}
+            table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+            th {{ background: #f8f9fa; text-align: left; padding: 8px; color: #7f8c8d; font-size: 11px; text-transform: uppercase; border-bottom: 2px solid #e9ecef; }}
+            .future-play {{ background-color: #fcf8e3; border-left: 4px solid #f0ad4e; padding: 12px 16px; border-radius: 4px; font-size: 13px; margin-top: 8px; }}
+            .footer {{ background: #f8f9fa; text-align: center; padding: 14px; font-size: 11px; color: #95a5a6; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h2>📈 ROTH IRA STRATEGY C DASHBOARD</h2>
+                <p>Automated Portfolio & Rebalance Report | {report_date}</p>
+            </div>
+            
+            <div class="card">
+                <div class="metric-grid">
+                    <div class="metric"><div class="metric-val">${portfolio_value:,.2f}</div><div class="metric-lbl">Portfolio Value</div></div>
+                    <div class="metric"><div class="metric-val" style="color: #27ae60;">{regime_label}</div><div class="metric-lbl">Market Regime</div></div>
+                    <div class="metric"><div class="metric-val">${latest_qqq:,.2f}</div><div class="metric-lbl">QQQ Price</div></div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-title">1. Actionable Trade Execution Plan</div>
+                <table>
+                    <thead>
+                        <tr><th>Ticker</th><th>Action</th><th>Trade Value</th><th>Target Shift</th></tr>
+                    </thead>
+                    <tbody>
+                        {trade_rows_html}
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="card">
+                <div class="card-title">2. Portfolio Breakdown (Current vs Proposed Target)</div>
+                <table>
+                    <thead>
+                        <tr><th>Ticker</th><th>Price</th><th>Current Allocation</th><th>Proposed Target</th></tr>
+                    </thead>
+                    <tbody>
+                        {table_rows_html}
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="card">
+                <div class="card-title">3. Future Plays & Market Watch Triggers</div>
+                <div class="future-play">
+                    <strong>⚡ Volatility Step-Down Trigger:</strong><br>
+                    If QQQ 10-day volatility rises from <strong>{latest_vol:.1%}</strong> to <strong>20.0%</strong>, strategy steps down leverage to: <em>10% TECL / 15% QLD / 10% SOXL / 65% SMH</em>.
+                </div>
+                <div class="future-play" style="background-color: #f2dede; border-left-color: #d9534f; margin-top: 10px;">
+                    <strong>🛡️ Bear Regime Rotation Trigger:</strong><br>
+                    If QQQ drops below <strong>${lower_band_val:,.2f}</strong> (200 EMA - 4%), strategy triggers risk-off rotation to: <em>80% SPMO / 20% GLD</em>.
+                </div>
+            </div>
+
+            <div class="footer">
+                Strategy C High-Growth Engine | Drift Threshold: ≥2.0% | GitHub Automated Pipeline
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+
+def send_email(subject, text_body, html_body):
   gmail_address = os.environ.get("GMAIL_ADDRESS")
   gmail_password = os.environ.get("GMAIL_APP_PASSWORD")
   receiver_email = os.environ.get("RECEIVER_EMAIL")
@@ -274,20 +453,21 @@ def send_email(subject, body):
     msg["Subject"] = subject
     msg["From"] = gmail_address
     msg["To"] = receiver_email
-    msg.set_content(body)
+    msg.set_content(text_body)
+    msg.add_alternative(html_body, subtype="html")
 
     with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as server:
       server.starttls()
       server.login(gmail_address, gmail_password)
       server.send_message(msg)
 
-    print("DEBUG: Email sent successfully.")
+    print("DEBUG: Executive HTML Email sent successfully.")
   except Exception as e:
     print(f"Error sending email: {e}")
 
 
 # ==========================================
-# 6. MAIN
+# 6. MAIN EXECUTION
 # ==========================================
 def main():
   close = download_data(TICKERS, START_DATE, END_DATE)
@@ -297,13 +477,14 @@ def main():
     return
 
   qqq = close["QQQ"]
-  _, _, _, regime = build_regime_filter(qqq)
+  _, upper_band, lower_band, regime = build_regime_filter(qqq)
 
   vol_10 = qqq.pct_change().rolling(VOL_LOOKBACK).std() * np.sqrt(252)
 
   latest_date = close.index[-1].strftime("%Y-%m-%d")
   latest_qqq = float(qqq.iloc[-1])
   latest_vol = float(vol_10.iloc[-1]) if not np.isnan(vol_10.iloc[-1]) else 0.18
+  lower_band_val = float(lower_band.iloc[-1])
   latest_regime = int(regime[-1])
   regime_label = "BULL (Risk-On)" if latest_regime == 1 else "BEAR (Risk-Off)"
 
@@ -312,33 +493,32 @@ def main():
       close, target_weights
   )
 
-  print(f"Date: {latest_date}")
-  print(f"Regime: {regime_label}")
-  print(f"Needs rebalance: {needs_rebalance}\n")
-
-  display_df = rebalance_df[
-      ["Ticker", "CurrentPct", "TargetPct", "Action"]
-  ].copy()
-  display_df["CurrentPct"] = display_df["CurrentPct"].apply(
-      lambda x: f"{x:.1%}"
+  # Generate Dashboard Outputs
+  console_dashboard = format_console_dashboard(
+      latest_date,
+      regime_label,
+      latest_qqq,
+      latest_vol,
+      lower_band_val,
+      portfolio_value,
+      rebalance_df,
   )
-  display_df["TargetPct"] = display_df["TargetPct"].apply(lambda x: f"{x:.1%}")
-  print(display_df.to_string(index=False))
-  print("-" * 50)
+  print(console_dashboard)
 
   if needs_rebalance:
-    subject = f"Strategy C High-Growth Rebalance Alert - {latest_date}"
-    body = build_email_body(
+    subject = f"Strategy C Rebalance Alert - {latest_date}"
+    html_email = build_html_email(
         latest_date,
         regime_label,
-        latest_vol,
         latest_qqq,
-        rebalance_df,
+        latest_vol,
+        lower_band_val,
         portfolio_value,
+        rebalance_df,
     )
-    send_email(subject, body)
+    send_email(subject, console_dashboard, html_email)
   else:
-    print("No rebalance needed. Thresholds not met.")
+    print("\nNo rebalance needed. Portfolio is fully aligned within tolerance.")
 
 
 if __name__ == "__main__":
