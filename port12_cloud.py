@@ -11,6 +11,7 @@ import yfinance as yf
 # ==========================================
 # 1. USER CONFIGURATION
 # ==========================================
+# Includes TECL so if you currently hold TECL, the script automatically generates the SELL transition trade.
 CURRENT_HOLDINGS = {
     "QLD": 0.0,
     "TECL": 5.9043,
@@ -26,18 +27,19 @@ DRIFT_THRESHOLD = 0.02  # 2 percentage points drift required to trade
 MIN_NOTIONAL_TRADE = 25.00  # Ignore tiny trades under $25
 
 # ==========================================
-# 2. SYSTEM PARAMETERS (STRATEGY C HYBRID)
+# 2. SYSTEM PARAMETERS (STRATEGY C HIGH-GROWTH)
 # ==========================================
+# Extended lookback window to 750 days for 200 EMA warmup stability
 START_DATE = (datetime.today() - timedelta(days=750)).strftime("%Y-%m-%d")
 END_DATE = datetime.today().strftime("%Y-%m-%d")
 
 TICKERS = ["QQQ", "QLD", "TECL", "SOXL", "SMH", "SPMO", "SPY", "GLD", "^IRX"]
 
-BAND_PCT = 0.04
-CONFIRM_DAYS = 5
+BAND_PCT = 0.04  # 4% band around 200 EMA
+CONFIRM_DAYS = 5  # 5 days confirmation hysteresis
 LOW_VOL_THRESHOLD = 0.20  # 20% annualized QQQ vol
 HIGH_VOL_THRESHOLD = 0.25  # 25% annualized QQQ vol
-VOL_LOOKBACK = 10
+VOL_LOOKBACK = 10  # 10 trading days rolling window
 
 
 # ==========================================
@@ -97,29 +99,29 @@ def build_regime_filter(
   return ema200, upper, lower, confirmed
 
 
-def strategy_c_hybrid_weights(
+def strategy_c_high_growth_weights(
     regime_value: int, latest_vol: float
 ) -> Dict[str, float]:
-  """Determines target weights for Strategy C Hybrid (10% TECL / 15% QLD / 20% SOXL / 55% SMH)."""
+  """Target weights for Strategy C High-Growth Variant (20% TECL / 30% QLD / 15% SOXL / 35% SMH)."""
   if regime_value == 1:
     # Bull Regime Allocation (Risk-On)
     if np.isnan(latest_vol) or latest_vol < LOW_VOL_THRESHOLD:
-      # Low Volatility (<20%): 10% TECL / 15% QLD / 20% SOXL / 55% SMH
+      # Low Volatility (<20%): 20% TECL / 30% QLD / 15% SOXL / 35% SMH
       return {
-          "TECL": 0.10,
-          "QLD": 0.15,
-          "SOXL": 0.20,
-          "SMH": 0.55,
+          "TECL": 0.20,
+          "QLD": 0.30,
+          "SOXL": 0.15,
+          "SMH": 0.35,
           "GLD": 0.00,
           "SPMO": 0.00,
       }
     elif latest_vol < HIGH_VOL_THRESHOLD:
-      # Moderate Volatility (20%-25%): 5% TECL / 10% QLD / 10% SOXL / 75% SMH
+      # Moderate Volatility (20%-25%): 10% TECL / 15% QLD / 10% SOXL / 65% SMH
       return {
-          "TECL": 0.05,
-          "QLD": 0.10,
+          "TECL": 0.10,
+          "QLD": 0.15,
           "SOXL": 0.10,
-          "SMH": 0.75,
+          "SMH": 0.65,
           "GLD": 0.00,
           "SPMO": 0.00,
       }
@@ -134,14 +136,14 @@ def strategy_c_hybrid_weights(
           "SPMO": 0.00,
       }
 
-  # Bear Regime Allocation (Risk-Off): 100% SPMO Momentum
+  # Bear Regime Allocation (Risk-Off): 80% SPMO / 20% GLD Hedge
   return {
       "TECL": 0.00,
       "QLD": 0.00,
       "SOXL": 0.00,
       "SMH": 0.00,
-      "GLD": 0.00,
-      "SPMO": 1.00,
+      "GLD": 0.20,
+      "SPMO": 0.80,
   }
 
 
@@ -226,7 +228,7 @@ def build_email_body(
 ) -> str:
   """Formats the rebalance alert email."""
   lines = [
-      "ROTH IRA Rebalance Alert",
+      "Strategy C High-Growth Rebalance Alert",
       "",
       f"Date: {report_date}",
       f"Regime: {regime_label}",
@@ -305,7 +307,7 @@ def main():
   latest_regime = int(regime[-1])
   regime_label = "BULL (Risk-On)" if latest_regime == 1 else "BEAR (Risk-Off)"
 
-  target_weights = strategy_c_hybrid_weights(latest_regime, latest_vol)
+  target_weights = strategy_c_high_growth_weights(latest_regime, latest_vol)
   rebalance_df, portfolio_value, needs_rebalance = build_rebalance_table(
       close, target_weights
   )
@@ -325,7 +327,7 @@ def main():
   print("-" * 50)
 
   if needs_rebalance:
-    subject = f"ROTH IRA Rebalance Alert - {latest_date}"
+    subject = f"Strategy C High-Growth Rebalance Alert - {latest_date}"
     body = build_email_body(
         latest_date,
         regime_label,
