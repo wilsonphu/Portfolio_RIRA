@@ -1,3 +1,5 @@
+import argparse
+import json
 import os
 import smtplib
 from datetime import datetime, timedelta
@@ -9,10 +11,12 @@ import pandas as pd
 import yfinance as yf
 
 # ==========================================
-# 1. USER CONFIGURATION
+# 1. STATE & USER CONFIGURATION
 # ==========================================
-# Includes TECL so if you currently hold TECL, the script generates the transition trades.
-CURRENT_HOLDINGS = {
+STATE_FILE = "portfolio_state.json"
+
+# Initial holdings (used ONLY on the first run if portfolio_state.json doesn't exist)
+INITIAL_HOLDINGS = {
     "QLD": 0.0,
     "TECL": 5.9043,
     "SOXL": 0.0,
@@ -42,7 +46,34 @@ VOL_LOOKBACK = 10  # 10 trading days rolling window
 
 
 # ==========================================
-# 3. DATA + SIGNALS
+# 3. STATE PERSISTENCE ENGINE
+# ==========================================
+def load_portfolio_state() -> Dict[str, float]:
+  """Loads portfolio state from JSON file if available; otherwise uses INITIAL_HOLDINGS."""
+  if os.path.exists(STATE_FILE):
+    try:
+      with open(STATE_FILE, "r") as f:
+        holdings = json.load(f)
+        return holdings
+    except Exception as e:
+      print(f"Warning: Could not read {STATE_FILE}, using initial holdings: {e}")
+  return INITIAL_HOLDINGS.copy()
+
+
+def save_portfolio_state(target_shares: Dict[str, float], cash: float = 0.0):
+  """Saves post-trade target shares to JSON file so future runs assume trades were executed."""
+  try:
+    state = target_shares.copy()
+    state["CASH"] = round(cash, 2)
+    with open(STATE_FILE, "w") as f:
+      json.dump(state, f, indent=4)
+    print(f"DEBUG: Portfolio state successfully saved to {STATE_FILE}")
+  except Exception as e:
+    print(f"Error saving portfolio state: {e}")
+
+
+# ==========================================
+# 4. DATA + SIGNALS
 # ==========================================
 def download_data(tickers: list, start: str, end: str) -> pd.DataFrame:
   """Downloads historical data and returns forward-filled closing prices."""
@@ -103,7 +134,6 @@ def strategy_c_high_growth_weights(
 ) -> Dict[str, float]:
   """Target weights for Strategy C High-Growth Variant."""
   if regime_value == 1:
-    # Bull Regime Allocation (Risk-On)
     if np.isnan(latest_vol) or latest_vol < LOW_VOL_THRESHOLD:
       # Low Volatility (<20%): 20% TECL / 30% QLD / 15% SOXL / 35% SMH
       return {
@@ -147,31 +177,38 @@ def strategy_c_high_growth_weights(
 
 
 # ==========================================
-# 4. REBALANCE ENGINE
+# 5. REBALANCE ENGINE
 # ==========================================
 def build_rebalance_table(
-    close_data: pd.DataFrame, target_weights: Dict[str, float]
-) -> Tuple[pd.DataFrame, float, bool]:
+    close_data: pd.DataFrame,
+    current_holdings: Dict[str, float],
+    target_weights: Dict[str, float],
+) -> Tuple[pd.DataFrame, float, bool, Dict[str, float]]:
   """Calculates necessary trades based on current drift from target weights."""
   latest_prices = {}
-  for t in CURRENT_HOLDINGS:
+  all_possible_tickers = set(
+      list(current_holdings.keys()) + list(target_weights.keys())
+  )
+
+  for t in all_possible_tickers:
     if t != "CASH":
       if t in close_data.columns:
         latest_prices[t] = float(close_data[t].iloc[-1])
       else:
         latest_prices[t] = 0.0
 
-  portfolio_value = float(CURRENT_HOLDINGS.get("CASH", 0.0))
-  for ticker, shares in CURRENT_HOLDINGS.items():
+  portfolio_value = float(current_holdings.get("CASH", 0.0))
+  for ticker, shares in current_holdings.items():
     if ticker != "CASH":
       portfolio_value += float(shares) * latest_prices.get(ticker, 0.0)
 
   rows = []
   needs_rebalance = False
+  target_shares_dict = {}
   trade_tickers = ["TECL", "QLD", "SOXL", "SMH", "GLD", "SPMO"]
 
   for ticker in trade_tickers:
-    current_shares = float(CURRENT_HOLDINGS.get(ticker, 0.0))
+    current_shares = float(current_holdings.get(ticker, 0.0))
     price = latest_prices.get(ticker, 0.0)
     current_value = current_shares * price
     current_pct = (
@@ -181,6 +218,7 @@ def build_rebalance_table(
     target_pct = float(target_weights.get(ticker, 0.0))
     target_value = target_pct * portfolio_value
     target_shares = round(target_value / price, 4) if price > 0 else 0.0
+    target_shares_dict[ticker] = target_shares
 
     share_diff = round(target_shares - current_shares, 4)
     trade_value = abs(share_diff) * price
@@ -213,11 +251,11 @@ def build_rebalance_table(
     })
 
   df = pd.DataFrame(rows)
-  return df, portfolio_value, needs_rebalance
+  return df, portfolio_value, needs_rebalance, target_shares_dict
 
 
 # ==========================================
-# 5. EXECUTIVE DASHBOARD & EMAIL FORMATTER
+# 6. DASHBOARD & EMAIL FORMATTER
 # ==========================================
 def format_console_dashboard(
     report_date: str,
@@ -234,7 +272,7 @@ def format_console_dashboard(
 
   lines = [
       border,
-      "  🚀 ROTH IRA EXECUTIVE DASHBOARD",
+      "  🚀 ROTH IRA STRATEGY C EXECUTIVE DASHBOARD",
       border,
       (
           f"  Date: {report_date:<15} | Portfolio Value:"
@@ -263,13 +301,12 @@ def format_console_dashboard(
       )
   else:
     lines.append(
-        "  • No trades required. Portfolio is fully aligned with target"
-        " weights."
+        "  • Portfolio fully aligned with target weights. No trades required."
     )
 
   lines.extend([
       sub_border,
-      "  2. PORTFOLIO BREAKDOWN (CURRENT vs PROPOSED TARGET)",
+      "  2. PORTFOLIO BREAKDOWN (CURRENT vs NEW TARGET)",
       sub_border,
       (
           f"  {'Ticker':<8} {'Price':<10} {'Current %':<12} {'Target %':<10}"
@@ -404,7 +441,7 @@ def build_html_email(
             </div>
 
             <div class="card">
-                <div class="card-title">2. Portfolio Breakdown (Current vs Proposed Target)</div>
+                <div class="card-title">2. Portfolio Breakdown (Current vs Target)</div>
                 <table>
                     <thead>
                         <tr><th>Ticker</th><th>Price</th><th>Current Allocation</th><th>Proposed Target</th></tr>
@@ -467,9 +504,22 @@ def send_email(subject, text_body, html_body):
 
 
 # ==========================================
-# 6. MAIN EXECUTION
+# 7. MAIN EXECUTION
 # ==========================================
 def main():
+  parser = argparse.ArgumentParser(
+      description="Strategy C High-Growth Portfolio Engine"
+  )
+  parser.add_argument(
+      "--test",
+      action="store_true",
+      help="Run in test mode (prints dashboard to console, skips email)",
+  )
+  args = parser.parse_args()
+
+  # Load persisted portfolio state (never requires manually editing CURRENT_HOLDINGS in code)
+  current_holdings = load_portfolio_state()
+
   close = download_data(TICKERS, START_DATE, END_DATE)
 
   if "QQQ" not in close.columns or close["QQQ"].dropna().empty:
@@ -489,11 +539,11 @@ def main():
   regime_label = "BULL (Risk-On)" if latest_regime == 1 else "BEAR (Risk-Off)"
 
   target_weights = strategy_c_high_growth_weights(latest_regime, latest_vol)
-  rebalance_df, portfolio_value, needs_rebalance = build_rebalance_table(
-      close, target_weights
+  rebalance_df, portfolio_value, needs_rebalance, target_shares_dict = (
+      build_rebalance_table(close, current_holdings, target_weights)
   )
 
-  # Generate Dashboard Outputs
+  # Generate Dashboard Output
   console_dashboard = format_console_dashboard(
       latest_date,
       regime_label,
@@ -505,20 +555,30 @@ def main():
   )
   print(console_dashboard)
 
+  # Email dispatch & state auto-persistence logic
   if needs_rebalance:
-    subject = f"ROTH IRA Rebalance Alert - {latest_date}"
-    html_email = build_html_email(
-        latest_date,
-        regime_label,
-        latest_qqq,
-        latest_vol,
-        lower_band_val,
-        portfolio_value,
-        rebalance_df,
-    )
-    send_email(subject, console_dashboard, html_email)
+    if args.test:
+      print("\n[TEST MODE ACTIVE]: Rebalance required, but email was skipped.")
+    else:
+      subject = f"ROTH IRA Rebalance Alert - {latest_date}"
+      html_email = build_html_email(
+          latest_date,
+          regime_label,
+          latest_qqq,
+          latest_vol,
+          lower_band_val,
+          portfolio_value,
+          rebalance_df,
+      )
+      send_email(subject, console_dashboard, html_email)
+
+      # Auto-persist post-trade target holdings so future runs assume trades were executed
+      save_portfolio_state(target_shares_dict, cash=0.0)
   else:
-    print("\nNo rebalance needed. Portfolio is fully aligned within tolerance.")
+    print(
+        "\nNo rebalance needed. Portfolio is fully aligned within tolerance."
+        " No email sent."
+    )
 
 
 if __name__ == "__main__":
