@@ -11,14 +11,13 @@ import yfinance as yf
 # ==========================================
 # 1. USER CONFIGURATION
 # ==========================================
-# Includes TECL so if you currently hold TECL, the script automatically generates the SELL transition trade.
 CURRENT_HOLDINGS = {
     "QLD": 0.0,
+    "TECL": 5.9043,
     "SOXL": 0.0,
     "SMH": 0.0,
     "GLD": 0.0,
     "SPMO": 0.0,
-    "TECL": 5.9043,
     "CASH": 1.28,
 }
 
@@ -27,19 +26,18 @@ DRIFT_THRESHOLD = 0.02  # 2 percentage points drift required to trade
 MIN_NOTIONAL_TRADE = 25.00  # Ignore tiny trades under $25
 
 # ==========================================
-# 2. SYSTEM PARAMETERS (STRATEGY C)
+# 2. SYSTEM PARAMETERS (STRATEGY C HYBRID)
 # ==========================================
-# Extended lookback window to 750 days for 200 EMA warmup stability
 START_DATE = (datetime.today() - timedelta(days=750)).strftime("%Y-%m-%d")
 END_DATE = datetime.today().strftime("%Y-%m-%d")
 
-TICKERS = ["QQQ", "QLD", "SOXL", "SMH", "SPMO", "SPY", "GLD", "TECL", "^IRX"]
+TICKERS = ["QQQ", "QLD", "TECL", "SOXL", "SMH", "SPMO", "SPY", "GLD", "^IRX"]
 
-BAND_PCT = 0.04  # 4% band around 200 EMA
-CONFIRM_DAYS = 5  # 5 days confirmation hysteresis
+BAND_PCT = 0.04
+CONFIRM_DAYS = 5
 LOW_VOL_THRESHOLD = 0.20  # 20% annualized QQQ vol
 HIGH_VOL_THRESHOLD = 0.25  # 25% annualized QQQ vol
-VOL_LOOKBACK = 10  # 10 trading days rolling window
+VOL_LOOKBACK = 10
 
 
 # ==========================================
@@ -74,7 +72,6 @@ def build_regime_filter(
   u = upper.values
   l = lower.values
 
-  # Start regime calculation after warmup
   start_idx = min(200, len(qqq_close) - 1)
   for i in range(start_idx, len(qqq_close)):
     if q[i] > u[i]:
@@ -100,24 +97,52 @@ def build_regime_filter(
   return ema200, upper, lower, confirmed
 
 
-def strategy_c_target_weights(
+def strategy_c_hybrid_weights(
     regime_value: int, latest_vol: float
 ) -> Dict[str, float]:
-  """Determines target weights for Strategy C (2x QLD replacing 3x TECL)."""
+  """Determines target weights for Strategy C Hybrid (10% TECL / 15% QLD / 20% SOXL / 55% SMH)."""
   if regime_value == 1:
     # Bull Regime Allocation (Risk-On)
     if np.isnan(latest_vol) or latest_vol < LOW_VOL_THRESHOLD:
-      # Low Volatility (<20%): 20% QLD / 20% SOXL / 60% SMH
-      return {"QLD": 0.20, "SOXL": 0.20, "SMH": 0.60, "GLD": 0.00, "SPMO": 0.00}
+      # Low Volatility (<20%): 10% TECL / 15% QLD / 20% SOXL / 55% SMH
+      return {
+          "TECL": 0.10,
+          "QLD": 0.15,
+          "SOXL": 0.20,
+          "SMH": 0.55,
+          "GLD": 0.00,
+          "SPMO": 0.00,
+      }
     elif latest_vol < HIGH_VOL_THRESHOLD:
-      # Moderate Volatility (20%-25%): 10% QLD / 10% SOXL / 80% SMH
-      return {"QLD": 0.10, "SOXL": 0.10, "SMH": 0.80, "GLD": 0.00, "SPMO": 0.00}
+      # Moderate Volatility (20%-25%): 5% TECL / 10% QLD / 10% SOXL / 75% SMH
+      return {
+          "TECL": 0.05,
+          "QLD": 0.10,
+          "SOXL": 0.10,
+          "SMH": 0.75,
+          "GLD": 0.00,
+          "SPMO": 0.00,
+      }
     else:
       # High Volatility (>25%): 80% SMH / 20% GLD
-      return {"QLD": 0.00, "SOXL": 0.00, "SMH": 0.80, "GLD": 0.20, "SPMO": 0.00}
+      return {
+          "TECL": 0.00,
+          "QLD": 0.00,
+          "SOXL": 0.00,
+          "SMH": 0.80,
+          "GLD": 0.20,
+          "SPMO": 0.00,
+      }
 
   # Bear Regime Allocation (Risk-Off): 100% SPMO Momentum
-  return {"QLD": 0.00, "SOXL": 0.00, "SMH": 0.00, "GLD": 0.00, "SPMO": 1.00}
+  return {
+      "TECL": 0.00,
+      "QLD": 0.00,
+      "SOXL": 0.00,
+      "SMH": 0.00,
+      "GLD": 0.00,
+      "SPMO": 1.00,
+  }
 
 
 # ==========================================
@@ -127,7 +152,6 @@ def build_rebalance_table(
     close_data: pd.DataFrame, target_weights: Dict[str, float]
 ) -> Tuple[pd.DataFrame, float, bool]:
   """Calculates necessary trades based on current drift from target weights."""
-  # Safely extract latest price for each holding
   latest_prices = {}
   for t in CURRENT_HOLDINGS:
     if t != "CASH":
@@ -143,7 +167,7 @@ def build_rebalance_table(
 
   rows = []
   needs_rebalance = False
-  trade_tickers = ["QLD", "SOXL", "SMH", "GLD", "SPMO", "TECL"]
+  trade_tickers = ["TECL", "QLD", "SOXL", "SMH", "GLD", "SPMO"]
 
   for ticker in trade_tickers:
     current_shares = float(CURRENT_HOLDINGS.get(ticker, 0.0))
@@ -155,8 +179,6 @@ def build_rebalance_table(
 
     target_pct = float(target_weights.get(ticker, 0.0))
     target_value = target_pct * portfolio_value
-
-    # Guard against division by zero if price is missing/zero
     target_shares = round(target_value / price, 4) if price > 0 else 0.0
 
     share_diff = round(target_shares - current_shares, 4)
@@ -204,7 +226,7 @@ def build_email_body(
 ) -> str:
   """Formats the rebalance alert email."""
   lines = [
-      "Strategy C Rebalance Alert",
+      "ROTH IRA Rebalance Alert",
       "",
       f"Date: {report_date}",
       f"Regime: {regime_label}",
@@ -283,7 +305,7 @@ def main():
   latest_regime = int(regime[-1])
   regime_label = "BULL (Risk-On)" if latest_regime == 1 else "BEAR (Risk-Off)"
 
-  target_weights = strategy_c_target_weights(latest_regime, latest_vol)
+  target_weights = strategy_c_hybrid_weights(latest_regime, latest_vol)
   rebalance_df, portfolio_value, needs_rebalance = build_rebalance_table(
       close, target_weights
   )
@@ -303,7 +325,7 @@ def main():
   print("-" * 50)
 
   if needs_rebalance:
-    subject = f"Strategy C Rebalance Alert - {latest_date}"
+    subject = f"Strategy C Hybrid Rebalance Alert - {latest_date}"
     body = build_email_body(
         latest_date,
         regime_label,
