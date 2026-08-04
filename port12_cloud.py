@@ -506,7 +506,7 @@ def main():
   print(console_dashboard)
 
   if needs_rebalance:
-    subject = f"Strategy C Rebalance Alert - {latest_date}"
+    subject = f"ROTH IRA Rebalance Alert - {latest_date}"
     html_email = build_html_email(
         latest_date,
         regime_label,
