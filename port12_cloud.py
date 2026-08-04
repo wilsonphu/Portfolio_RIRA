@@ -224,6 +224,12 @@ def send_email(subject, body):
 # 6. MAIN
 # ==========================================
 def main():
+    send_email(
+        "Portfolio 12 Test Email",
+        "This is a forced test from GitHub Actions."
+    )
+    print("Forced test email attempted.")
+    
     close = download_data(TICKERS, START_DATE, END_DATE)
     qqq = close["QQQ"]
     _, _, _, regime = build_regime_filter(qqq)
