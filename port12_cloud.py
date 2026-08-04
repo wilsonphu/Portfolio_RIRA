@@ -325,7 +325,7 @@ def main():
   print("-" * 50)
 
   if needs_rebalance:
-    subject = f"Strategy C Hybrid Rebalance Alert - {latest_date}"
+    subject = f"ROTH IRA Rebalance Alert - {latest_date}"
     body = build_email_body(
         latest_date,
         regime_label,
