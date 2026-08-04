@@ -12,17 +12,17 @@ import yfinance as yf
 # 1. USER CONFIGURATION
 # ==========================================
 CURRENT_HOLDINGS = {
-    "TECL": 0.0,
+    "TECL": 5.9043,
     "SOXL": 0.0,
     "SMH": 0.0,
     "GLD": 0.0,
     "SPMO": 0.0,
-    "CASH": 1.00,
+    "CASH": 1.28,
 }
 
 # Email only if a position is off target by at least this much.
-DRIFT_THRESHOLD = 0.00      # 2 percentage points
-MIN_NOTIONAL_TRADE = 0.01   # Ignore tiny trades under $25
+DRIFT_THRESHOLD = 0.02     # 2 percentage points
+MIN_NOTIONAL_TRADE = 25.00   # Ignore tiny trades under $25
 
 # ==========================================
 # 2. SYSTEM PARAMETERS
