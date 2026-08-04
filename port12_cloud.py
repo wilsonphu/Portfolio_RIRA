@@ -195,32 +195,30 @@ def build_email_body(report_date: str, regime_label: str, latest_vol: float,
 
     return "\n".join(lines)
 
-def send_email(subject: str, body: str):
-    """Sends the alert email via SMTP."""
-    smtp_host = os.environ.get("SMTP_HOST")
-    smtp_port = int(os.environ.get("SMTP_PORT", "587"))
-    smtp_user = os.environ.get("SMTP_USER")
-    smtp_password = os.environ.get("SMTP_PASSWORD")
-    from_email = os.environ.get("FROM_EMAIL")
-    to_email = os.environ.get("TO_EMAIL")
+def send_email(subject, body):
+    gmail_address = os.environ.get("GMAIL_ADDRESS")
+    gmail_password = os.environ.get("GMAIL_APP_PASSWORD")
+    receiver_email = os.environ.get("RECEIVER_EMAIL")
 
-    if not all([smtp_host, smtp_user, smtp_password, from_email, to_email]):
-        print("\n[WARNING] Email environment variables are not fully set. Skipping email notification.")
-        return
+    print(f"DEBUG: GMAIL_ADDRESS set? {bool(gmail_address)}")
+    print(f"DEBUG: GMAIL_APP_PASSWORD set? {bool(gmail_password)}")
+    print(f"DEBUG: RECEIVER_EMAIL = {receiver_email}")
+
+    if not all([gmail_address, gmail_password, receiver_email]):
+        raise ValueError("Missing one or more required email environment variables")
 
     msg = EmailMessage()
     msg["Subject"] = subject
-    msg["From"] = from_email
-    msg["To"] = to_email
+    msg["From"] = gmail_address
+    msg["To"] = receiver_email
     msg.set_content(body)
 
-    try:
-        with smtplib.SMTP(smtp_host, smtp_port) as server:
-            server.starttls()
-            server.login(smtp_user, smtp_password)
-            server.send_message(msg)
-    except Exception as e:
-        print(f"\n[ERROR] Failed to send email: {e}")
+    with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as server:
+        server.starttls()
+        server.login(gmail_address, gmail_password)
+        server.send_message(msg)
+
+    print("DEBUG: email sent successfully")
 
 # ==========================================
 # 6. MAIN
