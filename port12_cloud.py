@@ -11,7 +11,7 @@ import yfinance as yf
 # ==========================================
 # 1. USER CONFIGURATION
 # ==========================================
-# Includes TECL so if you currently hold TECL, the script generates the sell transition trade.
+# Includes TECL so if you currently hold TECL, the script automatically generates the SELL transition trade.
 CURRENT_HOLDINGS = {
     "QLD": 0.0,
     "SOXL": 0.0,
@@ -29,16 +29,17 @@ MIN_NOTIONAL_TRADE = 25.00  # Ignore tiny trades under $25
 # ==========================================
 # 2. SYSTEM PARAMETERS (STRATEGY C)
 # ==========================================
-START_DATE = (datetime.today() - timedelta(days=550)).strftime("%Y-%m-%d")
+# Extended lookback window to 750 days for 200 EMA warmup stability
+START_DATE = (datetime.today() - timedelta(days=750)).strftime("%Y-%m-%d")
 END_DATE = datetime.today().strftime("%Y-%m-%d")
 
-TICKERS = ["QQQ", "QLD", "SOXL", "SMH", "SPMO", "SPY", "GLD", "^IRX"]
+TICKERS = ["QQQ", "QLD", "SOXL", "SMH", "SPMO", "SPY", "GLD", "TECL", "^IRX"]
 
-BAND_PCT = 0.04
-CONFIRM_DAYS = 5
+BAND_PCT = 0.04  # 4% band around 200 EMA
+CONFIRM_DAYS = 5  # 5 days confirmation hysteresis
 LOW_VOL_THRESHOLD = 0.20  # 20% annualized QQQ vol
 HIGH_VOL_THRESHOLD = 0.25  # 25% annualized QQQ vol
-VOL_LOOKBACK = 10
+VOL_LOOKBACK = 10  # 10 trading days rolling window
 
 
 # ==========================================
@@ -55,7 +56,7 @@ def download_data(tickers: list, start: str, end: str) -> pd.DataFrame:
   else:
     close = pd.DataFrame(data["Close"])
 
-  return close.ffill()
+  return close.ffill().bfill().dropna(how="all")
 
 
 def build_regime_filter(
@@ -73,7 +74,9 @@ def build_regime_filter(
   u = upper.values
   l = lower.values
 
-  for i in range(200, len(qqq_close)):
+  # Start regime calculation after warmup
+  start_idx = min(200, len(qqq_close) - 1)
+  for i in range(start_idx, len(qqq_close)):
     if q[i] > u[i]:
       current = 1
     elif q[i] < l[i]:
@@ -124,13 +127,16 @@ def build_rebalance_table(
     close_data: pd.DataFrame, target_weights: Dict[str, float]
 ) -> Tuple[pd.DataFrame, float, bool]:
   """Calculates necessary trades based on current drift from target weights."""
-  latest_prices = {
-      t: float(close_data[t].iloc[-1])
-      for t in CURRENT_HOLDINGS
-      if t != "CASH"
-  }
-  portfolio_value = float(CURRENT_HOLDINGS.get("CASH", 0.0))
+  # Safely extract latest price for each holding
+  latest_prices = {}
+  for t in CURRENT_HOLDINGS:
+    if t != "CASH":
+      if t in close_data.columns:
+        latest_prices[t] = float(close_data[t].iloc[-1])
+      else:
+        latest_prices[t] = 0.0
 
+  portfolio_value = float(CURRENT_HOLDINGS.get("CASH", 0.0))
   for ticker, shares in CURRENT_HOLDINGS.items():
     if ticker != "CASH":
       portfolio_value += float(shares) * latest_prices.get(ticker, 0.0)
@@ -149,6 +155,8 @@ def build_rebalance_table(
 
     target_pct = float(target_weights.get(ticker, 0.0))
     target_value = target_pct * portfolio_value
+
+    # Guard against division by zero if price is missing/zero
     target_shares = round(target_value / price, 4) if price > 0 else 0.0
 
     share_diff = round(target_shares - current_shares, 4)
@@ -196,7 +204,7 @@ def build_email_body(
 ) -> str:
   """Formats the rebalance alert email."""
   lines = [
-      "ROTH IRA Rebalance Alert",
+      "Strategy C Rebalance Alert",
       "",
       f"Date: {report_date}",
       f"Regime: {regime_label}",
@@ -210,7 +218,7 @@ def build_email_body(
   actionable = rebalance_df[rebalance_df["Action"] != "HOLD"]
   for _, row in actionable.iterrows():
     lines.append(
-        f"- {row['Ticker']}: {row['Action']} shares | "
+        f"- {row['Ticker']}: {row['Action']} | "
         f"Current {row['CurrentPct']:.1%} -> Target {row['TargetPct']:.1%} | "
         f"Approx ${row['TradeValue']:.2f}"
     )
@@ -237,18 +245,21 @@ def send_email(subject, body):
     )
     return
 
-  msg = EmailMessage()
-  msg["Subject"] = subject
-  msg["From"] = gmail_address
-  msg["To"] = receiver_email
-  msg.set_content(body)
+  try:
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = gmail_address
+    msg["To"] = receiver_email
+    msg.set_content(body)
 
-  with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as server:
-    server.starttls()
-    server.login(gmail_address, gmail_password)
-    server.send_message(msg)
+    with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as server:
+      server.starttls()
+      server.login(gmail_address, gmail_password)
+      server.send_message(msg)
 
-  print("DEBUG: Email sent successfully.")
+    print("DEBUG: Email sent successfully.")
+  except Exception as e:
+    print(f"Error sending email: {e}")
 
 
 # ==========================================
@@ -256,6 +267,11 @@ def send_email(subject, body):
 # ==========================================
 def main():
   close = download_data(TICKERS, START_DATE, END_DATE)
+
+  if "QQQ" not in close.columns or close["QQQ"].dropna().empty:
+    print("Error: Could not retrieve QQQ price data.")
+    return
+
   qqq = close["QQQ"]
   _, _, _, regime = build_regime_filter(qqq)
 
@@ -263,7 +279,7 @@ def main():
 
   latest_date = close.index[-1].strftime("%Y-%m-%d")
   latest_qqq = float(qqq.iloc[-1])
-  latest_vol = float(vol_10.iloc[-1])
+  latest_vol = float(vol_10.iloc[-1]) if not np.isnan(vol_10.iloc[-1]) else 0.18
   latest_regime = int(regime[-1])
   regime_label = "BULL (Risk-On)" if latest_regime == 1 else "BEAR (Risk-Off)"
 
