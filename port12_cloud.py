@@ -234,7 +234,7 @@ def format_console_dashboard(
 
   lines = [
       border,
-      "  🚀 ROTH IRA STRATEGY C EXECUTIVE DASHBOARD",
+      "  🚀 ROTH IRA EXECUTIVE DASHBOARD",
       border,
       (
           f"  Date: {report_date:<15} | Portfolio Value:"
