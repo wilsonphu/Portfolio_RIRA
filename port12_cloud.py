@@ -16,12 +16,12 @@ CURRENT_HOLDINGS = {
     "SOXL": 0.0,
     "SMH": 0.0,
     "GLD": 0.0,
-    "SPMO": 99999.0,
+    "SPMO": 0.0,
     "CASH": 0.00,
 }
 
 # Email only if a position is off target by at least this much.
-DRIFT_THRESHOLD = 0.00       # 2 percentage points
+DRIFT_THRESHOLD = 0.02       # 2 percentage points
 MIN_NOTIONAL_TRADE = 25.00   # Ignore tiny trades under $25
 
 # ==========================================
