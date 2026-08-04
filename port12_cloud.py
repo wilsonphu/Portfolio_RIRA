@@ -16,7 +16,7 @@ CURRENT_HOLDINGS = {
     "SOXL": 0.0,
     "SMH": 0.0,
     "GLD": 0.0,
-    "SPMO": 0.0,
+    "SPMO": 99999.0,
     "CASH": 0.00,
 }
 
