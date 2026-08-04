@@ -1,7 +1,7 @@
 import os
 import smtplib
 from email.message import EmailMessage
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Tuple
 
 import numpy as np
@@ -27,7 +27,7 @@ MIN_NOTIONAL_TRADE = 25.00   # Ignore tiny trades under $25
 # ==========================================
 # 2. SYSTEM PARAMETERS
 # ==========================================
-START_DATE = "2014-01-01"
+START_DATE = (datetime.today() - timedelta(days=550)).strftime("%Y-%m-%d")
 END_DATE = datetime.today().strftime("%Y-%m-%d")
 
 TICKERS = ["QQQ", "TECL", "SOXL", "SMH", "SPMO", "SPY", "GLD", "^IRX"]
