@@ -20,11 +20,12 @@ CURRENT_HOLDINGS = {
     "CASH": 1.28,
 }
 
+# Rebalance Triggers
 DRIFT_THRESHOLD = 0.02      # 2 percentage points drift required to trade
 MIN_NOTIONAL_TRADE = 25.00   # Ignore tiny trades under $25
 
 # ==========================================
-# 2. SYSTEM PARAMETERS (STRATEGY F DYNAMIC ALPHA)
+# 2. SYSTEM PARAMETERS (STRATEGY F PRO)
 # ==========================================
 START_DATE = (datetime.today() - timedelta(days=550)).strftime("%Y-%m-%d")
 END_DATE = datetime.today().strftime("%Y-%m-%d")
@@ -33,8 +34,16 @@ TICKERS = ["QQQ", "TECL", "SOXL", "SMH", "SPMO", "SPY", "GLD", "^IRX"]
 
 BAND_PCT = 0.04
 CONFIRM_DAYS = 5
-VOL_LOOKBACK = 10
-MOM_LOOKBACK_DAYS = 20      # 4-week lookback for relative momentum tilt
+
+# Fine-Tuned Parameters
+MOM_LOOKBACK_DAYS = 15      # Shortened from 20 to 15 days for faster leader detection
+LOW_VOL_THRESHOLD = 0.22    # Volatility tier safeguards
+HIGH_VOL_THRESHOLD = 0.26
+
+# Allocations in Low-Vol Bull: 45% Leader / 20% Laggard / 35% SMH Core
+LEADER_WEIGHT_LOW = 0.45
+LAGGARD_WEIGHT_LOW = 0.20
+SMH_WEIGHT_LOW = 0.35
 
 # ==========================================
 # 3. DATA + SIGNALS
@@ -86,13 +95,19 @@ def build_regime_filter(qqq_close: pd.Series) -> Tuple[pd.Series, pd.Series, pd.
 
     return ema200, upper, lower, confirmed
 
-def get_dynamic_target_weights(close_data: pd.DataFrame, regime_val: int) -> Dict[str, float]:
-    """Determines target weights by evaluating relative 4-week momentum between TECL & SOXL."""
+def get_fine_tuned_target_weights(close_data: pd.DataFrame, regime_val: int) -> Dict[str, float]:
+    """Determines target weights via 15-day relative momentum ranking and volatility tiers."""
     if regime_val == 0:
         # Bear Regime: 85% SPMO, 15% GLD
         return {"TECL": 0.0, "SOXL": 0.0, "SMH": 0.0, "GLD": 0.15, "SPMO": 0.85}
 
-    # Bull Regime: Calculate 20-day (~4 week) returns for TECL and SOXL
+    # Calculate 15-day annualized volatility of QQQ
+    qqq_close = close_data["QQQ"]
+    vol_10 = qqq_close.pct_change().rolling(10).std().iloc[-1] * np.sqrt(252)
+    if np.isnan(vol_10):
+        vol_10 = 0.18
+
+    # Calculate 15-day (~3 week) returns for TECL and SOXL
     tecl_series = close_data["TECL"]
     soxl_series = close_data["SOXL"]
     
@@ -102,13 +117,19 @@ def get_dynamic_target_weights(close_data: pd.DataFrame, regime_val: int) -> Dic
     else:
         tecl_mom, soxl_mom = 0.0, 0.0
 
-    # Dynamic Tilt to the Momentum Leader
-    if soxl_mom > tecl_mom:
-        # Semiconductor Lead: Overweight SOXL
-        return {"TECL": 0.20, "SOXL": 0.40, "SMH": 0.40, "GLD": 0.00, "SPMO": 0.00}
+    # Dynamic Momentum Leader Selection
+    leader, laggard = ("SOXL", "TECL") if soxl_mom >= tecl_mom else ("TECL", "SOXL")
+
+    # Volatility-Tiered Allocation
+    if vol_10 < LOW_VOL_THRESHOLD:
+        # Low Vol (<22%): Full Alpha Allocation (45% Leader / 20% Laggard / 35% SMH)
+        return {leader: LEADER_WEIGHT_LOW, laggard: LAGGARD_WEIGHT_LOW, "SMH": SMH_WEIGHT_LOW, "GLD": 0.00, "SPMO": 0.00}
+    elif vol_10 < HIGH_VOL_THRESHOLD:
+        # Mid Vol (22%-26%): De-leveraged (22.5% Leader / 10% Laggard / 67.5% SMH)
+        return {leader: 0.225, laggard: 0.10, "SMH": 0.675, "GLD": 0.00, "SPMO": 0.00}
     else:
-        # Tech Broad Lead: Overweight TECL
-        return {"TECL": 0.40, "SOXL": 0.20, "SMH": 0.40, "GLD": 0.00, "SPMO": 0.00}
+        # High Vol (>26%): Defensive Bull (70% SMH / 15% GLD / 15% SPMO)
+        return {"TECL": 0.00, "SOXL": 0.00, "SMH": 0.70, "GLD": 0.15, "SPMO": 0.15}
 
 # ==========================================
 # 4. REBALANCE ENGINE
@@ -172,11 +193,10 @@ def main():
     _, _, _, regime = build_regime_filter(qqq)
 
     latest_date = close.index[-1].strftime("%Y-%m-%d")
-    latest_qqq = float(qqq.iloc[-1])
     latest_regime = int(regime[-1])
     regime_label = "BULL (Risk-On)" if latest_regime == 1 else "BEAR (Risk-Off)"
 
-    target_weights = get_dynamic_target_weights(close, latest_regime)
+    target_weights = get_fine_tuned_target_weights(close, latest_regime)
     rebalance_df, portfolio_value, needs_rebalance = build_rebalance_table(close, target_weights)
 
     print(f"Date: {latest_date}")
