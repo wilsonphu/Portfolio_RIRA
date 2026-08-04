@@ -21,8 +21,8 @@ CURRENT_HOLDINGS = {
 }
 
 # Email only if a position is off target by at least this much.
-DRIFT_THRESHOLD = 0.02       # 2 percentage points
-MIN_NOTIONAL_TRADE = 25.00   # Ignore tiny trades under $25
+DRIFT_THRESHOLD = 0.00      # 2 percentage points
+MIN_NOTIONAL_TRADE = 0.01   # Ignore tiny trades under $25
 
 # ==========================================
 # 2. SYSTEM PARAMETERS
