@@ -11,12 +11,14 @@ import yfinance as yf
 # ==========================================
 # 1. USER CONFIGURATION
 # ==========================================
+# Includes TECL so if you currently hold TECL, the script generates the sell transition trade.
 CURRENT_HOLDINGS = {
-    "TECL": 5.9043,
+    "QLD": 0.0,
     "SOXL": 0.0,
     "SMH": 0.0,
     "GLD": 0.0,
     "SPMO": 0.0,
+    "TECL": 5.9043,
     "CASH": 1.28,
 }
 
@@ -25,25 +27,18 @@ DRIFT_THRESHOLD = 0.02  # 2 percentage points drift required to trade
 MIN_NOTIONAL_TRADE = 25.00  # Ignore tiny trades under $25
 
 # ==========================================
-# 2. SYSTEM PARAMETERS (STRATEGY F PRO)
+# 2. SYSTEM PARAMETERS (STRATEGY C)
 # ==========================================
 START_DATE = (datetime.today() - timedelta(days=550)).strftime("%Y-%m-%d")
 END_DATE = datetime.today().strftime("%Y-%m-%d")
 
-TICKERS = ["QQQ", "TECL", "SOXL", "SMH", "SPMO", "SPY", "GLD", "^IRX"]
+TICKERS = ["QQQ", "QLD", "SOXL", "SMH", "SPMO", "SPY", "GLD", "^IRX"]
 
 BAND_PCT = 0.04
 CONFIRM_DAYS = 5
-
-# Fine-Tuned Strategy F Pro Controls
-MOM_LOOKBACK_DAYS = 15  # 15 trading days (~3 weeks) for leader detection
-LOW_VOL_THRESHOLD = 0.22  # 22% annualized QQQ vol
-HIGH_VOL_THRESHOLD = 0.26  # 26% annualized QQQ vol
-
-# Low-Vol Allocation Targets
-LEADER_WEIGHT_LOW = 0.45
-LAGGARD_WEIGHT_LOW = 0.20
-SMH_WEIGHT_LOW = 0.35
+LOW_VOL_THRESHOLD = 0.20  # 20% annualized QQQ vol
+HIGH_VOL_THRESHOLD = 0.25  # 25% annualized QQQ vol
+VOL_LOOKBACK = 10
 
 
 # ==========================================
@@ -102,59 +97,24 @@ def build_regime_filter(
   return ema200, upper, lower, confirmed
 
 
-def get_fine_tuned_target_weights(
-    close_data: pd.DataFrame, regime_val: int
+def strategy_c_target_weights(
+    regime_value: int, latest_vol: float
 ) -> Dict[str, float]:
-  """Determines target weights via 15-day relative momentum ranking and volatility tiers."""
-  if regime_val == 0:
-    # Bear Regime: 85% SPMO, 15% GLD
-    return {"TECL": 0.0, "SOXL": 0.0, "SMH": 0.0, "GLD": 0.15, "SPMO": 0.85}
+  """Determines target weights for Strategy C (2x QLD replacing 3x TECL)."""
+  if regime_value == 1:
+    # Bull Regime Allocation (Risk-On)
+    if np.isnan(latest_vol) or latest_vol < LOW_VOL_THRESHOLD:
+      # Low Volatility (<20%): 20% QLD / 20% SOXL / 60% SMH
+      return {"QLD": 0.20, "SOXL": 0.20, "SMH": 0.60, "GLD": 0.00, "SPMO": 0.00}
+    elif latest_vol < HIGH_VOL_THRESHOLD:
+      # Moderate Volatility (20%-25%): 10% QLD / 10% SOXL / 80% SMH
+      return {"QLD": 0.10, "SOXL": 0.10, "SMH": 0.80, "GLD": 0.00, "SPMO": 0.00}
+    else:
+      # High Volatility (>25%): 80% SMH / 20% GLD
+      return {"QLD": 0.00, "SOXL": 0.00, "SMH": 0.80, "GLD": 0.20, "SPMO": 0.00}
 
-  # Calculate 10-day annualized volatility of QQQ
-  qqq_close = close_data["QQQ"]
-  vol_10 = qqq_close.pct_change().rolling(10).std().iloc[-1] * np.sqrt(252)
-  if np.isnan(vol_10):
-    vol_10 = 0.18
-
-  # Calculate 15-day relative momentum
-  tecl_series = close_data["TECL"]
-  soxl_series = close_data["SOXL"]
-
-  if len(close_data) >= MOM_LOOKBACK_DAYS:
-    tecl_mom = (
-        tecl_series.iloc[-1] / tecl_series.iloc[-MOM_LOOKBACK_DAYS]
-    ) - 1
-    soxl_mom = (
-        soxl_series.iloc[-1] / soxl_series.iloc[-MOM_LOOKBACK_DAYS]
-    ) - 1
-  else:
-    tecl_mom, soxl_mom = 0.0, 0.0
-
-  # Leader Selection
-  leader, laggard = ("SOXL", "TECL") if soxl_mom >= tecl_mom else ("TECL", "SOXL")
-
-  # Volatility-Tiered Allocation
-  if vol_10 < LOW_VOL_THRESHOLD:
-    # Low Vol (<22%): 45% Leader / 20% Laggard / 35% SMH
-    return {
-        leader: LEADER_WEIGHT_LOW,
-        laggard: LAGGARD_WEIGHT_LOW,
-        "SMH": SMH_WEIGHT_LOW,
-        "GLD": 0.00,
-        "SPMO": 0.00,
-    }
-  elif vol_10 < HIGH_VOL_THRESHOLD:
-    # Mid Vol (22%-26%): 22.5% Leader / 10% Laggard / 67.5% SMH
-    return {
-        leader: 0.225,
-        laggard: 0.10,
-        "SMH": 0.675,
-        "GLD": 0.00,
-        "SPMO": 0.00,
-    }
-  else:
-    # High Vol (>26%): 70% SMH / 15% GLD / 15% SPMO
-    return {"TECL": 0.00, "SOXL": 0.00, "SMH": 0.70, "GLD": 0.15, "SPMO": 0.15}
+  # Bear Regime Allocation (Risk-Off): 100% SPMO Momentum
+  return {"QLD": 0.00, "SOXL": 0.00, "SMH": 0.00, "GLD": 0.00, "SPMO": 1.00}
 
 
 # ==========================================
@@ -177,7 +137,7 @@ def build_rebalance_table(
 
   rows = []
   needs_rebalance = False
-  trade_tickers = ["TECL", "SOXL", "SMH", "GLD", "SPMO"]
+  trade_tickers = ["QLD", "SOXL", "SMH", "GLD", "SPMO", "TECL"]
 
   for ticker in trade_tickers:
     current_shares = float(CURRENT_HOLDINGS.get(ticker, 0.0))
@@ -229,6 +189,7 @@ def build_rebalance_table(
 def build_email_body(
     report_date: str,
     regime_label: str,
+    latest_vol: float,
     latest_qqq: float,
     rebalance_df: pd.DataFrame,
     portfolio_value: float,
@@ -240,6 +201,7 @@ def build_email_body(
       f"Date: {report_date}",
       f"Regime: {regime_label}",
       f"QQQ Price: ${latest_qqq:,.2f}",
+      f"QQQ 10-Day Volatility: {latest_vol:.2%}",
       f"Portfolio Value: ${portfolio_value:,.2f}",
       "",
       "Actionable Trades Required:",
@@ -297,12 +259,15 @@ def main():
   qqq = close["QQQ"]
   _, _, _, regime = build_regime_filter(qqq)
 
+  vol_10 = qqq.pct_change().rolling(VOL_LOOKBACK).std() * np.sqrt(252)
+
   latest_date = close.index[-1].strftime("%Y-%m-%d")
   latest_qqq = float(qqq.iloc[-1])
+  latest_vol = float(vol_10.iloc[-1])
   latest_regime = int(regime[-1])
   regime_label = "BULL (Risk-On)" if latest_regime == 1 else "BEAR (Risk-Off)"
 
-  target_weights = get_fine_tuned_target_weights(close, latest_regime)
+  target_weights = strategy_c_target_weights(latest_regime, latest_vol)
   rebalance_df, portfolio_value, needs_rebalance = build_rebalance_table(
       close, target_weights
   )
@@ -322,10 +287,11 @@ def main():
   print("-" * 50)
 
   if needs_rebalance:
-    subject = f"Strategy F Pro Rebalance Alert - {latest_date}"
+    subject = f"Strategy C Rebalance Alert - {latest_date}"
     body = build_email_body(
         latest_date,
         regime_label,
+        latest_vol,
         latest_qqq,
         rebalance_df,
         portfolio_value,
