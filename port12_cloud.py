@@ -20,12 +20,11 @@ CURRENT_HOLDINGS = {
     "CASH": 1.28,
 }
 
-# Rebalance Triggers
 DRIFT_THRESHOLD = 0.02      # 2 percentage points drift required to trade
 MIN_NOTIONAL_TRADE = 25.00   # Ignore tiny trades under $25
 
 # ==========================================
-# 2. SYSTEM PARAMETERS (STRATEGY E OPTIMIZED)
+# 2. SYSTEM PARAMETERS (STRATEGY F DYNAMIC ALPHA)
 # ==========================================
 START_DATE = (datetime.today() - timedelta(days=550)).strftime("%Y-%m-%d")
 END_DATE = datetime.today().strftime("%Y-%m-%d")
@@ -34,11 +33,8 @@ TICKERS = ["QQQ", "TECL", "SOXL", "SMH", "SPMO", "SPY", "GLD", "^IRX"]
 
 BAND_PCT = 0.04
 CONFIRM_DAYS = 5
-
-# Expanded Volatility Thresholds
-LOW_VOL_THRESHOLD = 0.22    # Raised from 0.20 to 0.22
-HIGH_VOL_THRESHOLD = 0.26   # Raised from 0.25 to 0.26
 VOL_LOOKBACK = 10
+MOM_LOOKBACK_DAYS = 20      # 4-week lookback for relative momentum tilt
 
 # ==========================================
 # 3. DATA + SIGNALS
@@ -55,7 +51,7 @@ def download_data(tickers: list, start: str, end: str) -> pd.DataFrame:
     return close.ffill()
 
 def build_regime_filter(qqq_close: pd.Series) -> Tuple[pd.Series, pd.Series, pd.Series, np.ndarray]:
-    """Calculates EMA regimes and applies confirmation smoothing."""
+    """Calculates EMA 200 regime and applies confirmation smoothing."""
     ema200 = qqq_close.ewm(span=200, adjust=False).mean()
     upper = ema200 * (1 + BAND_PCT)
     lower = ema200 * (1 - BAND_PCT)
@@ -67,7 +63,6 @@ def build_regime_filter(qqq_close: pd.Series) -> Tuple[pd.Series, pd.Series, pd.
     u = upper.values
     l = lower.values
 
-    # Generate raw signals
     for i in range(200, len(qqq_close)):
         if q[i] > u[i]:
             current = 1
@@ -75,7 +70,6 @@ def build_regime_filter(qqq_close: pd.Series) -> Tuple[pd.Series, pd.Series, pd.
             current = 0
         raw[i] = current
 
-    # Apply confirmation smoothing
     confirmed = np.ones(len(qqq_close), dtype=int)
     current_regime = 1
     days = 0
@@ -92,24 +86,29 @@ def build_regime_filter(qqq_close: pd.Series) -> Tuple[pd.Series, pd.Series, pd.
 
     return ema200, upper, lower, confirmed
 
-def barbell_weights_optimized(v10: float) -> Dict[str, float]:
-    """Returns target weights based on volatility for Strategy E."""
-    if np.isnan(v10) or v10 < LOW_VOL_THRESHOLD:
-        # Low Volatility Bull: 25% TECL, 25% SOXL, 50% SMH
-        return {"TECL": 0.25, "SOXL": 0.25, "SMH": 0.50, "GLD": 0.00, "SPMO": 0.00}
-    elif v10 < HIGH_VOL_THRESHOLD:
-        # Moderate Volatility Bull: 15% TECL, 15% SOXL, 70% SMH
-        return {"TECL": 0.15, "SOXL": 0.15, "SMH": 0.70, "GLD": 0.00, "SPMO": 0.00}
-    
-    # High Volatility Bull: 70% SMH, 15% GLD, 15% SPMO
-    return {"TECL": 0.00, "SOXL": 0.00, "SMH": 0.70, "GLD": 0.15, "SPMO": 0.15}
+def get_dynamic_target_weights(close_data: pd.DataFrame, regime_val: int) -> Dict[str, float]:
+    """Determines target weights by evaluating relative 4-week momentum between TECL & SOXL."""
+    if regime_val == 0:
+        # Bear Regime: 85% SPMO, 15% GLD
+        return {"TECL": 0.0, "SOXL": 0.0, "SMH": 0.0, "GLD": 0.15, "SPMO": 0.85}
 
-def current_target_weights(regime_value: int, latest_vol: float) -> Dict[str, float]:
-    """Determines final target allocation based on market regime and volatility."""
-    if regime_value == 1:
-        return barbell_weights_optimized(latest_vol)
-    # Bear Regime: 85% SPMO, 15% GLD (Hedged Defensive Momentum)
-    return {"TECL": 0.0, "SOXL": 0.0, "SMH": 0.0, "GLD": 0.15, "SPMO": 0.85}
+    # Bull Regime: Calculate 20-day (~4 week) returns for TECL and SOXL
+    tecl_series = close_data["TECL"]
+    soxl_series = close_data["SOXL"]
+    
+    if len(close_data) >= MOM_LOOKBACK_DAYS:
+        tecl_mom = (tecl_series.iloc[-1] / tecl_series.iloc[-MOM_LOOKBACK_DAYS]) - 1
+        soxl_mom = (soxl_series.iloc[-1] / soxl_series.iloc[-MOM_LOOKBACK_DAYS]) - 1
+    else:
+        tecl_mom, soxl_mom = 0.0, 0.0
+
+    # Dynamic Tilt to the Momentum Leader
+    if soxl_mom > tecl_mom:
+        # Semiconductor Lead: Overweight SOXL
+        return {"TECL": 0.20, "SOXL": 0.40, "SMH": 0.40, "GLD": 0.00, "SPMO": 0.00}
+    else:
+        # Tech Broad Lead: Overweight TECL
+        return {"TECL": 0.40, "SOXL": 0.20, "SMH": 0.40, "GLD": 0.00, "SPMO": 0.00}
 
 # ==========================================
 # 4. REBALANCE ENGINE
@@ -119,7 +118,6 @@ def build_rebalance_table(close_data: pd.DataFrame, target_weights: Dict[str, fl
     latest_prices = {t: float(close_data[t].iloc[-1]) for t in CURRENT_HOLDINGS if t != "CASH"}
     portfolio_value = float(CURRENT_HOLDINGS.get("CASH", 0.0))
 
-    # Calculate total portfolio value
     for ticker, shares in CURRENT_HOLDINGS.items():
         if ticker != "CASH":
             portfolio_value += float(shares) * latest_prices.get(ticker, 0.0)
@@ -166,79 +164,19 @@ def build_rebalance_table(close_data: pd.DataFrame, target_weights: Dict[str, fl
     return df, portfolio_value, needs_rebalance
 
 # ==========================================
-# 5. EMAIL
-# ==========================================
-def build_email_body(report_date: str, regime_label: str, latest_vol: float, 
-                     latest_qqq: float, rebalance_df: pd.DataFrame, portfolio_value: float) -> str:
-    """Formats the rebalance alert email."""
-    lines = [
-        "Strategy E Barbell Rebalance Alert",
-        "",
-        f"Date: {report_date}",
-        f"Regime: {regime_label}",
-        f"QQQ Price: ${latest_qqq:,.2f}",
-        f"QQQ 10-Day Volatility: {latest_vol:.2%}",
-        f"Portfolio Value: ${portfolio_value:,.2f}",
-        "",
-        "Trades required:"
-    ]
-
-    actionable = rebalance_df[rebalance_df["Action"] != "HOLD"]
-    for _, row in actionable.iterrows():
-        lines.append(
-            f"- {row['Ticker']}: {row['Action']} shares | "
-            f"Current {row['CurrentPct']:.1%} -> Target {row['TargetPct']:.1%} | "
-            f"Approx ${row['TradeValue']:.2f}"
-        )
-
-    lines.extend(["", "Full allocation snapshot:"])
-    for _, row in rebalance_df.iterrows():
-        lines.append(
-            f"- {row['Ticker']}: current {row['CurrentPct']:.1%}, "
-            f"target {row['TargetPct']:.1%}, action {row['Action']}"
-        )
-
-    return "\n".join(lines)
-
-def send_email(subject, body):
-    gmail_address = os.environ.get("GMAIL_ADDRESS")
-    gmail_password = os.environ.get("GMAIL_APP_PASSWORD")
-    receiver_email = os.environ.get("RECEIVER_EMAIL")
-
-    if not all([gmail_address, gmail_password, receiver_email]):
-        print("Warning: Missing email environment variables. Skipping email dispatch.")
-        return
-
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = gmail_address
-    msg["To"] = receiver_email
-    msg.set_content(body)
-
-    with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as server:
-        server.starttls()
-        server.login(gmail_address, gmail_password)
-        server.send_message(msg)
-
-    print("DEBUG: email sent successfully")
-
-# ==========================================
-# 6. MAIN
+# 5. MAIN
 # ==========================================
 def main():
     close = download_data(TICKERS, START_DATE, END_DATE)
     qqq = close["QQQ"]
     _, _, _, regime = build_regime_filter(qqq)
-    
-    vol_10 = qqq.pct_change().rolling(VOL_LOOKBACK).std() * np.sqrt(252)
 
     latest_date = close.index[-1].strftime("%Y-%m-%d")
     latest_qqq = float(qqq.iloc[-1])
-    latest_vol = float(vol_10.iloc[-1])
     latest_regime = int(regime[-1])
     regime_label = "BULL (Risk-On)" if latest_regime == 1 else "BEAR (Risk-Off)"
 
-    target_weights = current_target_weights(latest_regime, latest_vol)
+    target_weights = get_dynamic_target_weights(close, latest_regime)
     rebalance_df, portfolio_value, needs_rebalance = build_rebalance_table(close, target_weights)
 
     print(f"Date: {latest_date}")
@@ -250,16 +188,6 @@ def main():
     display_df['TargetPct'] = display_df['TargetPct'].apply(lambda x: f"{x:.1%}")
     print(display_df.to_string(index=False))
     print("-" * 50)
-
-    if not needs_rebalance:
-        print("No rebalance needed. No email sent.")
-        return
-
-    subject = f"Strategy E Rebalance Alert - {latest_date}"
-    body = build_email_body(latest_date, regime_label, latest_vol, latest_qqq, rebalance_df, portfolio_value)
-    
-    send_email(subject, body)
-    print("Rebalance logic complete. (Email sent if configured properly).")
 
 if __name__ == "__main__":
     main()
