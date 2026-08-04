@@ -12,12 +12,12 @@ import yfinance as yf
 # 1. USER CONFIGURATION
 # ==========================================
 CURRENT_HOLDINGS = {
-    "TECL": 5.9043,
+    "TECL": 0.0,
     "SOXL": 0.0,
     "SMH": 0.0,
     "GLD": 0.0,
     "SPMO": 0.0,
-    "CASH": 0.00,
+    "CASH": 1.00,
 }
 
 # Email only if a position is off target by at least this much.
