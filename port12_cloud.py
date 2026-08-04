@@ -235,7 +235,7 @@ def build_email_body(
 ) -> str:
   """Formats the rebalance alert email."""
   lines = [
-      "Strategy F Pro Rebalance Alert",
+      "ROTH IRA Rebalance Alert",
       "",
       f"Date: {report_date}",
       f"Regime: {regime_label}",
