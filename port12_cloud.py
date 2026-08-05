@@ -1,5 +1,4 @@
 import argparse
-import json
 import os
 import smtplib
 from datetime import datetime, timedelta
@@ -11,28 +10,16 @@ import pandas as pd
 import yfinance as yf
 
 # ==========================================
-# 1. STATE & USER CONFIGURATION
+# 1. USER CONFIGURATION
 # ==========================================
-STATE_FILE = "portfolio_state.json"
-
-# Initial holdings (used ONLY on the first run if portfolio_state.json doesn't exist)
-INITIAL_HOLDINGS = {
-    "QLD": 0.0,
-    "TECL": 5.9043,
-    "SOXL": 0.0,
-    "SMH": 0.0,
-    "GLD": 0.0,
-    "SPMO": 0.0,
-    "CASH": 1.28,
-}
-
-# Rebalance Triggers
-DRIFT_THRESHOLD = 0.02  # 2 percentage points drift required to trade
-MIN_NOTIONAL_TRADE = 25.00  # Ignore tiny trades under $25
+# All the script needs is your total Roth IRA dollar balance.
+# Can also be set via environment variable ROTH_IRA_AMOUNT
+ROTH_IRA_AMOUNT = float(os.environ.get("ROTH_IRA_AMOUNT", 1025.97))
 
 # ==========================================
 # 2. SYSTEM PARAMETERS (STRATEGY C HIGH-GROWTH)
 # ==========================================
+# Extended lookback window to 750 days for 200 EMA warmup stability
 START_DATE = (datetime.today() - timedelta(days=750)).strftime("%Y-%m-%d")
 END_DATE = datetime.today().strftime("%Y-%m-%d")
 
@@ -46,34 +33,7 @@ VOL_LOOKBACK = 10  # 10 trading days rolling window
 
 
 # ==========================================
-# 3. STATE PERSISTENCE ENGINE
-# ==========================================
-def load_portfolio_state() -> Dict[str, float]:
-  """Loads portfolio state from JSON file if available; otherwise uses INITIAL_HOLDINGS."""
-  if os.path.exists(STATE_FILE):
-    try:
-      with open(STATE_FILE, "r") as f:
-        holdings = json.load(f)
-        return holdings
-    except Exception as e:
-      print(f"Warning: Could not read {STATE_FILE}, using initial holdings: {e}")
-  return INITIAL_HOLDINGS.copy()
-
-
-def save_portfolio_state(target_shares: Dict[str, float], cash: float = 0.0):
-  """Saves post-trade target shares to JSON file so future runs assume trades were executed."""
-  try:
-    state = target_shares.copy()
-    state["CASH"] = round(cash, 2)
-    with open(STATE_FILE, "w") as f:
-      json.dump(state, f, indent=4)
-    print(f"DEBUG: Portfolio state successfully saved to {STATE_FILE}")
-  except Exception as e:
-    print(f"Error saving portfolio state: {e}")
-
-
-# ==========================================
-# 4. DATA + SIGNALS
+# 3. DATA + SIGNALS
 # ==========================================
 def download_data(tickers: list, start: str, end: str) -> pd.DataFrame:
   """Downloads historical data and returns forward-filled closing prices."""
@@ -134,6 +94,7 @@ def strategy_c_high_growth_weights(
 ) -> Dict[str, float]:
   """Target weights for Strategy C High-Growth Variant."""
   if regime_value == 1:
+    # Bull Regime Allocation (Risk-On)
     if np.isnan(latest_vol) or latest_vol < LOW_VOL_THRESHOLD:
       # Low Volatility (<20%): 20% TECL / 30% QLD / 15% SOXL / 35% SMH
       return {
@@ -177,85 +138,43 @@ def strategy_c_high_growth_weights(
 
 
 # ==========================================
-# 5. REBALANCE ENGINE
+# 4. PORTFOLIO ALLOCATION ENGINE
 # ==========================================
-def build_rebalance_table(
+def calculate_target_portfolio(
     close_data: pd.DataFrame,
-    current_holdings: Dict[str, float],
+    roth_amount: float,
     target_weights: Dict[str, float],
-) -> Tuple[pd.DataFrame, float, bool, Dict[str, float]]:
-  """Calculates necessary trades based on current drift from target weights."""
+) -> pd.DataFrame:
+  """Calculates target dollar allocations and target shares directly from total Roth IRA balance."""
   latest_prices = {}
-  all_possible_tickers = set(
-      list(current_holdings.keys()) + list(target_weights.keys())
-  )
-
-  for t in all_possible_tickers:
-    if t != "CASH":
-      if t in close_data.columns:
-        latest_prices[t] = float(close_data[t].iloc[-1])
-      else:
-        latest_prices[t] = 0.0
-
-  portfolio_value = float(current_holdings.get("CASH", 0.0))
-  for ticker, shares in current_holdings.items():
-    if ticker != "CASH":
-      portfolio_value += float(shares) * latest_prices.get(ticker, 0.0)
-
-  rows = []
-  needs_rebalance = False
-  target_shares_dict = {}
   trade_tickers = ["TECL", "QLD", "SOXL", "SMH", "GLD", "SPMO"]
 
-  for ticker in trade_tickers:
-    current_shares = float(current_holdings.get(ticker, 0.0))
-    price = latest_prices.get(ticker, 0.0)
-    current_value = current_shares * price
-    current_pct = (
-        current_value / portfolio_value if portfolio_value > 0 else 0.0
-    )
-
-    target_pct = float(target_weights.get(ticker, 0.0))
-    target_value = target_pct * portfolio_value
-    target_shares = round(target_value / price, 4) if price > 0 else 0.0
-    target_shares_dict[ticker] = target_shares
-
-    share_diff = round(target_shares - current_shares, 4)
-    trade_value = abs(share_diff) * price
-    pct_drift = abs(target_pct - current_pct)
-
-    actionable = (pct_drift >= DRIFT_THRESHOLD) and (
-        trade_value >= MIN_NOTIONAL_TRADE
-    )
-    if actionable:
-      needs_rebalance = True
-      action = (
-          f"BUY {share_diff} sh"
-          if share_diff > 0
-          else f"SELL {abs(share_diff)} sh"
-      )
+  for t in trade_tickers:
+    if t in close_data.columns:
+      latest_prices[t] = float(close_data[t].iloc[-1])
     else:
-      action = "HOLD"
+      latest_prices[t] = 0.0
+
+  rows = []
+  for ticker in trade_tickers:
+    price = latest_prices.get(ticker, 0.0)
+    target_pct = float(target_weights.get(ticker, 0.0))
+    target_value = target_pct * roth_amount
+    target_shares = round(target_value / price, 4) if price > 0 else 0.0
 
     rows.append({
         "Ticker": ticker,
         "Price": price,
-        "CurrentShares": current_shares,
-        "CurrentPct": current_pct,
         "TargetPct": target_pct,
+        "TargetValue": target_value,
         "TargetShares": target_shares,
-        "ShareDiff": share_diff,
-        "TradeValue": trade_value,
-        "PctDrift": pct_drift,
-        "Action": action,
     })
 
-  df = pd.DataFrame(rows)
-  return df, portfolio_value, needs_rebalance, target_shares_dict
+  return pd.DataFrame(rows)
 
 
 # ==========================================
-# 6. DASHBOARD & EMAIL FORMATTER
+# 5. DASHBOARD & EMAIL FORMATTER
 # ==========================================
 def format_console_dashboard(
     report_date: str,
@@ -263,7 +182,7 @@ def format_console_dashboard(
     latest_qqq: float,
     latest_vol: float,
     lower_band_val: float,
-    portfolio_value: float,
+    roth_amount: float,
     df: pd.DataFrame,
 ) -> str:
   """Formats clean, high-readability terminal logs."""
@@ -275,8 +194,8 @@ def format_console_dashboard(
       "  🚀 ROTH IRA STRATEGY C EXECUTIVE DASHBOARD",
       border,
       (
-          f"  Date: {report_date:<15} | Portfolio Value:"
-          f" ${portfolio_value:,.2f}"
+          f"  Date: {report_date:<15} | Roth IRA Total Value:"
+          f" ${roth_amount:,.2f}"
       ),
       (
           f"  Regime: {regime_label:<20} | QQQ Volatility:"
@@ -287,45 +206,25 @@ def format_console_dashboard(
           f" ${lower_band_val:,.2f}"
       ),
       sub_border,
-      "  1. ACTIONABLE TRADE EXECUTION PLAN",
-      sub_border,
-  ]
-
-  trades = df[df["TradeValue"] >= MIN_NOTIONAL_TRADE]
-  if len(trades) > 0:
-    for _, r in trades.iterrows():
-      lines.append(
-          f"  • {r['Ticker']:<5} : {r['Action']:<16} | Approx"
-          f" ${r['TradeValue']:<9,.2f} | ({r['CurrentPct']:.1%} ➔"
-          f" {r['TargetPct']:.1%})"
-      )
-  else:
-    lines.append(
-        "  • Portfolio fully aligned with target weights. No trades required."
-    )
-
-  lines.extend([
-      sub_border,
-      "  2. PORTFOLIO BREAKDOWN (CURRENT vs NEW TARGET)",
+      "  1. PORTFOLIO TARGET ALLOCATION & EXECUTION SHARES",
       sub_border,
       (
-          f"  {'Ticker':<8} {'Price':<10} {'Current %':<12} {'Target %':<10}"
-          f" {'Current $':<12} {'Target $':<12}"
+          f"  {'Ticker':<8} {'Price':<10} {'Target %':<10} {'Target $':<12}"
+          f" {'Shares to Hold':<16}"
       ),
       "  " + "─" * 68,
-  ])
+  ]
 
   for _, r in df.iterrows():
-    curr_val = r["CurrentShares"] * r["Price"]
-    tgt_val = r["TargetPct"] * portfolio_value
-    lines.append(
-        f"  {r['Ticker']:<8} ${r['Price']:<9.2f} {r['CurrentPct']*100:<11.1f}%"
-        f" {r['TargetPct']*100:<9.1f}% ${curr_val:<11.2f} ${tgt_val:<11.2f}"
-    )
+    if r["TargetPct"] > 0:
+      lines.append(
+          f"  {r['Ticker']:<8} ${r['Price']:<9.2f} {r['TargetPct']*100:<9.1f}%"
+          f" ${r['TargetValue']:<11.2f} {r['TargetShares']:<16.4f}"
+      )
 
   lines.extend([
       sub_border,
-      "  3. FUTURE PLAYS & MARKET WATCH TRIGGERS",
+      "  2. FUTURE PLAYS & MARKET WATCH TRIGGERS",
       sub_border,
       "  • NEXT VOLATILITY STEP-DOWN TRIGGER:",
       (
@@ -352,43 +251,22 @@ def build_html_email(
     latest_qqq: float,
     latest_vol: float,
     lower_band_val: float,
-    portfolio_value: float,
+    roth_amount: float,
     df: pd.DataFrame,
 ) -> str:
   """Formats rich executive HTML report for Gmail alerts."""
-  trades = df[df["TradeValue"] >= MIN_NOTIONAL_TRADE]
-
-  trade_rows_html = ""
-  if len(trades) > 0:
-    for _, r in trades.iterrows():
-      badge_color = "#28a745" if "BUY" in r["Action"] else "#dc3545"
-      trade_rows_html += f"""
-            <tr style="border-bottom: 1px solid #eee;">
-                <td style="padding: 10px; font-weight: bold;">{r['Ticker']}</td>
-                <td style="padding: 10px;"><span style="background-color: {badge_color}; color: white; padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: bold;">{r['Action']}</span></td>
-                <td style="padding: 10px; font-weight: bold;">${r['TradeValue']:,.2f}</td>
-                <td style="padding: 10px; color: #555;">{r['CurrentPct']:.1%} ➔ {r['TargetPct']:.1%}</td>
-            </tr>
-            """
-  else:
-    trade_rows_html = (
-        "<tr><td colspan='4' style='padding: 12px; text-align: center; color:"
-        " #28a745; font-weight: bold;'>Portfolio fully aligned. No trades"
-        " required.</td></tr>"
-    )
-
   table_rows_html = ""
   for _, r in df.iterrows():
-    curr_val = r["CurrentShares"] * r["Price"]
-    tgt_val = r["TargetPct"] * portfolio_value
-    table_rows_html += f"""
-        <tr style="border-bottom: 1px solid #f2f2f2;">
-            <td style="padding: 8px; font-weight: bold;">{r['Ticker']}</td>
-            <td style="padding: 8px;">${r['Price']:,.2f}</td>
-            <td style="padding: 8px;">{r['CurrentPct']*100:.1f}% (${curr_val:,.2f})</td>
-            <td style="padding: 8px; font-weight: bold; color: #0056b3;">{r['TargetPct']*100:.1f}% (${tgt_val:,.2f})</td>
-        </tr>
-        """
+    if r["TargetPct"] > 0:
+      table_rows_html += f"""
+            <tr style="border-bottom: 1px solid #f2f2f2;">
+                <td style="padding: 10px; font-weight: bold;">{r['Ticker']}</td>
+                <td style="padding: 10px;">${r['Price']:,.2f}</td>
+                <td style="padding: 10px; font-weight: bold; color: #0056b3;">{r['TargetPct']*100:.1f}%</td>
+                <td style="padding: 10px; font-weight: bold;">${r['TargetValue']:,.2f}</td>
+                <td style="padding: 10px; font-weight: bold; color: #27ae60;">{r['TargetShares']:,.4f} shares</td>
+            </tr>
+            """
 
   return f"""
     <!DOCTYPE html>
@@ -417,34 +295,22 @@ def build_html_email(
         <div class="container">
             <div class="header">
                 <h2>📈 ROTH IRA STRATEGY C DASHBOARD</h2>
-                <p>Automated Portfolio & Rebalance Report | {report_date}</p>
+                <p>Automated Portfolio Strategy & Execution Report | {report_date}</p>
             </div>
             
             <div class="card">
                 <div class="metric-grid">
-                    <div class="metric"><div class="metric-val">${portfolio_value:,.2f}</div><div class="metric-lbl">Portfolio Value</div></div>
+                    <div class="metric"><div class="metric-val">${roth_amount:,.2f}</div><div class="metric-lbl">Total Roth IRA Balance</div></div>
                     <div class="metric"><div class="metric-val" style="color: #27ae60;">{regime_label}</div><div class="metric-lbl">Market Regime</div></div>
                     <div class="metric"><div class="metric-val">${latest_qqq:,.2f}</div><div class="metric-lbl">QQQ Price</div></div>
                 </div>
             </div>
 
             <div class="card">
-                <div class="card-title">1. Actionable Trade Execution Plan</div>
+                <div class="card-title">1. Target Portfolio Shares & Allocation</div>
                 <table>
                     <thead>
-                        <tr><th>Ticker</th><th>Action</th><th>Trade Value</th><th>Target Shift</th></tr>
-                    </thead>
-                    <tbody>
-                        {trade_rows_html}
-                    </tbody>
-                </table>
-            </div>
-
-            <div class="card">
-                <div class="card-title">2. Portfolio Breakdown (Current vs Target)</div>
-                <table>
-                    <thead>
-                        <tr><th>Ticker</th><th>Price</th><th>Current Allocation</th><th>Proposed Target</th></tr>
+                        <tr><th>Ticker</th><th>Price</th><th>Target %</th><th>Target Dollar</th><th>Shares to Hold</th></tr>
                     </thead>
                     <tbody>
                         {table_rows_html}
@@ -453,7 +319,7 @@ def build_html_email(
             </div>
 
             <div class="card">
-                <div class="card-title">3. Future Plays & Market Watch Triggers</div>
+                <div class="card-title">2. Future Plays & Market Watch Triggers</div>
                 <div class="future-play">
                     <strong>⚡ Volatility Step-Down Trigger:</strong><br>
                     If QQQ 10-day volatility rises from <strong>{latest_vol:.1%}</strong> to <strong>20.0%</strong>, strategy steps down leverage to: <em>10% TECL / 15% QLD / 10% SOXL / 65% SMH</em>.
@@ -465,7 +331,7 @@ def build_html_email(
             </div>
 
             <div class="footer">
-                Strategy C High-Growth Engine | Drift Threshold: ≥2.0% | GitHub Automated Pipeline
+                Strategy C High-Growth Engine | Automated GitHub Pipeline
             </div>
         </div>
     </body>
@@ -504,22 +370,9 @@ def send_email(subject, text_body, html_body):
 
 
 # ==========================================
-# 7. MAIN EXECUTION
+# 6. MAIN EXECUTION
 # ==========================================
 def main():
-  parser = argparse.ArgumentParser(
-      description="Strategy C High-Growth Portfolio Engine"
-  )
-  parser.add_argument(
-      "--test",
-      action="store_true",
-      help="Run in test mode (prints dashboard to console, skips email)",
-  )
-  args = parser.parse_args()
-
-  # Load persisted portfolio state (never requires manually editing CURRENT_HOLDINGS in code)
-  current_holdings = load_portfolio_state()
-
   close = download_data(TICKERS, START_DATE, END_DATE)
 
   if "QQQ" not in close.columns or close["QQQ"].dropna().empty:
@@ -539,8 +392,8 @@ def main():
   regime_label = "BULL (Risk-On)" if latest_regime == 1 else "BEAR (Risk-Off)"
 
   target_weights = strategy_c_high_growth_weights(latest_regime, latest_vol)
-  rebalance_df, portfolio_value, needs_rebalance, target_shares_dict = (
-      build_rebalance_table(close, current_holdings, target_weights)
+  target_df = calculate_target_portfolio(
+      close, ROTH_IRA_AMOUNT, target_weights
   )
 
   # Generate Dashboard Output
@@ -550,35 +403,22 @@ def main():
       latest_qqq,
       latest_vol,
       lower_band_val,
-      portfolio_value,
-      rebalance_df,
+      ROTH_IRA_AMOUNT,
+      target_df,
   )
   print(console_dashboard)
 
-  # Email dispatch & state auto-persistence logic
-  if needs_rebalance:
-    if args.test:
-      print("\n[TEST MODE ACTIVE]: Rebalance required, but email was skipped.")
-    else:
-      subject = f"ROTH IRA Rebalance Alert - {latest_date}"
-      html_email = build_html_email(
-          latest_date,
-          regime_label,
-          latest_qqq,
-          latest_vol,
-          lower_band_val,
-          portfolio_value,
-          rebalance_df,
-      )
-      send_email(subject, console_dashboard, html_email)
-
-      # Auto-persist post-trade target holdings so future runs assume trades were executed
-      save_portfolio_state(target_shares_dict, cash=0.0)
-  else:
-    print(
-        "\nNo rebalance needed. Portfolio is fully aligned within tolerance."
-        " No email sent."
-    )
+  subject = f"Strategy C Portfolio Report - {latest_date}"
+  html_email = build_html_email(
+      latest_date,
+      regime_label,
+      latest_qqq,
+      latest_vol,
+      lower_band_val,
+      ROTH_IRA_AMOUNT,
+      target_df,
+  )
+  send_email(subject, console_dashboard, html_email)
 
 
 if __name__ == "__main__":
