@@ -92,7 +92,7 @@ def build_regime_filter(
 def strategy_c_hybrid_pro_weights(
     regime_value: int, latest_vol: float
 ) -> Dict[str, float]:
-  """Target weights for Strategy C Hybrid Pro (10% TECL / 15% QLD / 20% SOXL / 55% SMH)."""
+  """Target weights for ROTH (10% TECL / 15% QLD / 20% SOXL / 55% SMH)."""
   if regime_value == 1:
     # Bull Regime Allocation (Risk-On)
     if np.isnan(latest_vol) or latest_vol < LOW_VOL_THRESHOLD:
@@ -191,7 +191,7 @@ def format_console_dashboard(
 
   lines = [
       border,
-      "  🚀 ROTH IRA STRATEGY C HYBRID PRO DASHBOARD",
+      "  🚀 ROTH DASHBOARD",
       border,
       (
           f"  Date: {report_date:<15} | Roth IRA Total Value:"
@@ -294,7 +294,7 @@ def build_html_email(
     <body>
         <div class="container">
             <div class="header">
-                <h2>📈 ROTH IRA STRATEGY C HYBRID PRO DASHBOARD</h2>
+                <h2>📈 ROTH DASHBOARD</h2>
                 <p>Automated Portfolio Strategy & Execution Report | {report_date}</p>
             </div>
             
