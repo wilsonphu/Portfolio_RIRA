@@ -1,44 +1,42 @@
 #!/usr/bin/env python3
 """
-ROTH IRA - Production Allocation Engine v2
-==========================================
-Enhanced with sector momentum ETFs and drift-band optimization.
+ROTH IRA - Barbell Momentum Allocation Engine
+==============================================
+Production daily allocation engine for a Roth IRA.
 
-New in v2:
-  - Risk-on bucket expanded: QLD + TECL + SOXL + SMH (sector momentum exposure)
-  - Drift-band fix: only trades when the risk-on scalar moves >5% from last executed weight
-  - State tracks last_executed_scalar (not just shares) to prevent micro-adjustment churn
-  - Sector allocation: momentum-weighted within risk-on bucket (SOXL/TECL/SMH/QLD)
-
-Strategy (Model B+: Multi-Factor Consensus + Vol Targeting + Sector Momentum)
------------------------------------------------------------------------------
-  Regime Filter (2-of-3 consensus on QQQ):
+Strategy Architecture
+---------------------
+  Regime Filter (2-of-3 consensus on MARKET_INDEX):
     - 200-day SMA, 50-day Donchian Midband, 50-day VWMA
-    -> BULL if >=2 agree, else BEAR.
+    -> BULL if at least 2 agree, otherwise BEAR.
 
-  Risk-On Scalar (0-100%):
-    - BULL: min(TARGET_VOL / QQQ 20d vol, 100%), halved if vol > 25%
-    - BEAR: 0%
+  Three-Tier Volatility Scaling (Bull regime):
+    - Low Vol    (<15%):  45% Leader / 15% Follower / 25% SMH / 15% QLD
+    - Moderate   (15-22%): 25% Leader / 10% Follower / 45% SMH / 20% QLD
+    - High Vol   (>22%):  85% SMH / 15% GLD (de-leveraged)
 
-  Risk-On Bucket Allocation (momentum-weighted):
-    - QLD (broad 2x Nasdaq): 40% base weight
-    - TECL (3x tech): 20% base, boosted by 15d momentum vs SOXL
-    - SOXL (3x semis): 20% base, boosted by 15d momentum vs TECL
-    - SMH (1x semis): 20% base, boosted by relative strength
-    -> Sector weights rebalanced monthly, drift-band protected
+  Leader/Follower Dynamic:
+    - SOXL vs TECL 15-day momentum; winner holds the Leader slot.
+    - Switches only on >5% momentum divergence (hysteresis).
 
-  Risk-Off Bucket: 100% GLD
+  Bear Regime:
+    - 80% SPMO (defensive equity momentum) / 20% GLD (hedge).
+
+  Risk Controls:
+    - 5% rebalance band vs last target weights
+    - 45% cap on any single leveraged sector position
+    - Monthly (~21 day) sector review
 
 Environment variables:
   ROTH_IRA_AMOUNT      Current Roth IRA balance (default 1025.97)
-  GMAIL_ADDRESS        Sender Gmail (optional)
-  GMAIL_APP_PASSWORD   Gmail app password (optional)
-  RECEIVER_EMAIL       Report recipient (optional)
+  GMAIL_ADDRESS        Sender Gmail address  (optional, for email reports)
+  GMAIL_APP_PASSWORD   Gmail app password    (optional)
+  RECEIVER_EMAIL       Report recipient      (optional)
 
 CLI usage:
-  python3 roth_ira_v2.py                 # run, print dashboard, save state, send email
-  python3 roth_ira_v2.py --test          # run, print dashboard, save state, NO email
-  python3 roth_ira_v2.py --roth-amount 5000.00
+  python3 roth_ira.py                 # run, print dashboard, save state, send email
+  python3 roth_ira.py --test          # run, print dashboard, save state, NO email
+  python3 roth_ira.py --roth-amount 5000.00
 """
 
 import argparse
@@ -47,451 +45,560 @@ import logging
 import os
 import smtplib
 import sys
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from email.message import EmailMessage
 from pathlib import Path
-from typing import Dict, Tuple
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
 
 # ==========================================
-# 1. CONFIGURATION
+# 1. MARKET UNIVERSE
 # ==========================================
-ROTH_IRA_AMOUNT = float(os.environ.get("ROTH_IRA_AMOUNT", 1025.97))
-STATE_FILE = Path("roth_ira_state_v2.json")
+MARKET_INDEX = "QQQ"              # regime + volatility signal asset (never traded)
 
-# Signal universe (regime filter)
-SIGNAL_TICKER = "QQQ"
+LEVERAGED_SEMICONDUCTOR = "SOXL"  # 3x semiconductors (leader candidate)
+LEVERAGED_TECH = "TECL"           # 3x technology (leader candidate)
+SEMICONDUCTOR_ETF = "SMH"         # 1x semiconductors (stabilizer)
+LEVERAGED_INDEX = "QLD"           # 2x broad Nasdaq-100 (core)
 
-# Risk-on bucket: broad + sector momentum
-RISK_ON_BASE = {
-    "QLD": 0.40,   # Broad 2x Nasdaq-100 (core)
-    "TECL": 0.20,  # 3x Technology
-    "SOXL": 0.20,  # 3x Semiconductors
-    "SMH": 0.20,   # 1x Semiconductors (lower octane stabilizer)
-}
+DEFENSIVE_EQUITY = "SPMO"         # S&P 500 momentum (bear-regime equity)
+HEDGE_ASSET = "GLD"               # gold (hedge)
 
-# Risk-off bucket
-RISK_OFF = {"GLD": 1.0}
+LEADER_CANDIDATES = [LEVERAGED_SEMICONDUCTOR, LEVERAGED_TECH]
+LEVERAGED_SECTOR_ETFS = {LEVERAGED_SEMICONDUCTOR, LEVERAGED_TECH}
 
-# Strategy parameters
+ALL_TICKERS = [
+    MARKET_INDEX,
+    LEVERAGED_SEMICONDUCTOR,
+    LEVERAGED_TECH,
+    SEMICONDUCTOR_ETF,
+    LEVERAGED_INDEX,
+    DEFENSIVE_EQUITY,
+    HEDGE_ASSET,
+]
+
+# ==========================================
+# 2. CONSTANTS
+# ==========================================
+# Market data
 SMA_WINDOW = 200
 DONCHIAN_WINDOW = 50
 VWMA_WINDOW = 50
-VOL_WINDOW = 20
-MOMENTUM_WINDOW = 15      # for sector momentum scoring
-TARGET_VOL = 0.15
-HIGH_VOL_CUTOFF = 0.25
-REBAL_BAND = 0.05         # 5% drift band on risk-on scalar
-SECTOR_REBAL_DAYS = 21    # ~monthly sector rebalancing
-
+VOLATILITY_WINDOW = 20
+MOMENTUM_WINDOW = 15
 HISTORY_DAYS = 750
 
+# Volatility thresholds
+LOW_VOL_THRESHOLD = 0.15
+MODERATE_VOL_THRESHOLD = 0.22
+
+# Risk controls
+REBALANCE_BAND = 0.05
+MAX_LEVERAGED_POSITION = 0.45
+LEADER_SWITCH_THRESHOLD = 0.05
+SECTOR_REBALANCE_DAYS = 21
+
+# Allocation templates ("Leader"/"Follower" slots resolve at runtime)
+LOW_VOL_ALLOCATION = {"Leader": 0.45, "Follower": 0.15, SEMICONDUCTOR_ETF: 0.25, LEVERAGED_INDEX: 0.15}
+MODERATE_VOL_ALLOCATION = {"Leader": 0.25, "Follower": 0.10, SEMICONDUCTOR_ETF: 0.45, LEVERAGED_INDEX: 0.20}
+HIGH_VOL_ALLOCATION = {SEMICONDUCTOR_ETF: 0.85, HEDGE_ASSET: 0.15}
+BEAR_ALLOCATION = {DEFENSIVE_EQUITY: 0.80, HEDGE_ASSET: 0.20}
+
+# Account
+ROTH_IRA_AMOUNT = float(os.environ.get("ROTH_IRA_AMOUNT", 1025.97))
+STATE_FILE = Path("roth_ira_state.json")
+
 # ==========================================
-# 2. LOGGING & STATE
+# 3. DATA CLASSES
+# ==========================================
+@dataclass
+class StrategyResult:
+    """Output of the allocation engine: everything a report or state needs."""
+    target_weights: dict[str, float]
+    regime: str               # "BULL" | "BEAR"
+    leader: str               # "SOXL" | "TECL"
+    volatility_tier: str      # "LOW" | "MODERATE" | "HIGH" | "N/A"
+    annualized_volatility: float
+
+
+@dataclass
+class PortfolioState:
+    """Persisted account state between runs."""
+    shares: dict[str, float] = field(default_factory=dict)
+    target_weights: dict[str, float] = field(default_factory=dict)
+    portfolio_value: float = 0.0
+    leader: str | None = None
+    volatility_tier: str = "N/A"
+    regime: str = "UNKNOWN"
+    last_sector_rebalance: str = ""
+    last_updated: str = ""
+
+# ==========================================
+# 4. LOGGING
 # ==========================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.FileHandler("roth_ira_v2.log"), logging.StreamHandler(sys.stdout)],
+    handlers=[logging.FileHandler("roth_ira.log"), logging.StreamHandler(sys.stdout)],
 )
-logger = logging.getLogger("roth_ira_v2")
+logger = logging.getLogger("roth_ira")
 
-def load_state() -> Dict:
+# ==========================================
+# 5. STATE PERSISTENCE
+# ==========================================
+def load_state() -> PortfolioState:
     if STATE_FILE.exists():
         try:
             with open(STATE_FILE, "r") as f:
-                return json.load(f)
+                return PortfolioState(**json.load(f))
         except Exception as e:
             logger.warning(f"Could not read {STATE_FILE}: {e}")
-    return {}
+    return PortfolioState()
 
-def save_state(shares: Dict[str, float], weights: Dict[str, float],
-               portfolio_value: float, risk_on_scalar: float, last_sector_rebal: str):
+
+def save_state(state: PortfolioState) -> None:
     try:
-        state = {
-            "shares": {k: round(v, 4) for k, v in shares.items()},
-            "weights": {k: round(v, 4) for k, v in weights.items()},
-            "portfolio_value": round(portfolio_value, 2),
-            "risk_on_scalar": round(risk_on_scalar, 4),
-            "last_executed_scalar": round(risk_on_scalar, 4),  # For drift-band tracking
-            "last_sector_rebal": last_sector_rebal,
-            "last_updated": datetime.now().isoformat(),
-        }
+        state.last_updated = datetime.now().isoformat()
         with open(STATE_FILE, "w") as f:
-            json.dump(state, f, indent=4)
-        logger.info(f"State saved: risk_on={risk_on_scalar:.2%}, portfolio=${portfolio_value:,.2f}")
+            json.dump(asdict(state), f, indent=4)
+        logger.info(
+            f"State saved: regime={state.regime}, leader={state.leader}, "
+            f"tier={state.volatility_tier}, value=${state.portfolio_value:,.2f}"
+        )
     except Exception as e:
         logger.error(f"Error saving state: {e}")
 
 # ==========================================
-# 3. DATA ACQUISITION
+# 6. DATA ACQUISITION (real daily data only)
 # ==========================================
-def download_data(tickers: list, days: int = HISTORY_DAYS) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def download_market_data(tickers: list[str], days: int = HISTORY_DAYS) -> tuple[pd.DataFrame, pd.DataFrame]:
     start = (datetime.today() - timedelta(days=days)).strftime("%Y-%m-%d")
     end = datetime.today().strftime("%Y-%m-%d")
     logger.info(f"Downloading {tickers} from {start} to {end}")
 
     data = yf.download(tickers, start=start, end=end, auto_adjust=True, progress=False)
     if data.empty:
-        raise RuntimeError(f"No data returned for {tickers}")
+        raise RuntimeError(f"yfinance returned no data for {tickers}")
 
-    close = data["Close"].copy() if isinstance(data.columns, pd.MultiIndex) else pd.DataFrame(data["Close"])
-    volume = data["Volume"].copy() if isinstance(data.columns, pd.MultiIndex) else pd.DataFrame(data["Volume"])
-    close = close.ffill().dropna()
-    volume = volume.ffill().reindex(close.index)
+    price_data = data["Close"].copy() if isinstance(data.columns, pd.MultiIndex) else pd.DataFrame(data["Close"])
+    volume_data = data["Volume"].copy() if isinstance(data.columns, pd.MultiIndex) else pd.DataFrame(data["Volume"])
+    price_data = price_data.ffill().dropna()
+    volume_data = volume_data.ffill().reindex(price_data.index)
 
-    if len(close) < SMA_WINDOW + 5:
-        raise RuntimeError(f"Insufficient history: {len(close)} rows")
-    return close, volume
-
-# ==========================================
-# 4. INDICATORS
-# ==========================================
-def build_indicators(close: pd.DataFrame, volume: pd.DataFrame) -> pd.DataFrame:
-    ind = pd.DataFrame(index=close.index)
-    q = close[SIGNAL_TICKER]
-
-    # Regime consensus
-    ind["SMA200"] = q.rolling(SMA_WINDOW, min_periods=SMA_WINDOW).mean()
-    hi = q.rolling(DONCHIAN_WINDOW, min_periods=DONCHIAN_WINDOW).max()
-    lo = q.rolling(DONCHIAN_WINDOW, min_periods=DONCHIAN_WINDOW).min()
-    ind["DONCHIAN_MID"] = (hi + lo) / 2.0
-    pv = q * volume[SIGNAL_TICKER]
-    ind["VWMA50"] = (pv.rolling(VWMA_WINDOW, min_periods=VWMA_WINDOW).sum()
-                     / volume[SIGNAL_TICKER].rolling(VWMA_WINDOW, min_periods=VWMA_WINDOW).sum())
-
-    ind["SMA_BULL"] = (q >= ind["SMA200"]).astype(float)
-    ind["DONCHIAN_BULL"] = (q >= ind["DONCHIAN_MID"]).astype(float)
-    ind["VWMA_BULL"] = (q >= ind["VWMA50"]).astype(float)
-    ind["CONSENSUS"] = ((ind["SMA_BULL"] + ind["DONCHIAN_BULL"] + ind["VWMA_BULL"]) >= 2).astype(int)
-
-    # Volatility
-    ind["QQQ_VOL20"] = q.pct_change().rolling(VOL_WINDOW, min_periods=VOL_WINDOW).std() * np.sqrt(252)
-
-    # Sector momentum (15-day)
-    for ticker in ["TECL", "SOXL", "SMH"]:
-        if ticker in close.columns:
-            ind[f"{ticker}_MOM15"] = close[ticker].pct_change(MOMENTUM_WINDOW)
-
-    return ind
+    if len(price_data) < SMA_WINDOW + 5:
+        raise RuntimeError(f"Insufficient history: {len(price_data)} rows (need > {SMA_WINDOW + 5})")
+    return price_data, volume_data
 
 # ==========================================
-# 5. DYNAMIC ALLOCATION ENGINE (v2)
+# 7. INDICATORS (point-in-time, no lookahead)
 # ==========================================
-def get_risk_on_scalar(ind: pd.Series) -> float:
-    """Core risk-on weight: 0-100% based on regime + volatility."""
-    consensus = int(ind["CONSENSUS"])
-    vol = float(ind["QQQ_VOL20"]) if not pd.isna(ind["QQQ_VOL20"]) else TARGET_VOL
+def calculate_indicators(price_data: pd.DataFrame, volume_data: pd.DataFrame) -> pd.DataFrame:
+    indicators = pd.DataFrame(index=price_data.index)
+    index_close = price_data[MARKET_INDEX]
 
-    if consensus != 1:
-        return 0.0
-    w = min(TARGET_VOL / vol, 1.0) if vol > 0 else 1.0
-    if vol > HIGH_VOL_CUTOFF:
-        w *= 0.5
-    return float(np.clip(w, 0.0, 1.0))
+    indicators["sma_200"] = index_close.rolling(SMA_WINDOW, min_periods=SMA_WINDOW).mean()
+    channel_high = index_close.rolling(DONCHIAN_WINDOW, min_periods=DONCHIAN_WINDOW).max()
+    channel_low = index_close.rolling(DONCHIAN_WINDOW, min_periods=DONCHIAN_WINDOW).min()
+    indicators["donchian_mid"] = (channel_high + channel_low) / 2.0
 
-def get_sector_weights(ind: pd.Series, base_weights: Dict[str, float]) -> Dict[str, float]:
-    """
-    Momentum-adjusted sector allocation within risk-on bucket.
-    TECL vs SOXL: boost whichever has stronger 15d momentum.
-    SMH: boost if semis showing relative strength (SOXL+SMH momentum > TECL).
-    """
-    weights = base_weights.copy()
+    price_x_volume = index_close * volume_data[MARKET_INDEX]
+    indicators["vwma_50"] = (
+        price_x_volume.rolling(VWMA_WINDOW, min_periods=VWMA_WINDOW).sum()
+        / volume_data[MARKET_INDEX].rolling(VWMA_WINDOW, min_periods=VWMA_WINDOW).sum()
+    )
 
-    tecl_mom = float(ind.get("TECL_MOM15", 0) or 0)
-    soxl_mom = float(ind.get("SOXL_MOM15", 0) or 0)
-    smh_mom = float(ind.get("SMH_MOM15", 0) or 0)
+    indicators["sma_signal"] = (index_close >= indicators["sma_200"]).astype(float)
+    indicators["donchian_signal"] = (index_close >= indicators["donchian_mid"]).astype(float)
+    indicators["vwma_signal"] = (index_close >= indicators["vwma_50"]).astype(float)
+    indicators["bullish_consensus"] = (
+        (indicators["sma_signal"] + indicators["donchian_signal"] + indicators["vwma_signal"]) >= 2
+    ).astype(int)
 
-    # TECL vs SOXL momentum battle
-    if soxl_mom > tecl_mom * 1.1:  # SOXL significantly stronger
-        weights["SOXL"] += 0.05
-        weights["TECL"] -= 0.05
-    elif tecl_mom > soxl_mom * 1.1:  # TECL significantly stronger
-        weights["TECL"] += 0.05
-        weights["SOXL"] -= 0.05
+    indicators["annualized_volatility"] = (
+        index_close.pct_change().rolling(VOLATILITY_WINDOW, min_periods=VOLATILITY_WINDOW).std() * np.sqrt(252)
+    )
 
-    # SMH boost if semis broadly strong
-    semi_strength = (soxl_mom + smh_mom) / 2
-    if semi_strength > tecl_mom * 1.2:
-        weights["SMH"] += 0.05
-        weights["QLD"] -= 0.05
-
-    # Normalize to sum to 1
-    total = sum(weights.values())
-    return {k: v / total for k, v in weights.items()}
-
-def get_target_weights(ind: pd.Series, risk_on_scalar: float,
-                       sector_weights: Dict[str, float]) -> Dict[str, float]:
-    """Combine risk-on scalar with sector allocation and risk-off."""
-    weights = {}
-    for ticker, sector_pct in sector_weights.items():
-        weights[ticker] = risk_on_scalar * sector_pct
-    for ticker, off_pct in RISK_OFF.items():
-        weights[ticker] = (1.0 - risk_on_scalar) * off_pct
-    return weights
-
-def should_rebalance(current_scalar: float, last_executed: float, band: float = REBAL_BAND) -> bool:
-    """Drift-band fix: only trade if scalar moved >5% from last executed."""
-    return abs(current_scalar - last_executed) > band
-
-def should_rebalance_sectors(last_rebal_date: str, current_date: datetime) -> bool:
-    """Monthly sector rebalancing check."""
-    if not last_rebal_date:
-        return True
-    last = datetime.fromisoformat(last_rebal_date)
-    return (current_date - last).days >= SECTOR_REBAL_DAYS
+    indicators["soxl_momentum"] = price_data[LEVERAGED_SEMICONDUCTOR].pct_change(MOMENTUM_WINDOW)
+    indicators["tecl_momentum"] = price_data[LEVERAGED_TECH].pct_change(MOMENTUM_WINDOW)
+    return indicators
 
 # ==========================================
-# 6. PORTFOLIO CALCULATIONS
+# 8. STRATEGY CORE
 # ==========================================
-def build_target_portfolio(close: pd.DataFrame, weights: Dict[str, float],
-                           portfolio_value: float) -> pd.DataFrame:
+def classify_volatility(annualized_volatility: float) -> str:
+    """Map annualized volatility to a regime tier."""
+    if pd.isna(annualized_volatility):
+        return "MODERATE"
+    if annualized_volatility < LOW_VOL_THRESHOLD:
+        return "LOW"
+    if annualized_volatility < MODERATE_VOL_THRESHOLD:
+        return "MODERATE"
+    return "HIGH"
+
+
+def select_leader(soxl_momentum: float, tecl_momentum: float, existing_leader: str | None) -> str:
+    """Pick the momentum leader with hysteresis to prevent whipsaws."""
+    if pd.isna(soxl_momentum) or pd.isna(tecl_momentum):
+        return existing_leader or LEVERAGED_SEMICONDUCTOR
+    if existing_leader == LEVERAGED_SEMICONDUCTOR:
+        if (tecl_momentum - soxl_momentum) > LEADER_SWITCH_THRESHOLD:
+            return LEVERAGED_TECH
+        return LEVERAGED_SEMICONDUCTOR
+    if existing_leader == LEVERAGED_TECH:
+        if (soxl_momentum - tecl_momentum) > LEADER_SWITCH_THRESHOLD:
+            return LEVERAGED_SEMICONDUCTOR
+        return LEVERAGED_TECH
+    return LEVERAGED_SEMICONDUCTOR if soxl_momentum >= tecl_momentum else LEVERAGED_TECH
+
+
+def select_allocation_template(volatility_tier: str) -> dict[str, float]:
+    if volatility_tier == "LOW":
+        return LOW_VOL_ALLOCATION.copy()
+    if volatility_tier == "MODERATE":
+        return MODERATE_VOL_ALLOCATION.copy()
+    return HIGH_VOL_ALLOCATION.copy()
+
+
+def apply_allocation_template(template: dict[str, float], leader: str) -> dict[str, float]:
+    """Resolve Leader/Follower slots and enforce the leveraged position cap."""
+    follower = LEVERAGED_TECH if leader == LEVERAGED_SEMICONDUCTOR else LEVERAGED_SEMICONDUCTOR
+    target_weights: dict[str, float] = {}
+
+    for slot, proportion in template.items():
+        if slot == "Leader":
+            ticker = leader
+        elif slot == "Follower":
+            ticker = follower
+        else:
+            ticker = slot
+
+        # Cap any single leveraged sector position; spill excess into the stabilizer
+        if ticker in LEVERAGED_SECTOR_ETFS and proportion > MAX_LEVERAGED_POSITION:
+            excess = proportion - MAX_LEVERAGED_POSITION
+            proportion = MAX_LEVERAGED_POSITION
+            target_weights[SEMICONDUCTOR_ETF] = target_weights.get(SEMICONDUCTOR_ETF, 0.0) + excess
+
+        target_weights[ticker] = target_weights.get(ticker, 0.0) + proportion
+
+    return target_weights
+
+
+def determine_target_allocation(latest_indicators: pd.Series, existing_leader: str | None) -> StrategyResult:
+    """Heart of the strategy: regime, leader, volatility tier, and target weights."""
+    is_bull = int(latest_indicators["bullish_consensus"]) == 1
+    annualized_volatility = (
+        float(latest_indicators["annualized_volatility"])
+        if not pd.isna(latest_indicators["annualized_volatility"])
+        else MODERATE_VOL_THRESHOLD
+    )
+
+    if not is_bull:
+        return StrategyResult(
+            target_weights=dict(BEAR_ALLOCATION),
+            regime="BEAR",
+            leader=existing_leader or LEVERAGED_SEMICONDUCTOR,
+            volatility_tier="N/A",
+            annualized_volatility=annualized_volatility,
+        )
+
+    volatility_tier = classify_volatility(latest_indicators["annualized_volatility"])
+    leader = select_leader(
+        float(latest_indicators.get("soxl_momentum", np.nan)),
+        float(latest_indicators.get("tecl_momentum", np.nan)),
+        existing_leader,
+    )
+    template = select_allocation_template(volatility_tier)
+    target_weights = apply_allocation_template(template, leader)
+
+    total = sum(target_weights.values())
+    if total > 0:
+        target_weights = {ticker: weight / total for ticker, weight in target_weights.items()}
+
+    return StrategyResult(
+        target_weights=target_weights,
+        regime="BULL",
+        leader=leader,
+        volatility_tier=volatility_tier,
+        annualized_volatility=annualized_volatility,
+    )
+
+# ==========================================
+# 9. PORTFOLIO MATH
+# ==========================================
+def calculate_target_portfolio(price_data: pd.DataFrame, target_weights: dict[str, float],
+                               portfolio_value: float) -> pd.DataFrame:
     rows = []
-    for ticker, pct in weights.items():
-        if pct < 0.001:  # Skip near-zero positions
+    for ticker, proportion in sorted(target_weights.items(), key=lambda item: -item[1]):
+        if proportion < 0.001:
             continue
-        price = float(close[ticker].iloc[-1])
-        value = pct * portfolio_value
+        price = float(price_data[ticker].iloc[-1])
+        value = proportion * portfolio_value
         rows.append({
             "Ticker": ticker,
             "Price": price,
-            "TargetPct": pct,
+            "TargetPct": proportion,
             "TargetValue": value,
             "TargetShares": round(value / price, 4) if price > 0 else 0.0,
         })
     return pd.DataFrame(rows)
 
-def current_portfolio_value(state: Dict, close: pd.DataFrame) -> float:
-    """Calculate current portfolio value from saved shares."""
-    shares = state.get("shares", {})
-    if not shares:
-        return 0.0
+
+def existing_portfolio_value(state: PortfolioState, price_data: pd.DataFrame) -> float:
     total = 0.0
-    for ticker, share_count in shares.items():
-        if ticker in close.columns:
-            total += share_count * float(close[ticker].iloc[-1])
+    for ticker, share_count in state.shares.items():
+        if ticker in price_data.columns:
+            total += share_count * float(price_data[ticker].iloc[-1])
     return total
 
-def current_risk_on_weight(state: Dict, close: pd.DataFrame) -> float:
-    """Current risk-on weight from saved shares."""
-    shares = state.get("shares", {})
-    if not shares:
-        return -1.0
-    on_val = sum(shares.get(t, 0.0) * float(close[t].iloc[-1])
-                 for t in RISK_ON_BASE if t in close.columns)
-    total = current_portfolio_value(state, close)
-    return on_val / total if total > 0 else -1.0
+
+def existing_weights(state: PortfolioState, price_data: pd.DataFrame) -> dict[str, float]:
+    total = existing_portfolio_value(state, price_data)
+    if total <= 0:
+        return {}
+    return {
+        ticker: share_count * float(price_data[ticker].iloc[-1]) / total
+        for ticker, share_count in state.shares.items()
+        if ticker in price_data.columns and share_count > 0
+    }
+
+
+def should_rebalance(existing: dict[str, float], target: dict[str, float],
+                     band: float = REBALANCE_BAND) -> bool:
+    if not existing:
+        return True
+    tickers = set(existing) | set(target)
+    return any(abs(target.get(t, 0.0) - existing.get(t, 0.0)) > band for t in tickers)
+
+
+def sector_review_due(last_sector_rebalance: str, trade_date: datetime) -> bool:
+    if not last_sector_rebalance:
+        return True
+    return (trade_date - datetime.fromisoformat(last_sector_rebalance)).days >= SECTOR_REBALANCE_DAYS
 
 # ==========================================
-# 7. DASHBOARD & EMAIL
+# 10. DASHBOARD (composed from sections)
 # ==========================================
-def format_dashboard(date_str: str, ind: pd.Series, risk_on: float,
-                     sector_weights: Dict[str, float], portfolio_value: float,
-                     df: pd.DataFrame, rebalance_due: bool, sector_rebal_due: bool) -> str:
-    border = "=" * 88
-    regime = "BULL (Risk-On)" if ind["CONSENSUS"] == 1 else "BEAR (Risk-Off)"
-    legs = f"SMA:{int(ind['SMA_BULL'])} Donchian:{int(ind['DONCHIAN_BULL'])} VWMA:{int(ind['VWMA_BULL'])}"
-
-    lines = [
+def build_header(date_str: str, result: StrategyResult, latest_indicators: pd.Series,
+                 portfolio_value: float, rebalance_due: bool, sector_due: bool) -> str:
+    border = "=" * 92
+    legs = (f"SMA:{int(latest_indicators['sma_signal'])} "
+            f"Donchian:{int(latest_indicators['donchian_signal'])} "
+            f"VWMA:{int(latest_indicators['vwma_signal'])}")
+    follower = LEVERAGED_TECH if result.leader == LEVERAGED_SEMICONDUCTOR else LEVERAGED_SEMICONDUCTOR
+    return "\n".join([
         border,
-        "  ROTH IRA v2 - MULTI-FACTOR + SECTOR MOMENTUM ENGINE",
+        "  ROTH IRA - BARBELL MOMENTUM ENGINE",
         border,
         f"  Date: {date_str}   Portfolio Value: ${portfolio_value:,.2f}",
-        f"  Regime: {regime}   Consensus: {legs}",
-        f"  QQQ: ${float(ind.get('QQQ_CLOSE', 0)):,.2f}   20d Vol: {ind['QQQ_VOL20']*100:.1f}%",
-        f"  Risk-On Scalar: {risk_on*100:.1f}%   Sector Rebal Due: {'YES' if sector_rebal_due else 'NO'}",
-        f"  Rebalance Due: {'YES (execute today)' if rebalance_due else 'NO (within 5% drift band)'}",
-        "-" * 88,
+        f"  Regime: {result.regime}   Consensus: {legs}",
+        f"  {MARKET_INDEX} Vol: {result.annualized_volatility*100:.1f}%   Vol Tier: {result.volatility_tier}",
+        f"  Momentum Leader: {result.leader}   Follower: {follower}",
+        f"  Rebalance Due: {'YES' if rebalance_due else 'NO'}   Sector Review: {'YES' if sector_due else 'NO'}",
+    ])
+
+
+def build_allocation_table(target_portfolio: pd.DataFrame) -> str:
+    divider = "-" * 92
+    lines = [
+        divider,
         "  TARGET ALLOCATION",
-        "-" * 88,
+        divider,
         f"  {'Ticker':<8}{'Price':>10}{'Target %':>11}{'Target $':>14}{'Shares':>14}",
-        "-" * 88,
+        divider,
     ]
-    for _, r in df.iterrows():
-        lines.append(f"  {r['Ticker']:<8}${r['Price']:>9.2f}{r['TargetPct']*100:>10.1f}%"
-                     f"${r['TargetValue']:>13,.2f}{r['TargetShares']:>14.4f}")
-    lines += [
-        "-" * 88,
-        "  SECTOR WEIGHTS (within risk-on)",
-        "-" * 88,
-    ]
-    for ticker, w in sorted(sector_weights.items(), key=lambda x: -x[1]):
-        lines.append(f"  {ticker:<8}: {w*100:.1f}%")
-    lines += [
-        "-" * 88,
-        "  RULES",
-        "-" * 88,
-        "  - Regime: BULL if >=2 of {200d SMA, 50d Donchian, 50d VWMA} bullish on QQQ",
-        f"  - Risk-On: min({TARGET_VOL:.0%}/vol, 100%), halved if vol>{HIGH_VOL_CUTOFF:.0%}",
-        "  - Sectors: 40% QLD / 20% TECL / 20% SOXL / 20% SMH (momentum-adjusted)",
-        "  - Trade: only when risk-on scalar drifts >5% from last executed",
-        "  - Sector rebal: ~monthly (21 days)",
-        border,
-    ]
+    for _, row in target_portfolio.iterrows():
+        lines.append(
+            f"  {row['Ticker']:<8}${row['Price']:>9.2f}{row['TargetPct']*100:>10.1f}%"
+            f"${row['TargetValue']:>13,.2f}{row['TargetShares']:>14.4f}"
+        )
     return "\n".join(lines)
 
-def build_html_email(date_str: str, ind: pd.Series, risk_on: float,
-                     sector_weights: Dict[str, float], portfolio_value: float,
-                     df: pd.DataFrame, rebalance_due: bool) -> str:
-    regime = "BULL (Risk-On)" if ind["CONSENSUS"] == 1 else "BEAR (Risk-Off)"
+
+def build_rules_section(result: StrategyResult) -> str:
+    divider = "-" * 92
+    if result.regime == "BULL":
+        structure = {
+            "LOW": "  Low Vol: 45% Leader / 15% Follower / 25% SMH / 15% QLD",
+            "MODERATE": "  Moderate Vol: 25% Leader / 10% Follower / 45% SMH / 20% QLD",
+            "HIGH": "  High Vol: 85% SMH / 15% GLD (de-leveraged)",
+        }[result.volatility_tier]
+    else:
+        structure = "  Bear Regime: 80% SPMO / 20% GLD"
+    return "\n".join([
+        divider,
+        "  RULES & RISK CONTROLS",
+        divider,
+        structure,
+        divider,
+        f"  - Max single leveraged position : {MAX_LEVERAGED_POSITION:.0%}",
+        f"  - Rebalance band                : {REBALANCE_BAND:.0%} (trade only on >5% drift)",
+        f"  - Leader switch threshold       : {LEADER_SWITCH_THRESHOLD:.0%} momentum divergence",
+        f"  - Sector review cadence         : ~{SECTOR_REBALANCE_DAYS} days",
+        "=" * 92,
+    ])
+
+
+def build_dashboard(date_str: str, result: StrategyResult, latest_indicators: pd.Series,
+                    portfolio_value: float, target_portfolio: pd.DataFrame,
+                    rebalance_due: bool, sector_due: bool) -> str:
+    return "\n".join([
+        build_header(date_str, result, latest_indicators, portfolio_value, rebalance_due, sector_due),
+        build_allocation_table(target_portfolio),
+        build_rules_section(result),
+    ])
+
+# ==========================================
+# 11. EMAIL (composed from sections)
+# ==========================================
+def build_email_header(date_str: str, result: StrategyResult,
+                       portfolio_value: float, rebalance_due: bool) -> str:
     color = "#27ae60" if rebalance_due else "#7f8c8d"
     status = "ACTION REQUIRED: Execute Rebalance" if rebalance_due else "Hold Current Allocation"
-
-    rows_html = ""
-    for _, r in df.iterrows():
-        rows_html += f"""
-        <tr style="border-bottom:1px solid #e9ecef;">
-          <td style="padding:10px;font-weight:bold;">{r['Ticker']}</td>
-          <td style="padding:10px;">${r['Price']:,.2f}</td>
-          <td style="padding:10px;font-weight:bold;color:#0056b3;">{r['TargetPct']*100:.1f}%</td>
-          <td style="padding:10px;font-weight:bold;">${r['TargetValue']:,.2f}</td>
-          <td style="padding:10px;font-weight:bold;color:#27ae60;">{r['TargetShares']:,.4f}</td>
-        </tr>"""
-
-    sector_html = "".join(f"<li>{t}: {w*100:.1f}%</li>" for t, w in sorted(sector_weights.items(), key=lambda x: -x[1]))
-
     return f"""
-    <!DOCTYPE html><html><head><meta charset="utf-8"></head>
-    <body style="font-family:-apple-system,sans-serif;background:#f8f9fa;padding:20px;color:#333;">
-      <div style="max-width:700px;background:#fff;margin:0 auto;border-radius:8px;
-                  box-shadow:0 4px 12px rgba(0,0,0,.08);overflow:hidden;">
         <div style="background:#1a252f;color:#fff;padding:24px;text-align:center;">
-          <h2 style="margin:0;">ROTH IRA v2 - SECTOR MOMENTUM ENGINE</h2>
+          <h2 style="margin:0;">ROTH IRA - BARBELL ENGINE</h2>
           <p style="margin:6px 0 0;color:#bdc3c7;">{date_str}</p>
         </div>
         <div style="padding:20px;background:#f1f4f8;border-bottom:1px solid #e9ecef;text-align:center;">
           <div style="font-size:15px;font-weight:bold;color:{color};">{status}</div>
           <div style="font-size:12px;color:#7f8c8d;margin-top:4px;">
-            Regime: {regime} | Risk-On: {risk_on*100:.1f}% | Portfolio: ${portfolio_value:,.2f}</div>
-        </div>
-        <div style="padding:20px;display:flex;">
-          <div style="flex:1;">
-            <h4>Target Allocation</h4>
-            <table style="width:100%;border-collapse:collapse;font-size:13px;">
-              <thead><tr style="background:#f8f9fa;border-bottom:2px solid #e9ecef;">
-                <th style="padding:8px;text-align:left;">Ticker</th>
-                <th style="padding:8px;text-align:left;">Price</th>
-                <th style="padding:8px;text-align:left;">%</th>
-                <th style="padding:8px;text-align:left;">Value</th>
-                <th style="padding:8px;text-align:left;">Shares</th>
-              </tr></thead>
-              <tbody>{rows_html}</tbody>
-            </table>
-          </div>
-          <div style="flex:0 0 180px;padding-left:20px;">
-            <h4>Sector Weights</h4>
-            <ul style="font-size:13px;color:#555;">{sector_html}</ul>
-          </div>
+            Regime: {result.regime} | Vol Tier: {result.volatility_tier} | Leader: {result.leader}
+            | Portfolio: ${portfolio_value:,.2f}</div>
+        </div>"""
+
+
+def build_email_table(target_portfolio: pd.DataFrame) -> str:
+    rows_html = ""
+    for _, row in target_portfolio.iterrows():
+        rows_html += f"""
+        <tr style="border-bottom:1px solid #e9ecef;">
+          <td style="padding:10px;font-weight:bold;">{row['Ticker']}</td>
+          <td style="padding:10px;">${row['Price']:,.2f}</td>
+          <td style="padding:10px;font-weight:bold;color:#0056b3;">{row['TargetPct']*100:.1f}%</td>
+          <td style="padding:10px;font-weight:bold;">${row['TargetValue']:,.2f}</td>
+          <td style="padding:10px;font-weight:bold;color:#27ae60;">{row['TargetShares']:,.4f}</td>
+        </tr>"""
+    return f"""
+          <table style="width:100%;border-collapse:collapse;font-size:13px;">
+            <thead><tr style="background:#f8f9fa;border-bottom:2px solid #e9ecef;">
+              <th style="padding:8px;text-align:left;">Ticker</th>
+              <th style="padding:8px;text-align:left;">Price</th>
+              <th style="padding:8px;text-align:left;">%</th>
+              <th style="padding:8px;text-align:left;">Value</th>
+              <th style="padding:8px;text-align:left;">Shares</th>
+            </tr></thead>
+            <tbody>{rows_html}</tbody>
+          </table>"""
+
+
+def build_email_html(date_str: str, result: StrategyResult, portfolio_value: float,
+                     target_portfolio: pd.DataFrame, rebalance_due: bool) -> str:
+    return f"""
+    <!DOCTYPE html><html><head><meta charset="utf-8"></head>
+    <body style="font-family:-apple-system,sans-serif;background:#f8f9fa;padding:20px;color:#333;">
+      <div style="max-width:700px;background:#fff;margin:0 auto;border-radius:8px;
+                  box-shadow:0 4px 12px rgba(0,0,0,.08);overflow:hidden;">
+        {build_email_header(date_str, result, portfolio_value, rebalance_due)}
+        <div style="padding:20px;">
+        {build_email_table(target_portfolio)}
         </div>
       </div>
     </body></html>"""
 
-def send_email(subject: str, text_body: str, html_body: str):
-    addr = os.environ.get("GMAIL_ADDRESS")
-    pwd = os.environ.get("GMAIL_APP_PASSWORD")
-    to = os.environ.get("RECEIVER_EMAIL")
-    if not all([addr, pwd, to]):
+
+def send_email(subject: str, text_body: str, html_body: str) -> None:
+    address = os.environ.get("GMAIL_ADDRESS")
+    password = os.environ.get("GMAIL_APP_PASSWORD")
+    recipient = os.environ.get("RECEIVER_EMAIL")
+    if not all([address, password, recipient]):
         logger.info("Email env vars not set; skipping.")
         return
     try:
-        msg = EmailMessage()
-        msg["Subject"], msg["From"], msg["To"] = subject, addr, to
-        msg.set_content(text_body)
-        msg.add_alternative(html_body, subtype="html")
-        with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as s:
-            s.starttls()
-            s.login(addr, pwd)
-            s.send_message(msg)
+        message = EmailMessage()
+        message["Subject"], message["From"], message["To"] = subject, address, recipient
+        message.set_content(text_body)
+        message.add_alternative(html_body, subtype="html")
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as server:
+            server.starttls()
+            server.login(address, password)
+            server.send_message(message)
         logger.info("Email sent.")
     except Exception as e:
         logger.error(f"Email error: {e}")
 
 # ==========================================
-# 8. MAIN
+# 12. ORCHESTRATION
 # ==========================================
-def main():
-    ap = argparse.ArgumentParser(description="ROTH IRA v2 - Sector Momentum Production Engine")
-    ap.add_argument("--test", action="store_true", help="Print dashboard, save state, skip email")
-    ap.add_argument("--roth-amount", type=float, default=None, help="Override Roth IRA balance")
-    args = ap.parse_args()
+def run_strategy(roth_amount: float | None):
+    """Download data, compute indicators, determine allocation, decide trades."""
+    price_data, volume_data = download_market_data(ALL_TICKERS)
+    indicators = calculate_indicators(price_data, volume_data)
+    latest_indicators = indicators.iloc[-1]
 
-    # Download all tickers
-    all_tickers = [SIGNAL_TICKER] + list(RISK_ON_BASE.keys()) + list(RISK_OFF.keys())
-    close, volume = download_data(all_tickers)
+    if pd.isna(latest_indicators["sma_200"]):
+        raise RuntimeError("Latest bar has no 200-day SMA - insufficient history.")
 
-    # Build indicators
-    ind = build_indicators(close, volume)
-    latest = ind.iloc[-1].copy()
-    latest["QQQ_CLOSE"] = close[SIGNAL_TICKER].iloc[-1]
-
-    if pd.isna(latest["SMA200"]):
-        raise RuntimeError("Insufficient history for 200-day SMA")
-
-    date_str = close.index[-1].strftime("%Y-%m-%d")
-    current_date = close.index[-1]
-
-    # Load state
     state = load_state()
-    last_executed_scalar = state.get("last_executed_scalar", -1.0)
-    last_sector_rebal = state.get("last_sector_rebal", "")
+    result = determine_target_allocation(latest_indicators, state.leader)
 
-    # Calculate risk-on scalar
-    risk_on = get_risk_on_scalar(latest)
+    portfolio_value = roth_amount or state.portfolio_value or ROTH_IRA_AMOUNT
+    target_portfolio = calculate_target_portfolio(price_data, result.target_weights, portfolio_value)
 
-    # Drift-band check (v2 fix: compare to last EXECUTED scalar, not just shares)
-    rebalance_due = should_rebalance(risk_on, last_executed_scalar, REBAL_BAND)
+    trade_date = price_data.index[-1]
+    rebalance_due = should_rebalance(existing_weights(state, price_data), result.target_weights)
+    sector_due = sector_review_due(state.last_sector_rebalance, trade_date)
 
-    # Sector rebalancing check
-    sector_rebal_due = should_rebalance_sectors(last_sector_rebal, current_date)
+    return price_data, latest_indicators, result, state, portfolio_value, target_portfolio, \
+        trade_date, rebalance_due, sector_due
 
-    # Get sector weights (momentum-adjusted)
-    sector_weights = get_sector_weights(latest, RISK_ON_BASE)
 
-    # Full target weights
-    weights = get_target_weights(latest, risk_on, sector_weights)
+def persist_state(state: PortfolioState, result: StrategyResult, portfolio_value: float,
+                  target_portfolio: pd.DataFrame, trade_date: datetime,
+                  rebalance_due: bool, sector_due: bool) -> None:
+    """Record the new state. On hold days, preserve held shares (what's actually owned)."""
+    if rebalance_due or sector_due:
+        state.shares = {row["Ticker"]: row["TargetShares"] for _, row in target_portfolio.iterrows()}
+        state.target_weights = result.target_weights
+        if sector_due:
+            state.last_sector_rebalance = trade_date.isoformat()
+    state.portfolio_value = round(portfolio_value, 2)
+    state.leader = result.leader
+    state.volatility_tier = result.volatility_tier
+    state.regime = result.regime
+    save_state(state)
 
-    # Portfolio value: saved -> CLI -> env
-    saved_value = state.get("portfolio_value", 0)
-    portfolio_value = args.roth_amount or saved_value or ROTH_IRA_AMOUNT
 
-    # Build target portfolio
-    target_df = build_target_portfolio(close, weights, portfolio_value)
+def main() -> None:
+    parser = argparse.ArgumentParser(description="ROTH IRA - Barbell Momentum Allocation Engine")
+    parser.add_argument("--test", action="store_true", help="Print dashboard and save state, skip email")
+    parser.add_argument("--roth-amount", type=float, default=None, help="Override Roth IRA balance")
+    args = parser.parse_args()
 
-    # Dashboard
-    dashboard = format_dashboard(date_str, latest, risk_on, sector_weights,
-                                  portfolio_value, target_df, rebalance_due, sector_rebal_due)
+    (price_data, latest_indicators, result, state, portfolio_value,
+     target_portfolio, trade_date, rebalance_due, sector_due) = run_strategy(args.roth_amount)
+
+    date_str = trade_date.strftime("%Y-%m-%d")
+    dashboard = build_dashboard(date_str, result, latest_indicators, portfolio_value,
+                                target_portfolio, rebalance_due, sector_due)
     print(dashboard)
 
-    # Save state (v2: track last_executed_scalar for drift-band)
-    if rebalance_due or sector_rebal_due:
-        save_state(
-            {r["Ticker"]: r["TargetShares"] for _, r in target_df.iterrows()},
-            weights,
-            portfolio_value,
-            risk_on,
-            current_date.isoformat() if sector_rebal_due else last_sector_rebal
-        )
-    else:
-        # No trade: preserve previous state, update only portfolio_value
-        save_state(
-            state.get("shares", {}),
-            state.get("weights", weights),
-            portfolio_value,
-            last_executed_scalar,  # Preserve, don't update
-            last_sector_rebal
-        )
+    persist_state(state, result, portfolio_value, target_portfolio,
+                  trade_date, rebalance_due, sector_due)
 
     if not args.test:
-        send_email(f"ROTH IRA v2 Report - {date_str}", dashboard,
-                   build_html_email(date_str, latest, risk_on, sector_weights,
-                                     portfolio_value, target_df, rebalance_due))
+        send_email(
+            f"ROTH IRA Report - {date_str}",
+            dashboard,
+            build_email_html(date_str, result, portfolio_value, target_portfolio, rebalance_due),
+        )
+
 
 if __name__ == "__main__":
     try:
         main()
     except Exception:
-        logger.exception("roth_ira_v2.py failed")
+        logger.exception("roth_ira.py failed")
         sys.exit(1)
