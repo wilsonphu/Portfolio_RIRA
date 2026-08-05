@@ -2,13 +2,45 @@ name: ROTH IRA Daily Signal
 
 on:
   workflow_dispatch:
+    inputs:
+      validate_only:
+        description: "Compile and verify dependencies without running the trading engine"
+        required: false
+        default: false
+        type: boolean
+
   schedule:
-    - cron: "20 16 * * 1-5"
+    # Run at 4:25 PM New York time, Monday through Friday.
+    # The engine independently verifies exchange sessions and completed daily bars.
+    - cron: "25 16 * * 1-5"
       timezone: "America/New_York"
 
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: roth-ira-production
+  cancel-in-progress: false
+
 jobs:
-  run-strategy:
+  roth-ira-signal:
+    name: Generate ROTH IRA signal
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      PYTHONUNBUFFERED: "1"
+      TZ: "America/New_York"
+      GH_TOKEN: ${{ github.token }}
+
+      GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+      GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+      RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
+
+      # May be blank after actual holdings have been persisted.
+      # A fresh first run requires this secret or --roth-amount.
+      ROTH_IRA_AMOUNT: ${{ secrets.ROTH_IRA_AMOUNT }}
 
     steps:
       - name: Check out repository
@@ -18,15 +50,26 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
 
       - name: Install dependencies
+        shell: bash
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
 
-      - name: Verify imports
+          if [[ -f requirements.txt ]]; then
+            python -m pip install -r requirements.txt
+          else
+            echo "::warning::requirements.txt was not found; installing runtime dependencies without pins."
+            python -m pip install numpy pandas yfinance exchange-calendars
+          fi
+
+      - name: Verify Python and imports
+        shell: bash
         run: |
+          set -euo pipefail
+          python -m py_compile port12_cloud.py
+
           python - <<'PY'
           import exchange_calendars
           import numpy
@@ -39,10 +82,134 @@ jobs:
           print("yfinance:", yfinance.__version__)
           PY
 
+      - name: Restore latest portfolio state
+        id: restore_state
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          workflow_file="${GITHUB_WORKFLOW_REF#${GITHUB_REPOSITORY}/}"
+          workflow_file="${workflow_file%%@*}"
+
+          restored="false"
+
+          while IFS= read -r previous_run_id; do
+            [[ -z "${previous_run_id}" ]] && continue
+
+            rm -rf .state-restore
+            mkdir -p .state-restore
+
+            if gh run download "${previous_run_id}" \
+              --name roth-ira-state \
+              --dir .state-restore >/dev/null 2>&1; then
+
+              if [[ -f .state-restore/roth_ira_state.json ]]; then
+                cp .state-restore/roth_ira_state.json roth_ira_state.json
+                echo "Restored roth_ira_state.json from workflow run ${previous_run_id}."
+                restored="true"
+                break
+              fi
+            fi
+          done < <(
+            gh run list \
+              --workflow "${workflow_file}" \
+              --status completed \
+              --limit 20 \
+              --json databaseId \
+              --jq '.[].databaseId'
+          )
+
+          rm -rf .state-restore
+          echo "restored=${restored}" >> "${GITHUB_OUTPUT}"
+
+          if [[ "${restored}" != "true" ]]; then
+            echo "No prior state artifact was found. This may be the first production run."
+          fi
+
+      - name: Check whether today is a US market session
+        id: market_session
+        if: ${{ github.event_name == 'schedule' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          is_session="$(
+            python - <<'PY'
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+
+          import exchange_calendars as xcals
+          import pandas as pd
+
+          today = pd.Timestamp(datetime.now(ZoneInfo("America/New_York")).date())
+          calendar = xcals.get_calendar("XNYS")
+          print("true" if calendar.is_session(today) else "false")
+          PY
+          )"
+
+          echo "is_session=${is_session}" >> "${GITHUB_OUTPUT}"
+          echo "US market session today: ${is_session}"
+
+      - name: Skip scheduled holiday run
+        if: ${{ github.event_name == 'schedule' && steps.market_session.outputs.is_session != 'true' }}
+        run: echo "Today is not an XNYS trading session; no signal was generated."
+
+      - name: Verify first-run account value
+        if: >-
+          ${{
+            (github.event_name == 'schedule' &&
+             steps.market_session.outputs.is_session == 'true') ||
+            (github.event_name == 'workflow_dispatch' &&
+             inputs.validate_only == false)
+          }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          configured_amount="$(
+            printf '%s' "${ROTH_IRA_AMOUNT:-}" | tr -d '[:space:]'
+          )"
+
+          if [[ ! -f roth_ira_state.json && -z "${configured_amount}" ]]; then
+            echo "::error::No persisted state was restored and ROTH_IRA_AMOUNT is blank."
+            echo "::error::Create the ROTH_IRA_AMOUNT repository secret for the first run."
+            exit 1
+          fi
+
       - name: Run ROTH IRA engine
-        env:
-          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
-          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-          RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
-          ROTH_IRA_AMOUNT: ${{ secrets.ROTH_IRA_AMOUNT }}
-        run: python port12_cloud.py
+        if: >-
+          ${{
+            (github.event_name == 'schedule' &&
+             steps.market_session.outputs.is_session == 'true') ||
+            (github.event_name == 'workflow_dispatch' &&
+             inputs.validate_only == false)
+          }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python port12_cloud.py
+
+      - name: Validation-only result
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.validate_only == true }}
+        run: echo "Validation completed; the trading engine was not run."
+
+      # The state is stored as an artifact instead of being committed to the repository.
+      # The next run restores the newest available state artifact.
+      - name: Persist portfolio state
+        if: ${{ always() && hashFiles('roth_ira_state.json') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: roth-ira-state
+          path: roth_ira_state.json
+          if-no-files-found: error
+          retention-days: 90
+          overwrite: true
+
+      - name: Upload run log
+        if: ${{ always() && hashFiles('roth_ira.log') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: roth-ira-log-${{ github.run_id }}
+          path: roth_ira.log
+          if-no-files-found: ignore
+          retention-days: 30
