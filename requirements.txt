@@ -1,2 +1,4 @@
-pandas
-yfinance
+numpy==2.3.5
+pandas==2.2.3
+yfinance==1.5.2
+exchange-calendars==4.13.2
