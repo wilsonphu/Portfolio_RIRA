@@ -1906,4 +1906,4 @@ if __name__ == "__main__":
         main()
     except Exception:
         logger.exception("ROTH IRA engine failed")
-        sys.exit(1)
+        sys.exit(1）
