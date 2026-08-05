@@ -159,15 +159,15 @@ APP_DIR = Path(__file__).resolve().parent
 STATE_FILE = APP_DIR / "roth_ira_state.json"
 LOG_FILE = APP_DIR / "roth_ira.log"
 
-_configured_roth_amount = os.environ.get("ROTH_IRA_AMOUNT")
+_configured_roth_amount = os.environ.get("ROTH_IRA_AMOUNT", "").strip()
 try:
     ROTH_IRA_AMOUNT = (
         float(_configured_roth_amount)
-        if _configured_roth_amount is not None
+        if _configured_roth_amount
         else None
     )
 except ValueError as exc:
-    raise RuntimeError("ROTH_IRA_AMOUNT must be numeric") from exc
+    raise RuntimeError("ROTH_IRA_AMOUNT must be numeric when provided") from exc
 
 if ROTH_IRA_AMOUNT is not None and (
     not np.isfinite(ROTH_IRA_AMOUNT) or ROTH_IRA_AMOUNT <= 0
