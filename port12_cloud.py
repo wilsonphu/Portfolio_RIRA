@@ -28,15 +28,15 @@ Strategy Architecture
     - Monthly (~21 day) sector review
 
 Environment variables:
-  ROTH_IRA_AMOUNT      Current Roth IRA balance (default 1025.97)
+  ROTH_IRA_AMOUNT      Current Roth IRA balance (required on a first run)
   GMAIL_ADDRESS        Sender Gmail address  (optional, for email reports)
   GMAIL_APP_PASSWORD   Gmail app password    (optional)
   RECEIVER_EMAIL       Report recipient      (optional)
 
 CLI usage:
-  python3 roth_ira.py                 # run, print dashboard, save state, send email
-  python3 roth_ira.py --test          # run, print dashboard, save state, NO email
-  python3 roth_ira.py --roth-amount 5000.00
+  python3 port12_cloud.py                 # run, print dashboard, save state, send email
+  python3 port12_cloud.py --test          # run, print dashboard, do not save state or send email
+  python3 port12_cloud.py --roth-amount 5000.00
 """
 
 import argparse
@@ -46,9 +46,10 @@ import os
 import smtplib
 import sys
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from email.message import EmailMessage
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -79,6 +80,7 @@ ALL_TICKERS = [
     DEFENSIVE_EQUITY,
     HEDGE_ASSET,
 ]
+TRADED_TICKERS = frozenset(ALL_TICKERS) - {MARKET_INDEX}
 
 # ==========================================
 # 2. CONSTANTS
@@ -108,7 +110,17 @@ HIGH_VOL_ALLOCATION = {SEMICONDUCTOR_ETF: 0.85, HEDGE_ASSET: 0.15}
 BEAR_ALLOCATION = {DEFENSIVE_EQUITY: 0.80, HEDGE_ASSET: 0.20}
 
 # Account
-ROTH_IRA_AMOUNT = float(os.environ.get("ROTH_IRA_AMOUNT", 1025.97))
+NEW_YORK = ZoneInfo("America/New_York")
+MARKET_OPEN_TIME = time(9, 30)
+MARKET_CLOSE_BUFFER_TIME = time(16, 15)
+configured_roth_amount = os.environ.get("ROTH_IRA_AMOUNT")
+try:
+    ROTH_IRA_AMOUNT = float(configured_roth_amount) if configured_roth_amount is not None else None
+except ValueError as exc:
+    raise RuntimeError("ROTH_IRA_AMOUNT must be numeric") from exc
+if ROTH_IRA_AMOUNT is not None and (
+        not np.isfinite(ROTH_IRA_AMOUNT) or ROTH_IRA_AMOUNT <= 0):
+    raise RuntimeError("ROTH_IRA_AMOUNT must be positive and finite")
 APP_DIR = Path(__file__).resolve().parent
 STATE_FILE = APP_DIR / "roth_ira_state.json"
 LOG_FILE = APP_DIR / "roth_ira.log"
@@ -140,6 +152,20 @@ class PortfolioState:
     last_sector_rebalance: str = ""
     last_updated: str = ""
 
+
+@dataclass(frozen=True)
+class StrategyRun:
+    """All point-in-time values produced during a single signal run."""
+    price_data: pd.DataFrame
+    latest_indicators: pd.Series
+    result: StrategyResult
+    state: PortfolioState
+    portfolio_value: float
+    target_portfolio: pd.DataFrame
+    signal_date: pd.Timestamp
+    rebalance_due: bool
+    sector_review_due: bool
+
 # ==========================================
 # 4. LOGGING
 # ==========================================
@@ -148,7 +174,7 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler(sys.stdout)],
 )
-logger = logging.getLogger("roth_ira")
+logger = logging.getLogger("port12_cloud")
 
 # ==========================================
 # 5. STATE PERSISTENCE
@@ -157,49 +183,101 @@ def load_state() -> PortfolioState:
     if not STATE_FILE.exists():
         return PortfolioState()
     try:
-        with open(STATE_FILE, "r", encoding="utf-8") as state_file:
-            payload = json.load(state_file)
-    except Exception as exc:
+        payload = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"Could not read {STATE_FILE}; refusing to infer holdings") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("Portfolio state must be a JSON object")
+    required_fields = {
+        "state_version",
+        "shares",
+        "target_weights",
+        "portfolio_value",
+        "leader",
+        "volatility_tier",
+        "regime",
+        "last_sector_rebalance",
+        "last_updated",
+    }
+    missing_fields = required_fields - set(payload)
+    if missing_fields:
+        raise RuntimeError(f"Portfolio state is missing required fields: {sorted(missing_fields)}")
     if payload.get("state_version") != STATE_VERSION:
         raise RuntimeError(
             f"Unsupported portfolio state version: {payload.get('state_version')!r}; "
             "migrate it explicitly"
         )
+    if not isinstance(payload.get("shares"), dict):
+        raise RuntimeError("Portfolio state is missing a valid shares mapping")
+    if not isinstance(payload.get("target_weights"), dict):
+        raise RuntimeError("Portfolio state is missing a valid target_weights mapping")
     try:
         state = PortfolioState(**payload)
     except TypeError as exc:
         raise RuntimeError(f"Unsupported fields in {STATE_FILE}; migrate it explicitly") from exc
 
-    unknown_tickers = (set(state.shares) | set(state.target_weights)) - set(ALL_TICKERS)
-    if unknown_tickers:
+    invalid_tickers = (
+        (set(state.shares) | set(state.target_weights)) - TRADED_TICKERS
+    )
+    if invalid_tickers:
         raise RuntimeError(
             "Unsupported portfolio state; migrate it explicitly "
-            f"(unknown_tickers={sorted(unknown_tickers)})"
+            f"(invalid_tickers={sorted(invalid_tickers)})"
         )
-    if any(not isinstance(shares, (int, float)) or shares < 0 for shares in state.shares.values()):
+    if any(isinstance(shares, bool) or not isinstance(shares, (int, float))
+           or not np.isfinite(shares) or shares < 0
+           for shares in state.shares.values()):
         raise RuntimeError("Portfolio state contains invalid share counts")
+    if any(isinstance(weight, bool) or not isinstance(weight, (int, float))
+           or not np.isfinite(weight) or weight < 0
+           for weight in state.target_weights.values()):
+        raise RuntimeError("Portfolio state contains invalid target weights")
+    if (isinstance(state.portfolio_value, bool) or not isinstance(state.portfolio_value, (int, float))
+            or not np.isfinite(state.portfolio_value) or state.portfolio_value < 0):
+        raise RuntimeError("Portfolio state contains an invalid portfolio value")
+    if state.leader is not None and state.leader not in LEADER_CANDIDATES:
+        raise RuntimeError("Portfolio state contains an invalid leader")
+    if state.regime not in {"UNKNOWN", "BULL", "BEAR"}:
+        raise RuntimeError("Portfolio state contains an invalid regime")
+    if state.volatility_tier not in {"N/A", "LOW", "MODERATE", "HIGH"}:
+        raise RuntimeError("Portfolio state contains an invalid volatility tier")
+    if not isinstance(state.last_updated, str) or not isinstance(state.last_sector_rebalance, str):
+        raise RuntimeError("Portfolio state contains invalid timestamps")
+    if state.last_sector_rebalance:
+        try:
+            pd.Timestamp(state.last_sector_rebalance)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Portfolio state contains an invalid sector-review date") from exc
     return state
 
 
 def save_state(state: PortfolioState) -> None:
-    try:
-        state.last_updated = datetime.now().isoformat()
-        with open(STATE_FILE, "w", encoding="utf-8") as state_file:
-            json.dump(asdict(state), state_file, indent=4)
-        logger.info(
-            f"State saved: regime={state.regime}, leader={state.leader}, "
-            f"tier={state.volatility_tier}, value=${state.portfolio_value:,.2f}"
-        )
-    except Exception as e:
-        logger.error(f"Error saving state: {e}")
+    """Atomically save validated state or fail the run."""
+    state.last_updated = datetime.now(NEW_YORK).isoformat()
+    payload = json.dumps(asdict(state), indent=4, allow_nan=False)
+    temporary_file = STATE_FILE.with_suffix(".json.tmp")
+    temporary_file.write_text(payload, encoding="utf-8")
+    os.replace(temporary_file, STATE_FILE)
+    logger.info(
+        "State saved: regime=%s, leader=%s, tier=%s, value=$%.2f",
+        state.regime, state.leader, state.volatility_tier, state.portfolio_value,
+    )
 
 # ==========================================
 # 6. DATA ACQUISITION (real daily data only)
 # ==========================================
 def download_market_data(tickers: list[str], days: int = HISTORY_DAYS) -> tuple[pd.DataFrame, pd.DataFrame]:
-    start = (datetime.today() - timedelta(days=days)).strftime("%Y-%m-%d")
-    end = datetime.today().strftime("%Y-%m-%d")
+    now_new_york = datetime.now(NEW_YORK)
+    today_new_york = now_new_york.date()
+    if today_new_york.weekday() < 5 and MARKET_OPEN_TIME <= now_new_york.time() < MARKET_CLOSE_BUFFER_TIME:
+        raise RuntimeError(
+            "Daily signal is not complete during market hours; run before 09:30 or after 16:15 America/New_York"
+        )
+    start = (today_new_york - timedelta(days=days)).isoformat()
+    # yfinance treats end as exclusive.  After the close include today's completed bar;
+    # before the open use the prior completed session.
+    end_date = today_new_york + timedelta(days=1) if now_new_york.time() >= MARKET_CLOSE_BUFFER_TIME else today_new_york
+    end = end_date.isoformat()
     logger.info(f"Downloading {tickers} from {start} to {end}")
 
     data = yf.download(tickers, start=start, end=end, auto_adjust=True, progress=False)
@@ -219,10 +297,34 @@ def download_market_data(tickers: list[str], days: int = HISTORY_DAYS) -> tuple[
             "Incomplete market-data universe: "
             f"prices={sorted(missing_price_columns)}, volumes={sorted(missing_volume_columns)}"
         )
-    if price_data.isna().any().any() or volume_data.isna().any().any():
-        raise RuntimeError("Incomplete market data; refusing to forward-fill prices or volumes")
     if not price_data.index.equals(volume_data.index):
         raise RuntimeError("Price and volume dates differ")
+
+    price_data = price_data.reindex(columns=tickers)
+    volume_data = volume_data.reindex(columns=tickers)
+    complete_rows = price_data.notna().all(axis=1) & volume_data.notna().all(axis=1)
+    if not complete_rows.any():
+        raise RuntimeError("No complete market-data rows were returned")
+    if not complete_rows.iloc[-1]:
+        missing = [
+            ticker for ticker in tickers
+            if pd.isna(price_data.iloc[-1][ticker]) or pd.isna(volume_data.iloc[-1][ticker])
+        ]
+        raise RuntimeError(f"Latest market-data row is partial: {missing}")
+    price_data = price_data.loc[complete_rows]
+    volume_data = volume_data.loc[complete_rows]
+    try:
+        prices_are_valid = np.isfinite(price_data.to_numpy(dtype=float)).all() and (price_data > 0).all().all()
+        volumes_are_valid = (
+            np.isfinite(volume_data.to_numpy(dtype=float)).all()
+            and (volume_data >= 0).all().all()
+        )
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Market data contains non-numeric values") from exc
+    if not prices_are_valid:
+        raise RuntimeError("Market data contains invalid prices")
+    if not volumes_are_valid or float(volume_data[MARKET_INDEX].iloc[-1]) <= 0:
+        raise RuntimeError("Market data contains invalid volume")
 
     if len(price_data) < SMA_WINDOW + 5:
         raise RuntimeError(f"Insufficient history: {len(price_data)} rows (need > {SMA_WINDOW + 5})")
@@ -266,19 +368,19 @@ def calculate_indicators(price_data: pd.DataFrame, volume_data: pd.DataFrame) ->
 # ==========================================
 def classify_volatility(annualized_volatility: float) -> str:
     """Map annualized volatility to a regime tier."""
-    if pd.isna(annualized_volatility):
-        return "MODERATE"
+    if not np.isfinite(annualized_volatility):
+        raise ValueError("Volatility is unavailable")
     if annualized_volatility < LOW_VOL_THRESHOLD:
         return "LOW"
-    if annualized_volatility < MODERATE_VOL_THRESHOLD:
+    if annualized_volatility <= MODERATE_VOL_THRESHOLD:
         return "MODERATE"
     return "HIGH"
 
 
 def select_leader(soxl_momentum: float, tecl_momentum: float, existing_leader: str | None) -> str:
     """Pick the momentum leader with hysteresis to prevent whipsaws."""
-    if pd.isna(soxl_momentum) or pd.isna(tecl_momentum):
-        return existing_leader or LEVERAGED_SEMICONDUCTOR
+    if not np.isfinite(soxl_momentum) or not np.isfinite(tecl_momentum):
+        raise ValueError("Leader momentum is unavailable")
     if existing_leader == LEVERAGED_SEMICONDUCTOR:
         if (tecl_momentum - soxl_momentum) > LEADER_SWITCH_THRESHOLD:
             return LEVERAGED_TECH
@@ -333,52 +435,44 @@ def validate_configuration() -> None:
         "HIGH_VOL_ALLOCATION": HIGH_VOL_ALLOCATION,
         "BEAR_ALLOCATION": BEAR_ALLOCATION,
     }.items():
-        if not np.isclose(sum(template.values()), 1.0):
+        if not np.isclose(sum(template.values()), 1.0, atol=1e-12):
             raise RuntimeError(f"{name} must sum to 1.0")
         if set(template) - allowed_slots or MARKET_INDEX in template:
             raise RuntimeError(f"{name} contains an invalid traded ticker")
 
 
-def determine_target_allocation(latest_indicators: pd.Series, existing_leader: str | None) -> StrategyResult:
+def determine_target_allocation(latest_indicators: pd.Series, existing_leader: str | None,
+                                allow_leader_review: bool) -> StrategyResult:
     """Heart of the strategy: regime, leader, volatility tier, and target weights."""
-    required_indicators = [
-        "bullish_consensus", "annualized_volatility", "soxl_momentum", "tecl_momentum",
-    ]
-    if latest_indicators[required_indicators].isna().any():
-        raise RuntimeError("Latest indicator set is incomplete; no recommendation generated")
     is_bull = int(latest_indicators["bullish_consensus"]) == 1
-    annualized_volatility = (
-        float(latest_indicators["annualized_volatility"])
-        if not pd.isna(latest_indicators["annualized_volatility"])
-        else MODERATE_VOL_THRESHOLD
-    )
+    annualized_volatility = float(latest_indicators["annualized_volatility"])
+    leader = existing_leader or LEVERAGED_SEMICONDUCTOR
+    if allow_leader_review:
+        leader = select_leader(
+            float(latest_indicators["soxl_momentum"]),
+            float(latest_indicators["tecl_momentum"]),
+            existing_leader,
+        )
 
     if not is_bull:
         return StrategyResult(
             target_weights=dict(BEAR_ALLOCATION),
             regime="BEAR",
-            leader=existing_leader or LEVERAGED_SEMICONDUCTOR,
+            leader=leader,
             volatility_tier="N/A",
             annualized_volatility=annualized_volatility,
         )
 
     volatility_tier = classify_volatility(latest_indicators["annualized_volatility"])
-    leader = select_leader(
-        float(latest_indicators.get("soxl_momentum", np.nan)),
-        float(latest_indicators.get("tecl_momentum", np.nan)),
-        existing_leader,
-    )
     template = select_allocation_template(volatility_tier)
     target_weights = apply_allocation_template(template, leader)
 
     total = sum(target_weights.values())
-    if total > 0:
-        target_weights = {ticker: weight / total for ticker, weight in target_weights.items()}
-    if not np.isclose(sum(target_weights.values()), 1.0):
-        raise RuntimeError("Target allocation does not sum to 1.0")
+    if not np.isclose(total, 1.0, atol=1e-12):
+        raise RuntimeError(f"Target allocation must sum to 1.0 before normalization; got {total}")
     if any(target_weights.get(ticker, 0.0) > MAX_LEVERAGED_POSITION
            for ticker in LEVERAGED_SECTOR_ETFS):
-        raise RuntimeError("Normalization exceeded the leveraged-position cap")
+        raise RuntimeError("Target allocation exceeds the leveraged-position cap")
 
     return StrategyResult(
         target_weights=target_weights,
@@ -391,29 +485,72 @@ def determine_target_allocation(latest_indicators: pd.Series, existing_leader: s
 # ==========================================
 # 9. PORTFOLIO MATH
 # ==========================================
+def validate_latest_indicators(latest_indicators: pd.Series) -> None:
+    """Prevent incomplete data from becoming a plausible allocation signal."""
+    required_indicators = [
+        "sma_200",
+        "donchian_mid",
+        "vwma_50",
+        "annualized_volatility",
+        "soxl_momentum",
+        "tecl_momentum",
+    ]
+    invalid = []
+    for name in required_indicators:
+        try:
+            valid = np.isfinite(float(latest_indicators[name]))
+        except (KeyError, TypeError, ValueError):
+            valid = False
+        if not valid:
+            invalid.append(name)
+    if invalid:
+        raise RuntimeError(f"Invalid latest indicators: {invalid}")
+
+
+def validate_holdings_against_prices(state: PortfolioState, price_data: pd.DataFrame) -> None:
+    """Ensure every recorded holding has a real, current price."""
+    unknown_holdings = set(state.shares) - set(price_data.columns)
+    if unknown_holdings:
+        raise RuntimeError(
+            "State contains holdings with no current price data: "
+            f"{sorted(unknown_holdings)}"
+        )
+    if MARKET_INDEX in state.shares:
+        raise RuntimeError(f"{MARKET_INDEX} is a signal asset and cannot be a holding")
+
+
 def calculate_target_portfolio(price_data: pd.DataFrame, target_weights: dict[str, float],
                                portfolio_value: float) -> pd.DataFrame:
+    if not np.isfinite(portfolio_value) or portfolio_value <= 0:
+        raise RuntimeError(f"Invalid portfolio value: {portfolio_value!r}")
     rows = []
     for ticker, proportion in sorted(target_weights.items(), key=lambda item: -item[1]):
         if proportion < 0.001:
             continue
         price = float(price_data[ticker].iloc[-1])
+        if not np.isfinite(price) or price <= 0:
+            raise RuntimeError(f"Invalid latest price for {ticker}: {price!r}")
         value = proportion * portfolio_value
         rows.append({
             "Ticker": ticker,
             "Price": price,
             "TargetPct": proportion,
             "TargetValue": value,
-            "TargetShares": round(value / price, 4) if price > 0 else 0.0,
+            "TargetShares": round(value / price, 4),
         })
     return pd.DataFrame(rows)
 
 
 def existing_portfolio_value(state: PortfolioState, price_data: pd.DataFrame) -> float:
+    validate_holdings_against_prices(state, price_data)
     total = 0.0
     for ticker, share_count in state.shares.items():
-        if ticker in price_data.columns:
-            total += share_count * float(price_data[ticker].iloc[-1])
+        price = float(price_data[ticker].iloc[-1])
+        if not np.isfinite(price) or price <= 0:
+            raise RuntimeError(f"Invalid latest price for held {ticker}: {price!r}")
+        total += share_count * price
+    if not np.isfinite(total):
+        raise RuntimeError(f"Invalid marked-to-market portfolio value: {total!r}")
     return total
 
 
@@ -424,7 +561,7 @@ def existing_weights(state: PortfolioState, price_data: pd.DataFrame) -> dict[st
     return {
         ticker: share_count * float(price_data[ticker].iloc[-1]) / total
         for ticker, share_count in state.shares.items()
-        if ticker in price_data.columns and share_count > 0
+        if share_count > 0
     }
 
 
@@ -436,7 +573,8 @@ def should_rebalance(existing: dict[str, float], target: dict[str, float],
     return any(abs(target.get(t, 0.0) - existing.get(t, 0.0)) > band for t in tickers)
 
 
-def sector_review_due(last_sector_rebalance: str, trading_dates: pd.DatetimeIndex) -> bool:
+def sector_review_due(last_sector_rebalance: str, signal_date: pd.Timestamp,
+                      trading_dates: pd.DatetimeIndex) -> bool:
     if not last_sector_rebalance:
         return True
     try:
@@ -445,7 +583,10 @@ def sector_review_due(last_sector_rebalance: str, trading_dates: pd.DatetimeInde
         raise RuntimeError("Portfolio state has an invalid sector-review date") from exc
     if last_review.tzinfo is not None:
         last_review = last_review.tz_localize(None)
-    return int((trading_dates > last_review).sum()) >= SECTOR_REBALANCE_DAYS
+    completed_sessions = trading_dates[
+        (trading_dates > last_review.normalize()) & (trading_dates <= signal_date)
+    ]
+    return len(completed_sessions) >= SECTOR_REBALANCE_DAYS
 
 # ==========================================
 # 10. DASHBOARD (composed from sections)
@@ -461,7 +602,7 @@ def build_header(date_str: str, result: StrategyResult, latest_indicators: pd.Se
         border,
         "  ROTH IRA - BARBELL MOMENTUM ENGINE",
         border,
-        f"  Date: {date_str}   Portfolio Value: ${portfolio_value:,.2f}",
+        f"  Signal Date: {date_str}   Portfolio Value: ${portfolio_value:,.2f}",
         f"  Regime: {result.regime}   Consensus: {legs}",
         f"  {MARKET_INDEX} Vol: {result.annualized_volatility*100:.1f}%   Vol Tier: {result.volatility_tier}",
         f"  Momentum Leader: {result.leader}   Follower: {follower}",
@@ -505,7 +646,7 @@ def build_rules_section(result: StrategyResult) -> str:
         f"  - Max single leveraged position : {MAX_LEVERAGED_POSITION:.0%}",
         f"  - Rebalance band                : {REBALANCE_BAND:.0%} (trade only on >5% drift)",
         f"  - Leader switch threshold       : {LEADER_SWITCH_THRESHOLD:.0%} momentum divergence",
-        f"  - Sector review cadence         : ~{SECTOR_REBALANCE_DAYS} days",
+        f"  - Sector review cadence         : ~{SECTOR_REBALANCE_DAYS} trading sessions",
         "=" * 92,
     ])
 
@@ -529,7 +670,7 @@ def build_email_header(date_str: str, result: StrategyResult,
     return f"""
         <div style="background:#1a252f;color:#fff;padding:24px;text-align:center;">
           <h2 style="margin:0;">ROTH IRA - BARBELL ENGINE</h2>
-          <p style="margin:6px 0 0;color:#bdc3c7;">{date_str}</p>
+          <p style="margin:6px 0 0;color:#bdc3c7;">Signal date: {date_str}</p>
         </div>
         <div style="padding:20px;background:#f1f4f8;border-bottom:1px solid #e9ecef;text-align:center;">
           <div style="font-size:15px;font-weight:bold;color:{color};">{status}</div>
@@ -595,47 +736,107 @@ def send_email(subject: str, text_body: str, html_body: str) -> None:
             server.login(address, password)
             server.send_message(message)
         logger.info("Email sent.")
-    except Exception as e:
-        logger.error(f"Email error: {e}")
+    except Exception:
+        logger.exception("Email delivery failed")
+        raise
 
 # ==========================================
 # 12. ORCHESTRATION
 # ==========================================
-def run_strategy(roth_amount: float | None):
-    """Download data, compute indicators, determine allocation, decide trades."""
+def resolve_portfolio_value(roth_amount: float | None, state: PortfolioState,
+                            price_data: pd.DataFrame) -> float:
+    """Use an explicit amount, actual holdings, or a configured first-run amount."""
+    if roth_amount is not None:
+        portfolio_value = roth_amount
+    elif state.shares:
+        portfolio_value = existing_portfolio_value(state, price_data)
+    elif ROTH_IRA_AMOUNT is not None:
+        portfolio_value = ROTH_IRA_AMOUNT
+    else:
+        raise RuntimeError(
+            "No portfolio value is available; supply --roth-amount, ROTH_IRA_AMOUNT, "
+            "or confirmed holdings"
+        )
+    if not np.isfinite(portfolio_value) or portfolio_value <= 0:
+        raise RuntimeError(f"Invalid portfolio value: {portfolio_value!r}")
+    return float(portfolio_value)
+
+
+def run_strategy(roth_amount: float | None) -> StrategyRun:
+    """Download data, compute the point-in-time signal, and decide whether to trade."""
     price_data, volume_data = download_market_data(ALL_TICKERS)
     indicators = calculate_indicators(price_data, volume_data)
     latest_indicators = indicators.iloc[-1]
-
-    if pd.isna(latest_indicators["sma_200"]):
-        raise RuntimeError("Latest bar has no 200-day SMA - insufficient history.")
-
+    validate_latest_indicators(latest_indicators)
     state = load_state()
-    result = determine_target_allocation(latest_indicators, state.leader)
-
-    portfolio_value = roth_amount or state.portfolio_value or ROTH_IRA_AMOUNT
+    signal_date = price_data.index[-1]
+    sector_due = sector_review_due(state.last_sector_rebalance, signal_date, price_data.index)
+    result = determine_target_allocation(latest_indicators, state.leader, sector_due)
+    portfolio_value = resolve_portfolio_value(roth_amount, state, price_data)
     target_portfolio = calculate_target_portfolio(price_data, result.target_weights, portfolio_value)
-
-    trade_date = price_data.index[-1]
     rebalance_due = should_rebalance(existing_weights(state, price_data), result.target_weights)
-    sector_due = sector_review_due(state.last_sector_rebalance, price_data.index)
-
-    return price_data, latest_indicators, result, state, portfolio_value, target_portfolio, \
-        trade_date, rebalance_due, sector_due
+    return StrategyRun(
+        price_data=price_data,
+        latest_indicators=latest_indicators,
+        result=result,
+        state=state,
+        portfolio_value=portfolio_value,
+        target_portfolio=target_portfolio,
+        signal_date=signal_date,
+        rebalance_due=rebalance_due,
+        sector_review_due=sector_due,
+    )
 
 
 def persist_state(state: PortfolioState, result: StrategyResult, portfolio_value: float,
-                  trade_date: datetime, executed_shares: dict[str, float] | None) -> None:
-    """Record only confirmed holdings; recommendations never imply execution."""
+                  signal_date: pd.Timestamp, sector_due: bool,
+                  executed_shares: dict[str, float] | None,
+                  price_data: pd.DataFrame) -> None:
+    """Record reviews and confirmed holdings; recommendations never imply execution."""
+    if sector_due:
+        state.last_sector_rebalance = signal_date.date().isoformat()
+        state.leader = result.leader
     if executed_shares is not None:
         state.shares = executed_shares
-        state.target_weights = result.target_weights
-        state.last_sector_rebalance = trade_date.isoformat()
-    state.portfolio_value = round(portfolio_value, 2)
-    state.leader = result.leader
+        executed_value = existing_portfolio_value(state, price_data)
+        if executed_value <= 0:
+            raise RuntimeError("Confirmed holdings have no positive marked-to-market value")
+        state.target_weights = existing_weights(state, price_data)
+        state.portfolio_value = round(executed_value, 2)
+    else:
+        state.portfolio_value = round(portfolio_value, 2)
     state.volatility_tier = result.volatility_tier
     state.regime = result.regime
     save_state(state)
+
+
+def log_decision(strategy_run: StrategyRun, execution_confirmed: bool) -> None:
+    """Write enough context to reconstruct a recommendation later."""
+    current_weights = existing_weights(strategy_run.state, strategy_run.price_data)
+    tickers = set(current_weights) | set(strategy_run.result.target_weights)
+    drifts = {
+        ticker: strategy_run.result.target_weights.get(ticker, 0.0)
+        - current_weights.get(ticker, 0.0)
+        for ticker in sorted(tickers)
+    }
+    logger.info(
+        "decision signal_date=%s regime=%s tier=%s leader=%s volatility=%.6f "
+        "soxl_momentum=%.6f tecl_momentum=%.6f sector_due=%s rebalance_due=%s "
+        "execution_confirmed=%s current=%s target=%s drift=%s",
+        strategy_run.signal_date.date(),
+        strategy_run.result.regime,
+        strategy_run.result.volatility_tier,
+        strategy_run.result.leader,
+        strategy_run.result.annualized_volatility,
+        strategy_run.latest_indicators["soxl_momentum"],
+        strategy_run.latest_indicators["tecl_momentum"],
+        strategy_run.sector_review_due,
+        strategy_run.rebalance_due,
+        execution_confirmed,
+        current_weights,
+        strategy_run.result.target_weights,
+        drifts,
+    )
 
 
 def parse_executed_shares(entries: list[str] | None) -> dict[str, float] | None:
@@ -646,7 +847,7 @@ def parse_executed_shares(entries: list[str] | None) -> dict[str, float] | None:
     for entry in entries:
         ticker, separator, share_text = entry.partition("=")
         ticker = ticker.upper()
-        if separator != "=" or ticker not in set(ALL_TICKERS) - {MARKET_INDEX}:
+        if separator != "=" or ticker not in TRADED_TICKERS:
             raise ValueError(f"Invalid executed holding: {entry!r}")
         try:
             shares = float(share_text)
@@ -661,32 +862,53 @@ def parse_executed_shares(entries: list[str] | None) -> dict[str, float] | None:
 def main() -> None:
     validate_configuration()
     parser = argparse.ArgumentParser(description="ROTH IRA - Barbell Momentum Allocation Engine")
-    parser.add_argument("--test", action="store_true", help="Print dashboard and save state, skip email")
+    parser.add_argument("--test", action="store_true", help="Print dashboard without saving state or sending email")
     parser.add_argument("--roth-amount", type=float, default=None, help="Override Roth IRA balance")
     parser.add_argument(
         "--executed-shares", nargs="+", metavar="TICKER=SHARES",
         help="Record confirmed post-trade holdings; e.g. SOXL=1.25 SMH=3.0",
     )
     args = parser.parse_args()
-    if args.roth_amount is not None and args.roth_amount <= 0:
-        parser.error("--roth-amount must be positive")
+    if args.roth_amount is not None and (
+            not np.isfinite(args.roth_amount) or args.roth_amount <= 0):
+        parser.error("--roth-amount must be positive and finite")
     executed_shares = parse_executed_shares(args.executed_shares)
 
-    (price_data, latest_indicators, result, state, portfolio_value,
-     target_portfolio, trade_date, rebalance_due, sector_due) = run_strategy(args.roth_amount)
+    strategy_run = run_strategy(args.roth_amount)
+    log_decision(strategy_run, execution_confirmed=executed_shares is not None)
 
-    date_str = trade_date.strftime("%Y-%m-%d")
-    dashboard = build_dashboard(date_str, result, latest_indicators, portfolio_value,
-                                target_portfolio, rebalance_due, sector_due)
+    signal_date_str = strategy_run.signal_date.strftime("%Y-%m-%d")
+    dashboard = build_dashboard(
+        signal_date_str,
+        strategy_run.result,
+        strategy_run.latest_indicators,
+        strategy_run.portfolio_value,
+        strategy_run.target_portfolio,
+        strategy_run.rebalance_due,
+        strategy_run.sector_review_due,
+    )
     print(dashboard)
-
-    persist_state(state, result, portfolio_value, trade_date, executed_shares)
 
     if not args.test:
         send_email(
-            f"ROTH IRA Report - {date_str}",
+            f"ROTH IRA Report - {signal_date_str}",
             dashboard,
-            build_email_html(date_str, result, portfolio_value, target_portfolio, rebalance_due),
+            build_email_html(
+                signal_date_str,
+                strategy_run.result,
+                strategy_run.portfolio_value,
+                strategy_run.target_portfolio,
+                strategy_run.rebalance_due,
+            ),
+        )
+        persist_state(
+            strategy_run.state,
+            strategy_run.result,
+            strategy_run.portfolio_value,
+            strategy_run.signal_date,
+            strategy_run.sector_review_due,
+            executed_shares,
+            strategy_run.price_data,
         )
 
 
@@ -694,5 +916,5 @@ if __name__ == "__main__":
     try:
         main()
     except Exception:
-        logger.exception("roth_ira.py failed")
+        logger.exception("port12_cloud.py failed")
         sys.exit(1)
