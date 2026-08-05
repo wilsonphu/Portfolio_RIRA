@@ -17,18 +17,19 @@ import yfinance as yf
 ROTH_IRA_AMOUNT = float(os.environ.get("ROTH_IRA_AMOUNT", 1025.97))
 
 # ==========================================
-# 2. SYSTEM PARAMETERS (VOLATILITY-TARGETED 2.33x NASDAQ)
+# 2. SYSTEM PARAMETERS (STRATEGY C HYBRID PRO)
 # ==========================================
 # Extended lookback window to 750 days for 200 EMA warmup stability
 START_DATE = (datetime.today() - timedelta(days=750)).strftime("%Y-%m-%d")
 END_DATE = datetime.today().strftime("%Y-%m-%d")
 
-TICKERS = ["QQQ", "QLD", "TQQQ", "SGOV", "GLD", "SPY", "^IRX"]
+TICKERS = ["QQQ", "QLD", "TECL", "SOXL", "SMH", "SPMO", "SPY", "GLD", "^IRX"]
 
-BAND_PCT = 0.02  # 2% hysteresis band around 200 EMA
-CONFIRM_DAYS = 5  # 5 days confirmation filter
-TARGET_VOLATILITY = 0.18  # 18% annualized volatility target
-VOL_LOOKBACK = 20  # 20 trading days (~1 month) rolling window
+BAND_PCT = 0.04  # 4% band around 200 EMA
+CONFIRM_DAYS = 5  # 5 days confirmation hysteresis
+LOW_VOL_THRESHOLD = 0.20  # 20% annualized QQQ vol
+HIGH_VOL_THRESHOLD = 0.25  # 25% annualized QQQ vol
+VOL_LOOKBACK = 10  # 10 trading days rolling window
 
 
 # ==========================================
@@ -51,7 +52,7 @@ def download_data(tickers: list, start: str, end: str) -> pd.DataFrame:
 def build_regime_filter(
     qqq_close: pd.Series,
 ) -> Tuple[pd.Series, pd.Series, pd.Series, np.ndarray]:
-  """Calculates 200 EMA regime filter with 2% band hysteresis and 5-day confirmation."""
+  """Calculates 200 EMA regime filter with confirmation smoothing."""
   ema200 = qqq_close.ewm(span=200, adjust=False).mean()
   upper = ema200 * (1 + BAND_PCT)
   lower = ema200 * (1 - BAND_PCT)
@@ -88,35 +89,56 @@ def build_regime_filter(
   return ema200, upper, lower, confirmed
 
 
-def calculate_volatility_targeted_weights(
+def strategy_c_hybrid_pro_weights(
     regime_value: int, latest_vol: float
 ) -> Dict[str, float]:
-  """Calculates target weights dynamically targeting 18% annualized volatility."""
+  """Target weights for Strategy C Hybrid Pro (10% TECL / 15% QLD / 20% SOXL / 55% SMH)."""
   if regime_value == 1:
-    # Bull Regime: 2.33x Nasdaq leverage (66.7% QLD / 33.3% TQQQ) scaled by volatility
-    if np.isnan(latest_vol) or latest_vol <= 0:
-      scale = 1.0
+    # Bull Regime Allocation (Risk-On)
+    if np.isnan(latest_vol) or latest_vol < LOW_VOL_THRESHOLD:
+      # Low Volatility (<20%): 10% TECL / 15% QLD / 20% SOXL / 55% SMH
+      return {
+          "TECL": 0.10,
+          "QLD": 0.15,
+          "SOXL": 0.20,
+          "SMH": 0.55,
+          "GLD": 0.00,
+          "SPMO": 0.00,
+      }
+    elif latest_vol < HIGH_VOL_THRESHOLD:
+      # Moderate Volatility (20%-25%): 5% TECL / 10% QLD / 10% SOXL / 75% SMH
+      return {
+          "TECL": 0.05,
+          "QLD": 0.10,
+          "SOXL": 0.10,
+          "SMH": 0.75,
+          "GLD": 0.00,
+          "SPMO": 0.00,
+      }
     else:
-      # Scale leverage down if realized volatility > 18% target
-      scale = min(1.0, TARGET_VOLATILITY / latest_vol)
+      # High Volatility (>25%): 80% SMH / 20% GLD
+      return {
+          "TECL": 0.00,
+          "QLD": 0.00,
+          "SOXL": 0.00,
+          "SMH": 0.80,
+          "GLD": 0.20,
+          "SPMO": 0.00,
+      }
 
-    qld_weight = round(0.667 * scale, 4)
-    tqqq_weight = round(0.333 * scale, 4)
-    sgov_weight = round(1.0 - (qld_weight + tqqq_weight), 4)
-
-    return {
-        "QLD": qld_weight,
-        "TQQQ": tqqq_weight,
-        "SGOV": sgov_weight,
-        "GLD": 0.0000,
-    }
-
-  # Bear Regime: 70% SGOV / 30% GLD
-  return {"QLD": 0.0000, "TQQQ": 0.0000, "SGOV": 0.7000, "GLD": 0.3000}
+  # Bear Regime Allocation (Risk-Off): 80% SPMO / 20% GLD Hedge
+  return {
+      "TECL": 0.00,
+      "QLD": 0.00,
+      "SOXL": 0.00,
+      "SMH": 0.00,
+      "GLD": 0.20,
+      "SPMO": 0.80,
+  }
 
 
 # ==========================================
-# 4. PORTFOLIO ENGINE
+# 4. PORTFOLIO ALLOCATION ENGINE
 # ==========================================
 def calculate_target_portfolio(
     close_data: pd.DataFrame,
@@ -125,7 +147,7 @@ def calculate_target_portfolio(
 ) -> pd.DataFrame:
   """Calculates target dollar allocations and target shares directly from total Roth IRA balance."""
   latest_prices = {}
-  trade_tickers = ["QLD", "TQQQ", "SGOV", "GLD"]
+  trade_tickers = ["TECL", "QLD", "SOXL", "SMH", "GLD", "SPMO"]
 
   for t in trade_tickers:
     if t in close_data.columns:
@@ -169,14 +191,14 @@ def format_console_dashboard(
 
   lines = [
       border,
-      "  🚀 ROTH IRA VOLATILITY-TARGETED 2.33x DASHBOARD",
+      "  🚀 ROTH IRA STRATEGY C HYBRID PRO DASHBOARD",
       border,
       (
           f"  Date: {report_date:<15} | Roth IRA Total Value:"
           f" ${roth_amount:,.2f}"
       ),
       (
-          f"  Regime: {regime_label:<20} | Realized QQQ Vol:"
+          f"  Regime: {regime_label:<20} | QQQ Volatility:"
           f" {latest_vol:.1%}"
       ),
       (
@@ -184,7 +206,7 @@ def format_console_dashboard(
           f" ${lower_band_val:,.2f}"
       ),
       sub_border,
-      "  1. TARGET PORTFOLIO ALLOCATION & SHARES TO HOLD",
+      "  1. PORTFOLIO TARGET ALLOCATION & SHARES TO HOLD",
       sub_border,
       (
           f"  {'Ticker':<8} {'Price':<10} {'Target %':<10} {'Target $':<12}"
@@ -200,34 +222,23 @@ def format_console_dashboard(
           f" ${r['TargetValue']:<11.2f} {r['TargetShares']:<16.4f}"
       )
 
-  vol_status = (
-      "FULL LEVERAGE ACTIVE"
-      if latest_vol <= TARGET_VOLATILITY
-      else (
-          f"VOLATILITY SCALED DOWN ({TARGET_VOLATILITY/latest_vol:.1%} leverage)"
-      )
-  )
-
   lines.extend([
       sub_border,
       "  2. FUTURE PLAYS & MARKET WATCH TRIGGERS",
       sub_border,
-      f"  • VOLATILITY TARGET STATUS ({vol_status}):",
+      "  • NEXT VOLATILITY STEP-DOWN TRIGGER:",
       (
-          f"    Current QQQ 20-day realized volatility is {latest_vol:.1%}"
-          " (Target: 18.0%)."
+          f"    If QQQ 10-day volatility rises from {latest_vol:.1%} to 20.0%,"
+          " strategy steps down"
       ),
-      (
-          "    If volatility rises above 18.0%, excess leverage"
-          " automatically shifts into SGOV."
-      ),
+      "    leverage to: 5% TECL / 10% QLD / 10% SOXL / 75% SMH.",
       "",
       "  • BEAR REGIME ROTATION TRIGGER:",
       (
-          f"    If QQQ drops below ${lower_band_val:,.2f} (200 EMA - 2%),"
+          f"    If QQQ drops below ${lower_band_val:,.2f} (200 EMA - 4%),"
           " strategy triggers risk-off"
       ),
-      "    rotation to: 70% SGOV / 30% GLD.",
+      "    rotation to: 80% SPMO / 20% GLD.",
       border,
   ])
 
@@ -283,8 +294,8 @@ def build_html_email(
     <body>
         <div class="container">
             <div class="header">
-                <h2>📈 ROTH IRA VOLATILITY-TARGETED DASHBOARD</h2>
-                <p>Automated Strategy & Execution Report | {report_date}</p>
+                <h2>📈 ROTH IRA STRATEGY C HYBRID PRO DASHBOARD</h2>
+                <p>Automated Portfolio Strategy & Execution Report | {report_date}</p>
             </div>
             
             <div class="card">
@@ -310,17 +321,17 @@ def build_html_email(
             <div class="card">
                 <div class="card-title">2. Future Plays & Market Watch Triggers</div>
                 <div class="future-play">
-                    <strong>⚡ Volatility Target Status (18.0% Target):</strong><br>
-                    Current 20-day realized volatility is <strong>{latest_vol:.1%}</strong>. If volatility exceeds 18.0%, excess capital automatically scales into SGOV.
+                    <strong>⚡ Volatility Step-Down Trigger:</strong><br>
+                    If QQQ 10-day volatility rises from <strong>{latest_vol:.1%}</strong> to <strong>20.0%</strong>, strategy steps down leverage to: <em>5% TECL / 10% QLD / 10% SOXL / 75% SMH</em>.
                 </div>
                 <div class="future-play" style="background-color: #f2dede; border-left-color: #d9534f; margin-top: 10px;">
                     <strong>🛡️ Bear Regime Rotation Trigger:</strong><br>
-                    If QQQ drops below <strong>${lower_band_val:,.2f}</strong> (200 EMA - 2%), strategy triggers risk-off rotation to: <em>70% SGOV / 30% GLD</em>.
+                    If QQQ drops below <strong>${lower_band_val:,.2f}</strong> (200 EMA - 4%), strategy triggers risk-off rotation to: <em>80% SPMO / 20% GLD</em>.
                 </div>
             </div>
 
             <div class="footer">
-                2.33x Volatility-Targeted Engine | Automated GitHub Pipeline
+                Strategy C Hybrid Pro Engine | Automated GitHub Pipeline
             </div>
         </div>
     </body>
@@ -362,6 +373,16 @@ def send_email(subject, text_body, html_body):
 # 6. MAIN EXECUTION
 # ==========================================
 def main():
+  parser = argparse.ArgumentParser(
+      description="Strategy C Hybrid Pro Portfolio Engine"
+  )
+  parser.add_argument(
+      "--test",
+      action="store_true",
+      help="Run in test mode (prints dashboard to console, skips email)",
+  )
+  args = parser.parse_args()
+
   close = download_data(TICKERS, START_DATE, END_DATE)
 
   if "QQQ" not in close.columns or close["QQQ"].dropna().empty:
@@ -371,18 +392,16 @@ def main():
   qqq = close["QQQ"]
   _, upper_band, lower_band, regime = build_regime_filter(qqq)
 
-  vol_20 = qqq.pct_change().rolling(VOL_LOOKBACK).std() * np.sqrt(252)
+  vol_10 = qqq.pct_change().rolling(VOL_LOOKBACK).std() * np.sqrt(252)
 
   latest_date = close.index[-1].strftime("%Y-%m-%d")
   latest_qqq = float(qqq.iloc[-1])
-  latest_vol = float(vol_20.iloc[-1]) if not np.isnan(vol_20.iloc[-1]) else 0.18
+  latest_vol = float(vol_10.iloc[-1]) if not np.isnan(vol_10.iloc[-1]) else 0.18
   lower_band_val = float(lower_band.iloc[-1])
   latest_regime = int(regime[-1])
   regime_label = "BULL (Risk-On)" if latest_regime == 1 else "BEAR (Risk-Off)"
 
-  target_weights = calculate_volatility_targeted_weights(
-      latest_regime, latest_vol
-  )
+  target_weights = strategy_c_hybrid_pro_weights(latest_regime, latest_vol)
   target_df = calculate_target_portfolio(
       close, ROTH_IRA_AMOUNT, target_weights
   )
@@ -399,17 +418,20 @@ def main():
   )
   print(console_dashboard)
 
-  subject = f"Volatility-Targeted 2.33x Report - {latest_date}"
-  html_email = build_html_email(
-      latest_date,
-      regime_label,
-      latest_qqq,
-      latest_vol,
-      lower_band_val,
-      ROTH_IRA_AMOUNT,
-      target_df,
-  )
-  send_email(subject, console_dashboard, html_email)
+  if args.test:
+    print("\n[TEST MODE ACTIVE]: Email dispatch skipped.")
+  else:
+    subject = f"Strategy C Hybrid Pro Report - {latest_date}"
+    html_email = build_html_email(
+        latest_date,
+        regime_label,
+        latest_qqq,
+        latest_vol,
+        lower_band_val,
+        ROTH_IRA_AMOUNT,
+        target_df,
+    )
+    send_email(subject, console_dashboard, html_email)
 
 
 if __name__ == "__main__":
