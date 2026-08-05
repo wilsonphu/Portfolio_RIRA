@@ -64,6 +64,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("roth_ira")
 
+# NOTE: if this repo is ever public, a real balance here is exposed in the
+# source and in every commit that touches this line. Set the real number via
+# the ROTH_IRA_AMOUNT env var / GH Actions secret and treat this default as a
+# placeholder only.
 ROTH_IRA_AMOUNT = float(os.environ.get("ROTH_IRA_AMOUNT", 1025.97))
 STATE_FILE = Path("roth_ira_state.json")
 
@@ -115,6 +119,8 @@ def download_data(tickers: list, days: int = HISTORY_DAYS) -> Tuple[pd.DataFrame
     logger.info(f"Downloading {tickers} from {start} to {end}")
 
     data = yf.download(tickers, start=start, end=end, auto_adjust=True, progress=False)
+    if data.empty:
+        raise RuntimeError(f"yfinance returned no data for {tickers} between {start} and {end}")
     close = data["Close"].copy() if isinstance(data.columns, pd.MultiIndex) else pd.DataFrame(data["Close"])
     volume = data["Volume"].copy() if isinstance(data.columns, pd.MultiIndex) else pd.DataFrame(data["Volume"])
     close = close.ffill().dropna()
@@ -317,7 +323,11 @@ def main():
     # Portfolio value: use saved holdings if available, else CLI/env amount
     state = load_state()
     saved_value = state.get("portfolio_value")
-    portfolio_value = args.roth_amount or saved_value or ROTH_IRA_AMOUNT
+    portfolio_value = (
+        args.roth_amount if args.roth_amount is not None
+        else saved_value if saved_value is not None
+        else ROTH_IRA_AMOUNT
+    )
 
     target_df = build_target_portfolio(close, weights, portfolio_value)
 
@@ -327,12 +337,25 @@ def main():
     dashboard = format_dashboard(date_str, latest, weights, portfolio_value, target_df, rebalance_due)
     print(dashboard)
 
-    save_state({r["Ticker"]: r["TargetShares"] for _, r in target_df.iterrows()},
-               weights, portfolio_value)
+    if rebalance_due:
+        # A trade should actually happen to reach target_df's weights --
+        # record that as the new held position.
+        save_state({r["Ticker"]: r["TargetShares"] for _, r in target_df.iterrows()},
+                   weights, portfolio_value)
+    else:
+        # No trade today. Re-save the *previously recorded* shares (not the
+        # freshly recalculated target) so next run's drift check compares
+        # against what's actually held -- not against yesterday's target,
+        # which is what the original code was doing.
+        save_state(state.get("shares", {}), state.get("weights", weights), portfolio_value)
 
     if not args.test:
         send_email(f"ROTH IRA Report - {date_str}", dashboard,
                    build_html_email(date_str, latest, portfolio_value, target_df, rebalance_due))
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        logger.exception("roth_ira.py failed")
+        sys.exit(1)
