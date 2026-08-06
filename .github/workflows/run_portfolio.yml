@@ -4,10 +4,29 @@ on:
   workflow_dispatch:
     inputs:
       validate_only:
-        description: "Compile and verify dependencies without running the trading engine"
+        description: "Compile and run tests without running the trading engine"
         required: false
         default: false
         type: boolean
+      run_mode:
+        description: "Operation to perform when validate_only is false"
+        required: true
+        default: signal
+        type: choice
+        options:
+          - signal
+          - confirm-execution
+          - sync-holdings
+      executed_signal_date:
+        description: "Pending signal date (YYYY-MM-DD); required only for confirm-execution"
+        required: false
+        default: ""
+        type: string
+      executed_shares:
+        description: "Complete holdings as space-separated TICKER=SHARES values, including CASH"
+        required: false
+        default: ""
+        type: string
 
   schedule:
     # Run at 4:25 PM New York time, Monday through Friday.
@@ -64,11 +83,12 @@ jobs:
             python -m pip install numpy pandas yfinance exchange-calendars
           fi
 
-      - name: Verify Python and imports
+      - name: Verify Python, imports, and unit tests
         shell: bash
         run: |
           set -euo pipefail
           python -m py_compile port12_cloud.py
+          python -m unittest discover -s tests -v
 
           python - <<'PY'
           import exchange_calendars
@@ -160,7 +180,8 @@ jobs:
             (github.event_name == 'schedule' &&
              steps.market_session.outputs.is_session == 'true') ||
             (github.event_name == 'workflow_dispatch' &&
-             inputs.validate_only == false)
+             inputs.validate_only == false &&
+             inputs.run_mode == 'signal')
           }}
         shell: bash
         run: |
@@ -184,14 +205,77 @@ jobs:
             (github.event_name == 'workflow_dispatch' &&
              inputs.validate_only == false)
           }}
+        env:
+          DISPATCH_RUN_MODE: ${{ inputs.run_mode }}
+          EXECUTED_SIGNAL_DATE_INPUT: ${{ inputs.executed_signal_date }}
+          EXECUTED_SHARES_INPUT: ${{ inputs.executed_shares }}
         shell: bash
         run: |
           set -euo pipefail
-          python port12_cloud.py
+
+          run_mode="signal"
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            run_mode="${DISPATCH_RUN_MODE}"
+          fi
+
+          has_non_whitespace() {
+            [[ "$1" =~ [^[:space:]] ]]
+          }
+
+          executed_signal_date="${EXECUTED_SIGNAL_DATE_INPUT}"
+          normalized_shares="${EXECUTED_SHARES_INPUT//$'\r'/ }"
+          normalized_shares="${normalized_shares//$'\n'/ }"
+          executed_share_entries=()
+          read -r -a executed_share_entries <<< "${normalized_shares}"
+
+          engine_args=()
+          case "${run_mode}" in
+            signal)
+              if has_non_whitespace "${executed_signal_date}" ||
+                 has_non_whitespace "${EXECUTED_SHARES_INPUT}"; then
+                echo "::error::Execution inputs are valid only for confirm-execution or sync-holdings."
+                exit 1
+              fi
+              ;;
+            confirm-execution)
+              if ! has_non_whitespace "${executed_signal_date}"; then
+                echo "::error::confirm-execution requires executed_signal_date."
+                exit 1
+              fi
+              if (( ${#executed_share_entries[@]} == 0 )); then
+                echo "::error::confirm-execution requires executed_shares."
+                exit 1
+              fi
+              engine_args+=(
+                --confirm-execution
+                --executed-signal-date "${executed_signal_date}"
+                --executed-shares
+              )
+              engine_args+=("${executed_share_entries[@]}")
+              ;;
+            sync-holdings)
+              if has_non_whitespace "${executed_signal_date}"; then
+                echo "::error::sync-holdings does not accept executed_signal_date."
+                exit 1
+              fi
+              if (( ${#executed_share_entries[@]} == 0 )); then
+                echo "::error::sync-holdings requires executed_shares."
+                exit 1
+              fi
+              engine_args+=(--sync-holdings --executed-shares)
+              engine_args+=("${executed_share_entries[@]}")
+              ;;
+            *)
+              echo "::error::Unsupported run mode: ${run_mode}"
+              exit 1
+              ;;
+          esac
+
+          python port12_cloud.py "${engine_args[@]}"
 
       - name: Validation-only result
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.validate_only == true }}
-        run: echo "Validation completed; the trading engine was not run."
+        run: echo "Validation and unit tests completed; the trading engine was not run."
 
       # The state is stored as an artifact instead of being committed to the repository.
       # The next run restores the newest available state artifact.

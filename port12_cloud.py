@@ -31,36 +31,38 @@ Operational workflow
 --------------------
 1. Generate a signal after the latest completed market close:
 
-     python3 roth_ira_production_fixed.py
+     python port12_cloud.py
 
 2. Trade manually during the next trading session. Recalculate actual orders from
    current executable prices; report quantities are signal-close estimates.
 
 3. Confirm the final post-trade holdings and remaining cash in a separate command:
 
-     python3 roth_ira_production_fixed.py --confirm-execution \
+     python port12_cloud.py --confirm-execution \
        --executed-signal-date 2026-08-04 \
        --executed-shares SOXL=1.2 SMH=3.4 CASH=12.50
 
 4. To record a contribution, withdrawal, dividend, or broker correction when no
    recommendation is pending:
 
-     python3 roth_ira_production_fixed.py --sync-holdings \
+     python port12_cloud.py --sync-holdings \
        --executed-shares SOXL=1.2 SMH=3.4 CASH=1012.50
 
 Environment variables
 ---------------------
 ROTH_IRA_AMOUNT      First-run cash balance only
-GMAIL_ADDRESS        Optional Gmail sender
-GMAIL_APP_PASSWORD   Optional Gmail app password
-RECEIVER_EMAIL       Optional report recipient
+GMAIL_ADDRESS        Gmail sender, required only when a notification is due
+GMAIL_APP_PASSWORD   Gmail app password, required only when a notification is due
+RECEIVER_EMAIL       Report recipient, required only when a notification is due
 
 Important
 ---------
 - No forward-fill, backfill, interpolation, or synthetic price/volume data.
 - Signals use only completed daily bars.
-- A previous actionable recommendation must be confirmed before a new one is
-  generated on a later signal date.
+- HOLD runs are persisted silently. New, materially changed, and cancelled
+  recommendations are emailed once; identical pending actions are not resent.
+- Confirmed share counts and cash, never a prior model target, remain the source
+  of truth for portfolio valuation and rebalance decisions.
 """
 
 from __future__ import annotations
@@ -129,6 +131,7 @@ VOLATILITY_RERISK_PERSISTENCE = 2
 
 REBALANCE_BAND = 0.05
 REBALANCE_DESTINATION = 0.025
+NOTIFICATION_WEIGHT_TOLERANCE = 0.005
 MAX_LEVERAGED_POSITION = 0.45
 LEADER_SWITCH_THRESHOLD = 0.05
 SECTOR_REBALANCE_DAYS = 21
@@ -153,7 +156,7 @@ BEAR_ALLOCATION = {DEFENSIVE_EQUITY: 0.80, HEDGE_ASSET: 0.20}
 # =============================================================================
 NEW_YORK = ZoneInfo("America/New_York")
 MARKET_CLOSE_BUFFER_MINUTES = 15
-STATE_VERSION = 4
+STATE_VERSION = 5
 
 APP_DIR = Path(__file__).resolve().parent
 STATE_FILE = APP_DIR / "roth_ira_state.json"
@@ -174,12 +177,26 @@ if ROTH_IRA_AMOUNT is not None and (
 ):
     raise RuntimeError("ROTH_IRA_AMOUNT must be positive and finite")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler(sys.stdout)],
-)
 logger = logging.getLogger("roth_ira")
+logger.setLevel(logging.INFO)
+logger.propagate = False
+
+
+def configure_logging(*, persist_log: bool) -> None:
+    """Configure CLI logging without creating files during imports or --test runs."""
+    formatter = logging.Formatter(
+        "%(asctime)s - %(levelname)s - %(message)s"
+    )
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+    if persist_log:
+        handlers.insert(0, logging.FileHandler(LOG_FILE))
+
+    for existing_handler in logger.handlers:
+        existing_handler.close()
+    logger.handlers.clear()
+    for handler in handlers:
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
 
 # =============================================================================
 # 4. DATA CLASSES
@@ -214,6 +231,18 @@ class RebalancePlan:
     individual_orders: int
 
 
+@dataclass(frozen=True)
+class NotificationDecision:
+    kind: str
+    reason: str
+    previous_recommendation_date: str = ""
+    supersedes_recommendation_date: str = ""
+
+    @property
+    def should_send(self) -> bool:
+        return self.kind != "NONE"
+
+
 @dataclass
 class PortfolioState:
     state_version: int = STATE_VERSION
@@ -241,6 +270,8 @@ class PortfolioState:
     pending_recommendation_regime: str = "UNKNOWN"
     pending_recommendation_tier: str = "N/A"
     pending_recommendation_weights: dict[str, float] = field(default_factory=dict)
+    pending_recommendation_notified: bool = False
+    pending_recommendation_supersedes_date: str = ""
 
     last_sector_rebalance: str = ""
     last_updated: str = ""
@@ -315,6 +346,8 @@ def validate_configuration() -> None:
         raise RuntimeError("Re-risk persistence must require at least two closes")
     if not (0 < REBALANCE_DESTINATION < REBALANCE_BAND):
         raise RuntimeError("The rebalance destination must be inside the trigger band")
+    if not (0 < NOTIFICATION_WEIGHT_TOLERANCE < REBALANCE_BAND):
+        raise RuntimeError("The notification tolerance must be inside the drift band")
     if not (0 < MAX_LEVERAGED_POSITION <= 1):
         raise RuntimeError("The leveraged-position cap is invalid")
 
@@ -365,6 +398,8 @@ def validate_state(state: PortfolioState) -> None:
     if state.state_version != STATE_VERSION:
         raise RuntimeError("Portfolio state has the wrong version after migration")
 
+    if not isinstance(state.shares, dict):
+        raise RuntimeError("shares must be a mapping")
     invalid_share_tickers = set(state.shares) - TRADED_TICKERS
     if invalid_share_tickers:
         raise RuntimeError(
@@ -450,9 +485,23 @@ def validate_state(state: PortfolioState) -> None:
         state.pending_recommendation_date,
         "pending_recommendation_date",
     )
+    supersedes_date = _parse_iso_date(
+        state.pending_recommendation_supersedes_date,
+        "pending_recommendation_supersedes_date",
+    )
+    if not isinstance(state.pending_recommendation_notified, bool):
+        raise RuntimeError("pending_recommendation_notified must be a boolean")
     if pending_date:
         if pending_date > today:
             raise RuntimeError("Pending recommendation date cannot be in the future")
+        if supersedes_date and supersedes_date > today:
+            raise RuntimeError(
+                "Pending superseded recommendation date cannot be in the future"
+            )
+        if supersedes_date and state.pending_recommendation_notified:
+            raise RuntimeError(
+                "A delivered recommendation cannot retain superseded outbox state"
+            )
         if not state.pending_recommendation_weights:
             raise RuntimeError("Pending recommendation is missing weights")
         if state.pending_recommendation_leader is None:
@@ -475,6 +524,8 @@ def validate_state(state: PortfolioState) -> None:
             or state.pending_recommendation_regime != "UNKNOWN"
             or state.pending_recommendation_tier != "N/A"
             or state.pending_recommendation_weights
+            or state.pending_recommendation_notified
+            or state.pending_recommendation_supersedes_date
         ):
             raise RuntimeError("Portfolio state contains an inconsistent pending recommendation")
 
@@ -502,7 +553,12 @@ def _backup_legacy_state(version: object) -> Path:
     return backup
 
 
-def _migrate_state_payload(payload: dict[str, object], version: object) -> dict[str, object]:
+def _migrate_state_payload(
+    payload: dict[str, object],
+    version: object,
+    *,
+    backup_legacy: bool,
+) -> dict[str, object]:
     known_legacy_keys = {
         "shares",
         "target_weights",
@@ -516,7 +572,7 @@ def _migrate_state_payload(payload: dict[str, object], version: object) -> dict[
     if version is None and not known_legacy_keys.issubset(payload):
         raise RuntimeError("Unversioned state does not match the known legacy schema")
 
-    backup = _backup_legacy_state(version)
+    backup = _backup_legacy_state(version) if backup_legacy else None
     defaults = asdict(PortfolioState())
     valid_fields = {item.name for item in fields(PortfolioState)}
     for key, value in payload.items():
@@ -528,6 +584,10 @@ def _migrate_state_payload(payload: dict[str, object], version: object) -> dict[
     # Versions before 3 did not safely distinguish signal state from confirmed
     # execution state. Preserve holdings, but force a conservative next transition.
     numeric_version = version if isinstance(version, int) else 1
+    if numeric_version < STATE_VERSION:
+        # Earlier schemas persisted the action before attempting SMTP and could
+        # not prove delivery. A one-time retry is safer than suppressing it.
+        defaults["pending_recommendation_notified"] = False
     if numeric_version < 3:
         defaults.update(
             {
@@ -549,12 +609,12 @@ def _migrate_state_payload(payload: dict[str, object], version: object) -> dict[
         "Migrated state version %r to version %s; backup=%s",
         version,
         STATE_VERSION,
-        backup,
+        backup or "disabled",
     )
     return defaults
 
 
-def load_state() -> PortfolioState:
+def load_state(*, backup_legacy: bool = True) -> PortfolioState:
     if not STATE_FILE.exists():
         return PortfolioState()
 
@@ -567,9 +627,23 @@ def load_state() -> PortfolioState:
 
     version = payload.get("state_version")
     if version != STATE_VERSION:
-        if version not in {None, 1, 2, 3}:
+        if version not in {None, 1, 2, 3, 4}:
             raise RuntimeError(f"Unsupported state version: {version!r}")
-        payload = _migrate_state_payload(payload, version)
+        payload = _migrate_state_payload(
+            payload,
+            version,
+            backup_legacy=backup_legacy,
+        )
+
+    expected_fields = {item.name for item in fields(PortfolioState)}
+    missing_fields = expected_fields - set(payload)
+    unexpected_fields = set(payload) - expected_fields
+    if missing_fields or unexpected_fields:
+        raise RuntimeError(
+            "Portfolio state schema mismatch: "
+            f"missing={sorted(missing_fields)}, "
+            f"unexpected={sorted(unexpected_fields)}"
+        )
 
     try:
         state = PortfolioState(**payload)
@@ -588,14 +662,16 @@ def save_state(state: PortfolioState) -> None:
     temporary.write_text(payload, encoding="utf-8")
     os.replace(temporary, STATE_FILE)
     logger.info(
-        "State saved: signal=%s/%s leader=%s executed=%s/%s cash=$%.2f value=$%.2f",
+        "State saved: signal=%s/%s leader=%s executed=%s/%s holdings=%s "
+        "pending_signal=%s notified=%s",
         state.regime,
         state.volatility_tier,
         state.leader,
         state.executed_regime,
         state.executed_volatility_tier,
-        state.cash_balance,
-        state.portfolio_value,
+        len(state.shares),
+        state.pending_recommendation_date or "NONE",
+        state.pending_recommendation_notified,
     )
 
 # =============================================================================
@@ -856,7 +932,14 @@ def validate_latest_indicators(latest: pd.Series) -> None:
     invalid: list[str] = []
     for name in required:
         try:
-            valid = np.isfinite(float(latest[name]))
+            value = float(latest[name])
+            valid = np.isfinite(value)
+            if name in {
+                "volatility_10",
+                "volatility_30",
+                "annualized_volatility",
+            }:
+                valid = valid and value > 0
         except (KeyError, TypeError, ValueError):
             valid = False
         if not valid:
@@ -866,8 +949,8 @@ def validate_latest_indicators(latest: pd.Series) -> None:
 
 
 def classify_volatility(annualized_volatility: float) -> str:
-    if not np.isfinite(annualized_volatility):
-        raise ValueError("Volatility is unavailable")
+    if not np.isfinite(annualized_volatility) or annualized_volatility <= 0:
+        raise ValueError("Volatility must be positive and finite")
     if annualized_volatility < LOW_VOL_THRESHOLD:
         return "LOW"
     if annualized_volatility <= MODERATE_VOL_THRESHOLD:
@@ -1148,7 +1231,8 @@ def should_rebalance(
         return True
     tickers = set(existing) | set(target)
     return any(
-        abs(target.get(ticker, 0.0) - existing.get(ticker, 0.0)) > band
+        abs(target.get(ticker, 0.0) - existing.get(ticker, 0.0))
+        >= band - 1e-12
         for ticker in tickers
     )
 
@@ -1270,6 +1354,12 @@ def build_rebalance_plan(
         one_way_turnover = 0.0
         individual_orders = 0
 
+    if rebalance_due and individual_orders == 0 and one_way_turnover <= 1e-12:
+        rebalance_due = False
+        full_transition = False
+        reason = "CONFIRMED_TARGET_STATE"
+        one_way_turnover = 0.0
+
     return RebalancePlan(
         execution_weights=execution,
         rebalance_due=rebalance_due,
@@ -1383,24 +1473,18 @@ def calculate_execution_table(
 # =============================================================================
 # 10. ORCHESTRATION AND STATE TRANSITIONS
 # =============================================================================
-def run_strategy(roth_amount: float | None) -> StrategyRun:
+def run_strategy(
+    roth_amount: float | None,
+    *,
+    backup_legacy_state: bool = True,
+) -> StrategyRun:
     price_data, volume_data = download_market_data(ALL_TICKERS)
     indicators = calculate_indicators(price_data, volume_data)
     latest = indicators.iloc[-1]
     validate_latest_indicators(latest)
 
-    state = load_state()
+    state = load_state(backup_legacy=backup_legacy_state)
     signal_date = pd.Timestamp(price_data.index[-1]).normalize()
-    signal_date_string = signal_date.date().isoformat()
-
-    if (
-        state.pending_recommendation_date
-        and state.pending_recommendation_date != signal_date_string
-    ):
-        raise RuntimeError(
-            "A previous recommendation remains unconfirmed. Confirm the actual "
-            "holdings before generating a new actionable recommendation."
-        )
 
     tier_decision = replay_volatility_state(indicators, state)
     sector_due = sector_review_due(
@@ -1423,20 +1507,41 @@ def run_strategy(roth_amount: float | None) -> StrategyRun:
     current_weights = existing_weights(planning_state, price_data)
     plan = build_rebalance_plan(current_weights, result, planning_state)
 
-    # Re-running the same signal date is idempotent. The stored recommendation
-    # remains authoritative, and a data revision that changes it fails closed.
-    if state.pending_recommendation_date == signal_date_string:
-        saved = state.pending_recommendation_weights
-        if not _weights_close(saved, plan.execution_weights):
-            raise RuntimeError(
-                "The same signal date now produces a different recommendation; "
-                "market data may have been revised. Resolve this manually."
-            )
+    # Preserve the exact staged action during an SMTP retry when the current
+    # recommendation has not changed materially.
+    if (
+        plan.rebalance_due
+        and state.pending_recommendation_date
+        and not state.pending_recommendation_notified
+        and _weights_close(
+            state.pending_recommendation_weights,
+            plan.execution_weights,
+            tolerance=NOTIFICATION_WEIGHT_TOLERANCE,
+        )
+    ):
+        retry_weights = dict(state.pending_recommendation_weights)
+        retry_components = set(current_weights) | set(retry_weights)
         plan = replace(
             plan,
-            execution_weights=dict(saved),
-            rebalance_due=True,
-            reason="PENDING_RECOMMENDATION",
+            execution_weights=retry_weights,
+            reason="PENDING_DELIVERY_RETRY",
+            one_way_turnover=0.5
+            * sum(
+                abs(
+                    retry_weights.get(component, 0.0)
+                    - current_weights.get(component, 0.0)
+                )
+                for component in retry_components
+            ),
+            individual_orders=sum(
+                component != CASH_ASSET
+                and abs(
+                    retry_weights.get(component, 0.0)
+                    - current_weights.get(component, 0.0)
+                )
+                > 1e-9
+                for component in retry_components
+            ),
         )
 
     table_weights = (
@@ -1468,7 +1573,70 @@ def run_strategy(roth_amount: float | None) -> StrategyRun:
     )
 
 
+def _pending_recommendation_matches(strategy_run: StrategyRun) -> bool:
+    state = strategy_run.state
+    return (
+        bool(state.pending_recommendation_date)
+        and _weights_close(
+            state.pending_recommendation_weights,
+            strategy_run.rebalance_plan.execution_weights,
+            tolerance=NOTIFICATION_WEIGHT_TOLERANCE,
+        )
+    )
+
+
+def decide_notification(strategy_run: StrategyRun) -> NotificationDecision:
+    """Return the one notification, if any, warranted by confirmed holdings."""
+    state = strategy_run.state
+    pending_date = state.pending_recommendation_date
+    supersedes_date = state.pending_recommendation_supersedes_date
+    pending = bool(pending_date)
+    actionable = (
+        strategy_run.rebalance_plan.rebalance_due
+        and strategy_run.rebalance_plan.individual_orders > 0
+    )
+
+    if actionable:
+        if not pending:
+            return NotificationDecision("ACTION", "NEW_RECOMMENDATION")
+        if _pending_recommendation_matches(strategy_run):
+            if state.pending_recommendation_notified:
+                return NotificationDecision(
+                    "NONE",
+                    "IDENTICAL_PENDING_RECOMMENDATION",
+                    pending_date,
+                )
+            return NotificationDecision(
+                (
+                    "UPDATE_RETRY"
+                    if supersedes_date
+                    else "RETRY"
+                ),
+                (
+                    "UNDELIVERED_RECOMMENDATION_UPDATE"
+                    if supersedes_date
+                    else "UNDELIVERED_PENDING_RECOMMENDATION"
+                ),
+                pending_date,
+                supersedes_date,
+            )
+        return NotificationDecision(
+            "UPDATE",
+            "MATERIAL_RECOMMENDATION_UPDATE",
+            supersedes_date or pending_date,
+        )
+
+    if pending:
+        return NotificationDecision(
+            "CANCELLATION",
+            "PENDING_ACTION_NO_LONGER_REQUIRED",
+            supersedes_date or pending_date,
+        )
+    return NotificationDecision("NONE", "HOLD")
+
+
 def persist_signal_run(strategy_run: StrategyRun) -> None:
+    """Persist holdings valuation and signal progress, but not email delivery."""
     state = strategy_run.state
     result = strategy_run.result
     signal_date = strategy_run.signal_date.date().isoformat()
@@ -1488,15 +1656,73 @@ def persist_signal_run(strategy_run: StrategyRun) -> None:
     if strategy_run.sector_review_due:
         state.last_sector_rebalance = signal_date
 
-    plan = strategy_run.rebalance_plan
-    if plan.rebalance_due:
-        if state.pending_recommendation_date not in {"", signal_date}:
-            raise RuntimeError("An older recommendation is still pending")
-        state.pending_recommendation_date = signal_date
+    if strategy_run.rebalance_plan.reason == "CONFIRMED_TARGET_STATE":
+        state.target_weights = dict(strategy_run.rebalance_plan.execution_weights)
+        state.executed_leader = result.leader
+        state.executed_regime = result.regime
+        state.executed_volatility_tier = result.volatility_tier
+
+    save_state(state)
+
+
+def prepare_notification_delivery(
+    strategy_run: StrategyRun,
+    notification: NotificationDecision,
+) -> None:
+    """Stage an exact, confirmable recommendation before attempting SMTP."""
+    if not notification.should_send:
+        return
+
+    state = strategy_run.state
+    if notification.kind in {"ACTION", "UPDATE"}:
+        result = strategy_run.result
+        state.pending_recommendation_date = (
+            strategy_run.signal_date.date().isoformat()
+        )
         state.pending_recommendation_leader = result.leader
         state.pending_recommendation_regime = result.regime
         state.pending_recommendation_tier = result.volatility_tier
-        state.pending_recommendation_weights = dict(plan.execution_weights)
+        state.pending_recommendation_weights = dict(
+            strategy_run.rebalance_plan.execution_weights
+        )
+        state.pending_recommendation_notified = False
+        state.pending_recommendation_supersedes_date = (
+            notification.previous_recommendation_date
+            if notification.kind == "UPDATE"
+            else ""
+        )
+    elif notification.kind in {"RETRY", "UPDATE_RETRY"}:
+        if not state.pending_recommendation_date:
+            raise RuntimeError("Cannot retry a missing pending recommendation")
+        state.pending_recommendation_notified = False
+    elif notification.kind != "CANCELLATION":
+        raise ValueError(f"Unsupported notification kind: {notification.kind}")
+
+
+def persist_notification_delivery(
+    strategy_run: StrategyRun,
+    notification: NotificationDecision,
+) -> None:
+    """Record a notification only after SMTP delivery succeeds."""
+    if not notification.should_send:
+        raise ValueError("A NONE notification cannot be persisted as delivered")
+
+    state = strategy_run.state
+    if notification.kind in {"ACTION", "UPDATE", "RETRY", "UPDATE_RETRY"}:
+        if not state.pending_recommendation_date:
+            raise RuntimeError("Delivered recommendation is missing its outbox state")
+        state.pending_recommendation_notified = True
+        state.pending_recommendation_supersedes_date = ""
+    elif notification.kind == "CANCELLATION":
+        state.pending_recommendation_date = ""
+        state.pending_recommendation_leader = None
+        state.pending_recommendation_regime = "UNKNOWN"
+        state.pending_recommendation_tier = "N/A"
+        state.pending_recommendation_weights = {}
+        state.pending_recommendation_notified = False
+        state.pending_recommendation_supersedes_date = ""
+    else:
+        raise ValueError(f"Unsupported notification kind: {notification.kind}")
 
     save_state(state)
 
@@ -1504,14 +1730,30 @@ def persist_signal_run(strategy_run: StrategyRun) -> None:
 def validate_execution_confirmation(
     state: PortfolioState,
     executed_signal_date: str,
-) -> None:
+) -> bool:
     if not state.pending_recommendation_date:
         raise RuntimeError("There is no pending recommendation to confirm")
-    if state.pending_recommendation_date != executed_signal_date:
-        raise RuntimeError(
-            "Confirmed fills do not match the pending recommendation: "
-            f"expected {state.pending_recommendation_date}, got {executed_signal_date}"
+    if state.pending_recommendation_date == executed_signal_date:
+        return True
+
+    executed_date = _parse_iso_date(executed_signal_date, "executed_signal_date")
+    pending_date = _parse_iso_date(
+        state.pending_recommendation_date,
+        "pending_recommendation_date",
+    )
+    if executed_date and pending_date and executed_date < pending_date:
+        logger.warning(
+            "Reconciling fills for superseded signal %s; current pending signal %s "
+            "will be cleared and recalculated from confirmed holdings",
+            executed_signal_date,
+            state.pending_recommendation_date,
         )
+        return False
+
+    raise RuntimeError(
+        "Confirmed fills do not match the pending recommendation: "
+        f"expected {state.pending_recommendation_date}, got {executed_signal_date}"
+    )
 
 
 def confirm_execution(
@@ -1520,27 +1762,37 @@ def confirm_execution(
     executed_signal_date: str,
 ) -> PortfolioState:
     state = load_state()
-    validate_execution_confirmation(state, executed_signal_date)
+    matches_current_recommendation = validate_execution_confirmation(
+        state,
+        executed_signal_date,
+    )
 
     state.shares = dict(executed_shares)
     state.cash_balance = float(executed_cash)
-    state.target_weights = dict(state.pending_recommendation_weights)
-    state.executed_leader = state.pending_recommendation_leader
-    state.executed_regime = state.pending_recommendation_regime
-    state.executed_volatility_tier = state.pending_recommendation_tier
+    if matches_current_recommendation:
+        state.target_weights = dict(state.pending_recommendation_weights)
+        state.executed_leader = state.pending_recommendation_leader
+        state.executed_regime = state.pending_recommendation_regime
+        state.executed_volatility_tier = state.pending_recommendation_tier
+    else:
+        state.target_weights = {}
+        state.executed_leader = None
+        state.executed_regime = "UNKNOWN"
+        state.executed_volatility_tier = "N/A"
 
     state.pending_recommendation_date = ""
     state.pending_recommendation_leader = None
     state.pending_recommendation_regime = "UNKNOWN"
     state.pending_recommendation_tier = "N/A"
     state.pending_recommendation_weights = {}
+    state.pending_recommendation_notified = False
+    state.pending_recommendation_supersedes_date = ""
 
     save_state(state)
     logger.info(
-        "Execution confirmed for signal %s: holdings=%s cash=$%.2f",
+        "Execution confirmed for signal %s: holdings=%s",
         executed_signal_date,
-        executed_shares,
-        executed_cash,
+        len(executed_shares),
     )
     return state
 
@@ -1558,7 +1810,7 @@ def sync_holdings(
     state.shares = dict(executed_shares)
     state.cash_balance = float(executed_cash)
     save_state(state)
-    logger.info("Holdings synchronized: holdings=%s cash=$%.2f", executed_shares, executed_cash)
+    logger.info("Holdings synchronized: holdings=%s", len(executed_shares))
     return state
 
 
@@ -1679,10 +1931,19 @@ def build_dashboard(strategy_run: StrategyRun) -> str:
     return "\n".join(lines)
 
 
-def build_email_html(strategy_run: StrategyRun) -> str:
+def build_email_html(
+    strategy_run: StrategyRun,
+    notification: NotificationDecision,
+) -> str:
     result = strategy_run.result
     plan = strategy_run.rebalance_plan
-    status = "ACTION REQUIRED" if plan.rebalance_due else "HOLD"
+    status = {
+        "ACTION": "ACTION REQUIRED",
+        "UPDATE": "UPDATED ACTION REQUIRED",
+        "RETRY": "ACTION REQUIRED - DELIVERY RETRY",
+        "UPDATE_RETRY": "UPDATED ACTION REQUIRED - DELIVERY RETRY",
+        "CANCELLATION": "PREVIOUS ACTION CANCELLED",
+    }.get(notification.kind, "HOLD")
     color = "#b42318" if plan.rebalance_due else "#667085"
     rows: list[str] = []
     for _, row in strategy_run.execution_table.iterrows():
@@ -1724,13 +1985,71 @@ Portfolio: ${strategy_run.portfolio_value:,.2f} | One-way turnover: {plan.one_wa
 """
 
 
+def notification_subject(
+    strategy_run: StrategyRun,
+    notification: NotificationDecision,
+) -> str:
+    label = {
+        "ACTION": "Action Required",
+        "UPDATE": "Action Updated",
+        "RETRY": "Action Required (Retry)",
+        "UPDATE_RETRY": "Action Updated (Retry)",
+        "CANCELLATION": "Action Cancelled",
+    }.get(notification.kind)
+    if label is None:
+        raise ValueError("A NONE notification has no email subject")
+    subject_date = (
+        notification.previous_recommendation_date
+        if notification.kind in {"RETRY", "UPDATE_RETRY"}
+        else strategy_run.signal_date.date().isoformat()
+    )
+    return f"ROTH IRA {label} - {subject_date}"
+
+
+def notification_text_body(
+    strategy_run: StrategyRun,
+    notification: NotificationDecision,
+    dashboard: str,
+) -> str:
+    if notification.kind == "CANCELLATION":
+        prefix = (
+            "The portfolio action for signal "
+            f"{notification.previous_recommendation_date} is no longer required. "
+            "Do not execute the prior recommendation.\n\n"
+        )
+    elif notification.kind == "UPDATE":
+        prefix = (
+            "This recommendation replaces the portfolio action for signal "
+            f"{notification.previous_recommendation_date}.\n\n"
+        )
+    elif notification.kind == "RETRY":
+        prefix = (
+            "Delivery of the portfolio action for signal "
+            f"{notification.previous_recommendation_date} is being retried.\n\n"
+        )
+    elif notification.kind == "UPDATE_RETRY":
+        prefix = (
+            "Delivery of the updated portfolio action for signal "
+            f"{notification.previous_recommendation_date} is being retried. "
+            "It replaces the previously delivered action for signal "
+            f"{notification.supersedes_recommendation_date}.\n\n"
+        )
+    elif notification.kind == "ACTION":
+        prefix = "A portfolio update is required.\n\n"
+    else:
+        raise ValueError("A NONE notification has no email body")
+    return prefix + dashboard
+
+
 def send_email(subject: str, text_body: str, html_body: str) -> None:
     address = os.environ.get("GMAIL_ADDRESS")
     password = os.environ.get("GMAIL_APP_PASSWORD")
     recipient = os.environ.get("RECEIVER_EMAIL")
     if not all((address, password, recipient)):
-        logger.info("Email environment variables are not set; skipping email")
-        return
+        raise RuntimeError(
+            "GMAIL_ADDRESS, GMAIL_APP_PASSWORD, and RECEIVER_EMAIL are required "
+            "when a portfolio notification is due"
+        )
 
     message = EmailMessage()
     message["Subject"] = subject
@@ -1835,9 +2154,10 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    validate_configuration()
     parser = build_argument_parser()
     args = parser.parse_args()
+    configure_logging(persist_log=not args.test)
+    validate_configuration()
 
     if args.roth_amount is not None and (
         not np.isfinite(args.roth_amount) or args.roth_amount <= 0
@@ -1885,20 +2205,33 @@ def main() -> None:
             "Execution fields require --confirm-execution or --sync-holdings"
         )
 
-    strategy_run = run_strategy(args.roth_amount)
+    strategy_run = run_strategy(
+        args.roth_amount,
+        backup_legacy_state=not args.test,
+    )
     log_decision(strategy_run)
     dashboard = build_dashboard(strategy_run)
     print(dashboard)
+    notification = decide_notification(strategy_run)
+    logger.info(
+        "notification kind=%s reason=%s",
+        notification.kind,
+        notification.reason,
+    )
 
     if not args.test:
-        # Persist the recommendation before sending an actionable email. An email
-        # failure is recoverable because the recommendation remains in state.
+        # Atomically checkpoint confirmed holdings, signal progression, and the
+        # exact outbox action before SMTP. Delivery is marked separately so an
+        # ambiguous failure remains both confirmable and retryable.
+        prepare_notification_delivery(strategy_run, notification)
         persist_signal_run(strategy_run)
-        send_email(
-            f"ROTH IRA Report - {strategy_run.signal_date.date()}",
-            dashboard,
-            build_email_html(strategy_run),
-        )
+        if notification.should_send:
+            send_email(
+                notification_subject(strategy_run, notification),
+                notification_text_body(strategy_run, notification, dashboard),
+                build_email_html(strategy_run, notification),
+            )
+            persist_notification_delivery(strategy_run, notification)
 
 
 if __name__ == "__main__":
