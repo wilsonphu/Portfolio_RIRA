@@ -22,7 +22,7 @@ SIGNAL_DATE = pd.Timestamp("2026-08-04")
 
 
 def market_frames(rows=230, *, end=SIGNAL_DATE):
-    index = pd.bdate_range(end=end, periods=rows)
+    index = engine.required_nyse_sessions(pd.Timestamp(end), rows)
     step = np.arange(rows, dtype=float)
     prices = pd.DataFrame(
         {
@@ -126,6 +126,7 @@ def pending_state(
         pending_recommendation_weights=dict(weights),
         pending_recommendation_notified=notified,
         pending_recommendation_supersedes_date=supersedes_date,
+        pending_recommendation_fingerprint=engine.STRATEGY_FINGERPRINT,
     )
 
 
@@ -164,12 +165,26 @@ def make_strategy_run(
         raw_tier=tier,
         transition="UNCHANGED",
     )
+    latest = complete_latest(
+        bullish=result.regime == "BULL",
+        volatility=result.annualized_volatility,
+    )
+    prices = one_row_prices()
+    signal_diagnostics = engine.build_signal_diagnostics(
+        prices,
+        latest,
+        "a" * 64,
+    )
+    execution_diagnostics = engine.calculate_execution_diagnostics(
+        pd.DataFrame(),
+        1_000.0,
+        {},
+        result.target_weights,
+        execution_weights,
+    )
     return engine.StrategyRun(
-        price_data=one_row_prices(),
-        latest_indicators=complete_latest(
-            bullish=result.regime == "BULL",
-            volatility=result.annualized_volatility,
-        ),
+        price_data=prices,
+        latest_indicators=latest,
         result=result,
         state=state,
         planning_state=copy.deepcopy(state),
@@ -180,6 +195,8 @@ def make_strategy_run(
         sector_review_due=False,
         rebalance_plan=plan,
         tier_decision=tier_decision,
+        signal_diagnostics=signal_diagnostics,
+        execution_diagnostics=execution_diagnostics,
     )
 
 
@@ -189,15 +206,23 @@ class EngineTestCase(unittest.TestCase):
         self.temp_path = Path(self.temporary_directory.name)
         self.state_file = self.temp_path / "state.json"
         self.log_file = self.temp_path / "engine.log"
+        self.audit_file = self.temp_path / "decision.json"
         self.state_patch = mock.patch.object(engine, "STATE_FILE", self.state_file)
         self.log_patch = mock.patch.object(engine, "LOG_FILE", self.log_file)
+        self.audit_patch = mock.patch.object(
+            engine,
+            "DECISION_AUDIT_FILE",
+            self.audit_file,
+        )
         self.state_patch.start()
         self.log_patch.start()
+        self.audit_patch.start()
 
     def tearDown(self):
         for handler in list(engine.logger.handlers):
             handler.close()
         engine.logger.handlers.clear()
+        self.audit_patch.stop()
         self.log_patch.stop()
         self.state_patch.stop()
         self.temporary_directory.cleanup()
@@ -436,6 +461,186 @@ class OriginalStrategyTests(EngineTestCase):
         self.assertEqual(reviewed.leader, engine.LEVERAGED_TECH)
 
 
+class StrategyGovernanceTests(EngineTestCase):
+    def test_strategy_manifest_hash_is_deterministic_and_parameter_sensitive(self):
+        manifest = engine.strategy_manifest()
+        reordered = dict(reversed(list(copy.deepcopy(manifest).items())))
+        self.assertEqual(
+            engine.calculate_strategy_fingerprint(manifest),
+            engine.calculate_strategy_fingerprint(reordered),
+        )
+        self.assertEqual(
+            engine.STRATEGY_FINGERPRINT,
+            engine.EXPECTED_STRATEGY_FINGERPRINT,
+        )
+
+        changed = copy.deepcopy(manifest)
+        changed["thresholds"]["low_volatility"] = 0.151
+        self.assertNotEqual(
+            engine.calculate_strategy_fingerprint(manifest),
+            engine.calculate_strategy_fingerprint(changed),
+        )
+
+        with mock.patch.object(engine, "LOW_VOL_THRESHOLD", 0.151):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "fingerprint",
+            ):
+                engine.validate_configuration()
+
+        self.assertNotIn(
+            "notification_weight_tolerance",
+            json.dumps(manifest),
+        )
+        self.assertIn(
+            "notification_weight_tolerance",
+            engine.operational_manifest(),
+        )
+        with mock.patch.object(
+            engine,
+            "NOTIFICATION_WEIGHT_TOLERANCE",
+            0.006,
+        ):
+            self.assertEqual(
+                engine.calculate_strategy_fingerprint(),
+                engine.STRATEGY_FINGERPRINT,
+            )
+            engine.validate_configuration()
+
+    def test_exact_advertised_exposure_for_every_locked_template(self):
+        for leader in engine.LEADER_CANDIDATES:
+            with self.subTest(leader=leader, tier="LOW"):
+                target = engine.apply_allocation_template(
+                    engine.LOW_VOL_ALLOCATION,
+                    leader,
+                )
+                self.assertAlmostEqual(
+                    engine.advertised_daily_exposure(target),
+                    2.35,
+                )
+            with self.subTest(leader=leader, tier="MODERATE"):
+                target = engine.apply_allocation_template(
+                    engine.MODERATE_VOL_ALLOCATION,
+                    leader,
+                )
+                self.assertAlmostEqual(
+                    engine.advertised_daily_exposure(target),
+                    1.90,
+                )
+
+        self.assertAlmostEqual(
+            engine.advertised_daily_exposure(engine.HIGH_VOL_ALLOCATION),
+            1.0,
+        )
+        self.assertAlmostEqual(
+            engine.advertised_daily_exposure(engine.BEAR_ALLOCATION),
+            1.0,
+        )
+        self.assertEqual(
+            engine.advertised_daily_exposure({engine.CASH_ASSET: 1.0}),
+            0.0,
+        )
+
+    def test_drift_destination_exposure_is_diagnostic_not_a_hidden_constraint(self):
+        current = {
+            engine.LEVERAGED_SEMICONDUCTOR: 0.45,
+            engine.LEVERAGED_TECH: 0.20,
+            engine.SEMICONDUCTOR_ETF: 0.20,
+            engine.LEVERAGED_INDEX: 0.15,
+        }
+        target = engine.apply_allocation_template(
+            engine.LOW_VOL_ALLOCATION,
+            engine.LEVERAGED_SEMICONDUCTOR,
+        )
+        destination = engine.inner_band_rebalance_weights(current, target)
+
+        self.assertAlmostEqual(
+            engine.advertised_daily_exposure(destination),
+            2.40,
+        )
+        self.assertLessEqual(
+            destination[engine.LEVERAGED_SEMICONDUCTOR],
+            engine.MAX_LEVERAGED_POSITION,
+        )
+        self.assertAlmostEqual(
+            engine.MAX_STRATEGIC_ADVERTISED_DAILY_EXPOSURE,
+            2.35,
+        )
+
+    def test_strategy_revision_mismatch_forces_an_exact_transition(self):
+        result = make_result(tier="LOW")
+        state = engine.PortfolioState(
+            executed_leader=result.leader,
+            executed_regime=result.regime,
+            executed_volatility_tier=result.volatility_tier,
+            executed_strategy_fingerprint="b" * 64,
+        )
+        plan = engine.build_rebalance_plan(
+            {engine.SEMICONDUCTOR_ETF: 1.0},
+            result,
+            state,
+        )
+        self.assertTrue(plan.rebalance_due)
+        self.assertTrue(plan.full_transition)
+        self.assertEqual(plan.reason, "STRATEGY_REVISION_TRANSITION")
+        self.assertEqual(
+            plan.execution_weights,
+            weights_with_cash(result.target_weights),
+        )
+
+    def test_old_strategy_retry_cannot_replace_new_transition_weights(self):
+        result = make_result(tier="LOW")
+        new_weights = weights_with_cash(result.target_weights)
+        old_weights = dict(new_weights)
+        old_weights[engine.LEVERAGED_SEMICONDUCTOR] -= 0.004
+        old_weights[engine.LEVERAGED_TECH] += 0.004
+        current_weights = {engine.SEMICONDUCTOR_ETF: 1.0}
+        state = pending_state(old_weights, notified=False)
+        state.pending_recommendation_fingerprint = "b" * 64
+        state.executed_leader = result.leader
+        state.executed_regime = result.regime
+        state.executed_volatility_tier = result.volatility_tier
+        state.executed_strategy_fingerprint = "b" * 64
+
+        plan = engine.build_rebalance_plan(
+            current_weights,
+            result,
+            state,
+        )
+        preserved = engine.preserve_pending_delivery_plan(
+            plan,
+            state,
+            current_weights,
+        )
+
+        self.assertEqual(preserved.reason, "STRATEGY_REVISION_TRANSITION")
+        self.assertEqual(preserved.execution_weights, new_weights)
+        self.assertNotEqual(preserved.execution_weights, old_weights)
+
+    def test_signal_diagnostics_report_exact_boundary_margins(self):
+        prices = one_row_prices()
+        prices.loc[SIGNAL_DATE, engine.MARKET_INDEX] = 110.0
+        latest = complete_latest(
+            volatility=0.20,
+            soxl_momentum=0.08,
+            tecl_momentum=0.02,
+        )
+        latest["sma_200"] = 100.0
+        latest["donchian_mid"] = 105.0
+        latest["vwma_50"] = 112.0
+        diagnostics = engine.build_signal_diagnostics(
+            prices,
+            latest,
+            "c" * 64,
+        )
+        self.assertAlmostEqual(diagnostics.sma_distance, 0.10)
+        self.assertAlmostEqual(diagnostics.donchian_distance, 110.0 / 105.0 - 1)
+        self.assertAlmostEqual(diagnostics.vwma_distance, 110.0 / 112.0 - 1)
+        self.assertAlmostEqual(diagnostics.low_volatility_distance, 0.05)
+        self.assertAlmostEqual(diagnostics.moderate_volatility_distance, -0.02)
+        self.assertAlmostEqual(diagnostics.momentum_spread, 0.06)
+
+
 class RebalanceTests(EngineTestCase):
     def test_exact_five_point_drift_triggers_and_below_band_holds(self):
         target = {"A": 0.50, "B": 0.50}
@@ -476,6 +681,7 @@ class RebalanceTests(EngineTestCase):
             executed_leader=engine.LEVERAGED_SEMICONDUCTOR,
             executed_regime="BULL",
             executed_volatility_tier="LOW",
+            executed_strategy_fingerprint=engine.STRATEGY_FINGERPRINT,
         )
         hold = engine.build_rebalance_plan(existing, low_soxl, state)
         self.assertFalse(hold.rebalance_due)
@@ -518,6 +724,7 @@ class RebalanceTests(EngineTestCase):
             executed_leader=engine.LEVERAGED_SEMICONDUCTOR,
             executed_regime="BULL",
             executed_volatility_tier="LOW",
+            executed_strategy_fingerprint=engine.STRATEGY_FINGERPRINT,
         )
         plan = engine.build_rebalance_plan(
             {
@@ -553,6 +760,80 @@ class RebalanceTests(EngineTestCase):
         self.assertEqual(table.loc[engine.LEVERAGED_SEMICONDUCTOR, "TargetPct"], 0.0)
         self.assertEqual(table.loc[engine.LEVERAGED_TECH, "TargetPct"], 0.0)
 
+    def test_gross_security_trades_and_cost_sensitivity_are_exact(self):
+        prices = one_row_prices(100.0)
+
+        cash_state = engine.PortfolioState(cash_balance=1_000.0)
+        cash_destination = {
+            engine.SEMICONDUCTOR_ETF: 1.0,
+            engine.CASH_ASSET: 0.0,
+        }
+        initial_table = engine.calculate_execution_table(
+            prices,
+            cash_destination,
+            1_000.0,
+            cash_state,
+            actionable=True,
+        )
+        initial = engine.calculate_execution_diagnostics(
+            initial_table,
+            1_000.0,
+            {engine.CASH_ASSET: 1.0},
+            {engine.SEMICONDUCTOR_ETF: 1.0},
+            cash_destination,
+        )
+        self.assertAlmostEqual(initial.gross_security_trade_fraction, 1.0)
+        self.assertAlmostEqual(initial.estimated_costs[5], 0.50)
+        self.assertAlmostEqual(initial.estimated_costs[10], 1.00)
+        self.assertAlmostEqual(initial.estimated_costs[25], 2.50)
+
+        rotation_state = engine.PortfolioState(
+            shares={engine.SEMICONDUCTOR_ETF: 10.0}
+        )
+        rotation_destination = {
+            engine.HEDGE_ASSET: 1.0,
+            engine.CASH_ASSET: 0.0,
+        }
+        rotation_table = engine.calculate_execution_table(
+            prices,
+            rotation_destination,
+            1_000.0,
+            rotation_state,
+            actionable=True,
+        )
+        rotation = engine.calculate_execution_diagnostics(
+            rotation_table,
+            1_000.0,
+            {engine.SEMICONDUCTOR_ETF: 1.0},
+            {engine.HEDGE_ASSET: 1.0},
+            rotation_destination,
+        )
+        self.assertAlmostEqual(rotation.gross_security_trade_fraction, 2.0)
+        self.assertAlmostEqual(rotation.estimated_costs[10], 2.0)
+
+    def test_hold_has_zero_execution_cost_without_changing_target(self):
+        result = make_result(tier="LOW")
+        prices = one_row_prices(100.0)
+        table = engine.calculate_execution_table(
+            prices,
+            weights_with_cash(result.target_weights),
+            1_000.0,
+            engine.PortfolioState(),
+            actionable=False,
+        )
+        diagnostics = engine.calculate_execution_diagnostics(
+            table,
+            1_000.0,
+            dict(result.target_weights),
+            result.target_weights,
+            result.target_weights,
+        )
+        self.assertEqual(diagnostics.gross_security_trade_fraction, 0.0)
+        self.assertTrue(
+            all(value == 0.0 for value in diagnostics.estimated_costs.values())
+        )
+        self.assertAlmostEqual(diagnostics.destination_daily_exposure, 2.35)
+
     def test_zero_order_structural_transition_reconciles_execution_metadata(self):
         result = make_result(tier="LOW", leader=engine.LEVERAGED_SEMICONDUCTOR)
         existing = dict(result.target_weights)
@@ -560,6 +841,7 @@ class RebalanceTests(EngineTestCase):
             executed_leader=engine.LEVERAGED_SEMICONDUCTOR,
             executed_regime="BULL",
             executed_volatility_tier="MODERATE",
+            executed_strategy_fingerprint=engine.STRATEGY_FINGERPRINT,
         )
         plan = engine.build_rebalance_plan(existing, result, state)
         self.assertFalse(plan.rebalance_due)
@@ -616,6 +898,92 @@ class MarketDataTests(EngineTestCase):
         self.assertTrue(np.isnan(prices.loc[gap_date, engine.SEMICONDUCTOR_ETF]))
         self.assertTrue(prices.index.equals(volumes.index))
         downloader.assert_called_once()
+
+    def test_missing_required_exchange_session_is_rejected(self):
+        _, _, payload = market_frames()
+        missing_session = payload.index[-25]
+        payload = payload.drop(index=missing_session)
+        with self.assertRaisesRegex(
+            RuntimeError,
+            f"session continuity.*{missing_session.date().isoformat()}",
+        ):
+            self.download_from_payload(payload, payload.index[-1])
+
+    def test_non_session_row_is_rejected_but_gap_before_window_is_irrelevant(self):
+        _, _, payload = market_frames()
+        friday = next(
+            item
+            for item in reversed(payload.index[-150:])
+            if item.dayofweek == 4
+        )
+        non_session = friday + pd.Timedelta(days=1)
+        invalid = payload.rename(index={friday: non_session}).sort_index()
+        with self.assertRaisesRegex(
+            RuntimeError,
+            f"non_sessions.*{non_session.date().isoformat()}",
+        ):
+            self.download_from_payload(invalid, invalid.index[-1])
+
+        outside_required_window = payload.drop(index=payload.index[0])
+        (prices, _), _ = self.download_from_payload(
+            outside_required_window,
+            outside_required_window.index[-1],
+        )
+        self.assertEqual(len(prices), len(outside_required_window))
+
+    def test_market_data_fingerprint_is_canonical_and_input_sensitive(self):
+        prices, volumes, _ = market_frames()
+        baseline = engine.market_data_fingerprint(prices, volumes)
+        reordered = engine.market_data_fingerprint(
+            prices.loc[:, list(reversed(prices.columns))],
+            volumes.loc[:, list(reversed(volumes.columns))],
+        )
+        self.assertEqual(baseline, reordered)
+
+        changed_prices = prices.copy()
+        changed_prices.loc[
+            changed_prices.index[-10],
+            engine.MARKET_INDEX,
+        ] += 0.01
+        self.assertNotEqual(
+            baseline,
+            engine.market_data_fingerprint(changed_prices, volumes),
+        )
+
+        changed_volumes = volumes.copy()
+        changed_volumes.loc[
+            changed_volumes.index[-10],
+            engine.MARKET_INDEX,
+        ] += 1.0
+        self.assertNotEqual(
+            baseline,
+            engine.market_data_fingerprint(prices, changed_volumes),
+        )
+
+    def test_same_date_data_revision_fails_but_next_session_is_allowed(self):
+        state = engine.PortfolioState(
+            last_processed_signal_date=SIGNAL_DATE.date().isoformat(),
+            last_processed_data_fingerprint="d" * 64,
+        )
+        engine.validate_same_date_data_fingerprint(
+            state,
+            SIGNAL_DATE,
+            "d" * 64,
+        )
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "already processed signal date",
+        ):
+            engine.validate_same_date_data_fingerprint(
+                state,
+                SIGNAL_DATE,
+                "e" * 64,
+            )
+        engine.validate_same_date_data_fingerprint(
+            state,
+            SIGNAL_DATE + pd.Timedelta(days=1),
+            "e" * 64,
+        )
 
     def test_gap_inside_required_signal_window_fails_closed(self):
         _, _, payload = market_frames()
@@ -749,6 +1117,10 @@ class StateAndHoldingsTests(EngineTestCase):
 
         migrated = engine.load_state(backup_legacy=False)
         self.assertFalse(migrated.pending_recommendation_notified)
+        self.assertEqual(
+            migrated.pending_recommendation_fingerprint,
+            engine.STRATEGY_FINGERPRINT,
+        )
         retry = make_strategy_run(
             state=migrated,
             execution_weights=weights,
@@ -759,6 +1131,80 @@ class StateAndHoldingsTests(EngineTestCase):
         self.assertEqual(
             decision.previous_recommendation_date,
             SIGNAL_DATE.date().isoformat(),
+        )
+
+    def test_version_five_migration_preserves_holdings_and_strategy_lineage(self):
+        weights = weights_with_cash(make_result().target_weights)
+        legacy_state = pending_state(
+            weights,
+            notified=True,
+            shares={engine.LEVERAGED_SEMICONDUCTOR: 2.0},
+        )
+        legacy_state.cash_balance = 25.0
+        legacy_state.executed_leader = engine.LEVERAGED_SEMICONDUCTOR
+        legacy_state.executed_regime = "BULL"
+        legacy_state.executed_volatility_tier = "LOW"
+        payload = asdict(legacy_state)
+        payload["state_version"] = 5
+        payload.pop("executed_strategy_fingerprint")
+        payload.pop("pending_recommendation_fingerprint")
+        payload.pop("last_processed_data_fingerprint")
+        payload.pop("last_delivered_decision_hash")
+        payload.pop("last_delivered_signal_date")
+        payload.pop("last_delivered_notification_kind")
+        self.write_state(payload)
+
+        migrated = engine.load_state(backup_legacy=False)
+        self.assertEqual(migrated.state_version, engine.STATE_VERSION)
+        self.assertEqual(migrated.shares, legacy_state.shares)
+        self.assertEqual(migrated.cash_balance, 25.0)
+        self.assertEqual(
+            migrated.executed_strategy_fingerprint,
+            engine.STRATEGY_FINGERPRINT,
+        )
+        self.assertEqual(
+            migrated.pending_recommendation_fingerprint,
+            engine.STRATEGY_FINGERPRINT,
+        )
+        self.assertTrue(migrated.pending_recommendation_notified)
+
+    def test_version_six_migration_preserves_processed_data_lineage(self):
+        weights = weights_with_cash(make_result().target_weights)
+        legacy = pending_state(
+            weights,
+            notified=False,
+        )
+        legacy.executed_leader = engine.LEVERAGED_SEMICONDUCTOR
+        legacy.executed_regime = "BULL"
+        legacy.executed_volatility_tier = "LOW"
+        legacy.executed_strategy_fingerprint = (
+            "e397f981f746715b61a756c8aa511b24fd6b9349f08297098859ad90c417f20d"
+        )
+        legacy.pending_recommendation_fingerprint = (
+            legacy.executed_strategy_fingerprint
+        )
+        legacy.last_processed_signal_date = SIGNAL_DATE.date().isoformat()
+        legacy.last_processed_data_fingerprint = "d" * 64
+        payload = asdict(legacy)
+        payload["state_version"] = 6
+        payload.pop("last_delivered_decision_hash")
+        payload.pop("last_delivered_signal_date")
+        payload.pop("last_delivered_notification_kind")
+        self.write_state(payload)
+
+        migrated = engine.load_state(backup_legacy=False)
+        self.assertEqual(migrated.state_version, engine.STATE_VERSION)
+        self.assertEqual(
+            migrated.last_processed_data_fingerprint,
+            "d" * 64,
+        )
+        self.assertEqual(
+            migrated.executed_strategy_fingerprint,
+            engine.STRATEGY_FINGERPRINT,
+        )
+        self.assertEqual(
+            migrated.pending_recommendation_fingerprint,
+            engine.STRATEGY_FINGERPRINT,
         )
 
     def test_confirmed_shares_and_cash_not_model_target_drive_next_decision(self):
@@ -787,7 +1233,12 @@ class StateAndHoldingsTests(EngineTestCase):
         )
         self.assertEqual(confirmed.cash_balance, 50.0)
         self.assertEqual(confirmed.target_weights, model_target)
+        self.assertEqual(
+            confirmed.executed_strategy_fingerprint,
+            engine.STRATEGY_FINGERPRINT,
+        )
         self.assertEqual(confirmed.pending_recommendation_date, "")
+        self.assertEqual(confirmed.pending_recommendation_fingerprint, "")
         self.assertFalse(confirmed.pending_recommendation_notified)
 
         prices = one_row_prices()
@@ -844,6 +1295,26 @@ class StateAndHoldingsTests(EngineTestCase):
         self.assertEqual(confirmed.target_weights, {})
         self.assertEqual(confirmed.executed_regime, "UNKNOWN")
         self.assertEqual(confirmed.executed_volatility_tier, "N/A")
+        self.assertEqual(confirmed.executed_strategy_fingerprint, "")
+
+    def test_fills_from_old_strategy_revision_reset_execution_metadata(self):
+        weights = weights_with_cash(make_result().target_weights)
+        state = pending_state(weights)
+        state.pending_recommendation_fingerprint = "f" * 64
+        self.write_state(state)
+
+        confirmed = engine.confirm_execution(
+            {engine.SEMICONDUCTOR_ETF: 2.0},
+            10.0,
+            SIGNAL_DATE.date().isoformat(),
+        )
+        self.assertEqual(
+            confirmed.shares,
+            {engine.SEMICONDUCTOR_ETF: 2.0},
+        )
+        self.assertEqual(confirmed.target_weights, {})
+        self.assertEqual(confirmed.executed_regime, "UNKNOWN")
+        self.assertEqual(confirmed.executed_strategy_fingerprint, "")
 
 
 class NotificationTests(EngineTestCase):
@@ -924,6 +1395,10 @@ class NotificationTests(EngineTestCase):
             engine.persist_notification_delivery(run, decision)
         self.assertEqual(state.pending_recommendation_weights, moderate)
         self.assertEqual(state.pending_recommendation_tier, "MODERATE")
+        self.assertEqual(
+            state.pending_recommendation_fingerprint,
+            engine.STRATEGY_FINGERPRINT,
+        )
         self.assertTrue(state.pending_recommendation_notified)
         save.assert_called_once_with(state)
 
@@ -955,6 +1430,10 @@ class NotificationTests(EngineTestCase):
             "2026-08-03",
         )
         self.assertFalse(state.pending_recommendation_notified)
+        self.assertEqual(
+            state.pending_recommendation_fingerprint,
+            engine.STRATEGY_FINGERPRINT,
+        )
 
         retry_run = make_strategy_run(
             state=state,
@@ -1092,6 +1571,13 @@ class NotificationTests(EngineTestCase):
             SIGNAL_DATE.date().isoformat(),
         )
         self.assertFalse(persisted.pending_recommendation_notified)
+        self.assertEqual(
+            persisted.pending_recommendation_fingerprint,
+            engine.STRATEGY_FINGERPRINT,
+        )
+        audit = json.loads(self.audit_file.read_text(encoding="utf-8"))
+        self.assertEqual(audit["delivery"]["status"], "STAGED")
+        self.assertEqual(audit["notification"]["kind"], "ACTION")
         engine.validate_execution_confirmation(
             persisted,
             SIGNAL_DATE.date().isoformat(),
@@ -1104,6 +1590,76 @@ class NotificationTests(EngineTestCase):
             reason="VOLATILITY_TIER_TRANSITION",
         )
         self.assertEqual(engine.decide_notification(retry).kind, "RETRY")
+
+    def test_delivered_email_evidence_survives_final_audit_write_failure(self):
+        run = make_strategy_run(rebalance_due=True)
+        original_write_audit = engine.write_decision_audit
+        audit_writes = 0
+
+        def fail_second_audit_write(*args, **kwargs):
+            nonlocal audit_writes
+            audit_writes += 1
+            if audit_writes == 2:
+                raise OSError("final audit disk error")
+            return original_write_audit(*args, **kwargs)
+
+        with mock.patch.object(
+            sys,
+            "argv",
+            ["port12_cloud.py"],
+        ), mock.patch.object(engine, "configure_logging"), mock.patch.object(
+            engine,
+            "run_strategy",
+            return_value=run,
+        ), mock.patch.object(engine, "log_decision"), mock.patch.object(
+            engine,
+            "build_dashboard",
+            return_value="dashboard",
+        ), mock.patch.object(
+            engine,
+            "build_email_html",
+            return_value="<html></html>",
+        ), mock.patch.object(engine, "send_email"), mock.patch.object(
+            engine,
+            "write_decision_audit",
+            side_effect=fail_second_audit_write,
+        ), mock.patch("builtins.print"):
+            with self.assertRaisesRegex(OSError, "final audit disk error"):
+                engine.main()
+
+        persisted = engine.load_state()
+        staged = json.loads(self.audit_file.read_text(encoding="utf-8"))
+        self.assertTrue(persisted.pending_recommendation_notified)
+        self.assertEqual(staged["delivery"]["status"], "STAGED")
+        self.assertEqual(
+            persisted.last_delivered_decision_hash,
+            staged["decision_hash"],
+        )
+        self.assertEqual(
+            persisted.last_delivered_signal_date,
+            SIGNAL_DATE.date().isoformat(),
+        )
+        self.assertEqual(
+            persisted.last_delivered_notification_kind,
+            "ACTION",
+        )
+
+        recovery_run = make_strategy_run(
+            state=persisted,
+            execution_weights=run.rebalance_plan.execution_weights,
+            rebalance_due=True,
+        )
+        hold = engine.decide_notification(recovery_run)
+        self.assertEqual(hold.kind, "NONE")
+        recovered_audit = engine.build_decision_audit(
+            recovery_run,
+            hold,
+            "NOT_REQUIRED",
+        )
+        self.assertEqual(
+            recovered_audit["delivery"]["last_confirmed"]["decision_hash"],
+            staged["decision_hash"],
+        )
 
     def test_update_and_cancellation_bodies_name_superseded_signal(self):
         prior_date = "2026-08-01"
@@ -1163,6 +1719,9 @@ class NotificationTests(EngineTestCase):
             "send_email",
         ) as send, mock.patch.object(
             engine,
+            "write_decision_audit",
+        ) as audit, mock.patch.object(
+            engine,
             "_backup_legacy_state",
         ) as backup, mock.patch("builtins.print"):
             engine.main()
@@ -1175,8 +1734,128 @@ class NotificationTests(EngineTestCase):
         prepare.assert_not_called()
         delivery.assert_not_called()
         send.assert_not_called()
+        audit.assert_not_called()
         backup.assert_not_called()
         self.assertFalse(self.log_file.exists())
+        self.assertFalse(self.audit_file.exists())
+
+
+class DecisionAuditTests(EngineTestCase):
+    def test_audit_is_structured_non_sensitive_and_hash_stable_across_delivery(self):
+        run = make_strategy_run(rebalance_due=True)
+        notification = engine.NotificationDecision(
+            "ACTION",
+            "NEW_RECOMMENDATION",
+        )
+        staged = engine.build_decision_audit(
+            run,
+            notification,
+            "STAGED",
+        )
+        delivered = engine.build_decision_audit(
+            run,
+            notification,
+            "DELIVERED",
+        )
+
+        self.assertEqual(
+            staged["audit_schema_version"],
+            engine.DECISION_AUDIT_SCHEMA_VERSION,
+        )
+        self.assertEqual(staged["decision_hash"], delivered["decision_hash"])
+        self.assertEqual(staged["strategy"]["fingerprint"], engine.STRATEGY_FINGERPRINT)
+        self.assertEqual(
+            engine.calculate_strategy_fingerprint(
+                staged["strategy"]["manifest"],
+            ),
+            engine.STRATEGY_FINGERPRINT,
+        )
+        self.assertEqual(staged["operations"], engine.operational_manifest())
+        self.assertRegex(
+            staged["runtime"]["implementation_sha256"],
+            r"^[0-9a-f]{64}$",
+        )
+        self.assertEqual(staged["market_data"]["fingerprint"], "a" * 64)
+        self.assertEqual(staged["delivery"]["status"], "STAGED")
+        self.assertEqual(delivered["delivery"]["status"], "DELIVERED")
+        self.assertIsNone(staged["delivery"]["last_confirmed"])
+        self.assertEqual(
+            delivered["delivery"]["last_confirmed"]["decision_hash"],
+            delivered["decision_hash"],
+        )
+
+        serialized = json.dumps(staged).lower()
+        for forbidden in (
+            '"shares"',
+            "cash_balance",
+            "portfolio_value",
+            "gmail",
+            "password",
+            "receiver_email",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, serialized)
+
+    def test_hold_audit_requires_not_required_status(self):
+        run = make_strategy_run(rebalance_due=False)
+        hold = engine.NotificationDecision("NONE", "HOLD")
+        payload = engine.build_decision_audit(
+            run,
+            hold,
+            "NOT_REQUIRED",
+        )
+        self.assertEqual(payload["notification"]["kind"], "NONE")
+        self.assertEqual(payload["delivery"]["status"], "NOT_REQUIRED")
+        with self.assertRaises(ValueError):
+            engine.build_decision_audit(run, hold, "STAGED")
+
+    def test_decision_audit_save_is_atomic(self):
+        run = make_strategy_run(rebalance_due=False)
+        hold = engine.NotificationDecision("NONE", "HOLD")
+        engine.write_decision_audit(run, hold, "NOT_REQUIRED")
+        payload = json.loads(self.audit_file.read_text(encoding="utf-8"))
+        self.assertEqual(payload["delivery"]["status"], "NOT_REQUIRED")
+
+        original = self.audit_file.read_text(encoding="utf-8")
+        with mock.patch.object(engine.os, "replace", side_effect=OSError("disk error")):
+            with self.assertRaisesRegex(OSError, "disk error"):
+                engine.write_decision_audit(run, hold, "NOT_REQUIRED")
+        self.assertEqual(self.audit_file.read_text(encoding="utf-8"), original)
+
+
+class WorkflowSafetyTests(unittest.TestCase):
+    def test_workflow_guards_stateful_ref_restores_exact_state_and_uploads_audit(self):
+        workflow = (
+            PROJECT_ROOT / ".github" / "workflows" / "run_portfolio.yml"
+        ).read_text(encoding="utf-8")
+        job_configuration = workflow.split("    steps:", 1)[0]
+        self.assertNotIn("${{ secrets.", job_configuration)
+        self.assertNotIn("GH_TOKEN:", job_configuration)
+        self.assertIn("Guard stateful production ref", workflow)
+        self.assertIn('"${GITHUB_REF_TYPE}" != "branch"', workflow)
+        self.assertIn('expected_ref="refs/heads/${DEFAULT_BRANCH}"', workflow)
+        self.assertIn("persist-credentials: false", workflow)
+        self.assertIn("--field name=roth-ira-state", workflow)
+        self.assertIn("--paginate", workflow)
+        self.assertIn(
+            "/actions/workflows/${workflow_name}/runs",
+            workflow,
+        )
+        self.assertIn(
+            "select(.workflow_run.head_branch == $branch)",
+            workflow,
+        )
+        self.assertIn(
+            "select(.workflow_run.head_repository_id == $repository_id)",
+            workflow,
+        )
+        self.assertIn("select($run_ids | index($run_id))", workflow)
+        self.assertNotIn("--limit 20", workflow)
+        self.assertNotIn("gh run list", workflow)
+        self.assertIn("initialize_portfolio:", workflow)
+        self.assertIn("refusing implicit initialization", workflow)
+        self.assertIn("roth-ira-decision-${{ github.run_id }}", workflow)
+        self.assertIn("inputs.validate_only == true", workflow)
 
 
 if __name__ == "__main__":

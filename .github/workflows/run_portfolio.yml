@@ -8,6 +8,11 @@ on:
         required: false
         default: false
         type: boolean
+      initialize_portfolio:
+        description: "Explicitly initialize a missing state from ROTH_IRA_AMOUNT"
+        required: false
+        default: false
+        type: boolean
       run_mode:
         description: "Operation to perform when validate_only is false"
         required: true
@@ -51,19 +56,40 @@ jobs:
     env:
       PYTHONUNBUFFERED: "1"
       TZ: "America/New_York"
-      GH_TOKEN: ${{ github.token }}
-
-      GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
-      GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-      RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
-
-      # May be blank after actual holdings have been persisted.
-      # A fresh first run requires this secret or --roth-amount.
-      ROTH_IRA_AMOUNT: ${{ secrets.ROTH_IRA_AMOUNT }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      REPOSITORY_ID: ${{ github.event.repository.id }}
 
     steps:
+      - name: Guard stateful production ref
+        if: >-
+          ${{
+            github.event_name == 'schedule' ||
+            (github.event_name == 'workflow_dispatch' &&
+             inputs.validate_only == false)
+          }}
+        env:
+          DISPATCH_RUN_MODE: ${{ inputs.run_mode }}
+          INITIALIZE_PORTFOLIO: ${{ inputs.initialize_portfolio }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_ref="refs/heads/${DEFAULT_BRANCH}"
+          if [[ "${GITHUB_REF_TYPE}" != "branch" ||
+                "${GITHUB_REF}" != "${expected_ref}" ]]; then
+            echo "::error::Stateful portfolio operations must run from ${expected_ref}."
+            exit 1
+          fi
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" &&
+                "${INITIALIZE_PORTFOLIO:-false}" == "true" &&
+                "${DISPATCH_RUN_MODE}" != "signal" ]]; then
+            echo "::error::initialize_portfolio is valid only with signal mode."
+            exit 1
+          fi
+
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -104,47 +130,83 @@ jobs:
 
       - name: Restore latest portfolio state
         id: restore_state
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.validate_only == true) }}
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          set -uo pipefail
+          set -euo pipefail
+
+          rm -rf .state-restore
+          mkdir -p .state-restore/unpacked
+          trap 'rm -rf .state-restore' EXIT
 
           workflow_file="${GITHUB_WORKFLOW_REF#${GITHUB_REPOSITORY}/}"
           workflow_file="${workflow_file%%@*}"
+          workflow_name="${workflow_file##*/}"
+          workflow_run_pages="$(
+            gh api \
+              --method GET \
+              --paginate \
+              --slurp \
+              --field branch="${DEFAULT_BRANCH}" \
+              --field status=completed \
+              --field per_page=100 \
+              "/repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow_name}/runs"
+          )"
+          eligible_run_ids="$(
+            jq -c '[.[].workflow_runs[].id]' <<< "${workflow_run_pages}"
+          )"
 
-          restored="false"
+          artifact_pages="$(
+            gh api \
+              --method GET \
+              --paginate \
+              --slurp \
+              --field name=roth-ira-state \
+              --field per_page=100 \
+              "/repos/${GITHUB_REPOSITORY}/actions/artifacts"
+          )"
+          artifact_id="$(
+            jq -r \
+              --arg branch "${DEFAULT_BRANCH}" \
+              --argjson repository_id "${REPOSITORY_ID}" \
+              --argjson run_ids "${eligible_run_ids}" \
+              '
+                [
+                  .[].artifacts[]
+                  | select(.name == "roth-ira-state")
+                  | select(.expired == false)
+                  | select(.workflow_run.head_branch == $branch)
+                  | select(.workflow_run.head_repository_id == $repository_id)
+                  | .workflow_run.id as $run_id
+                  | select($run_ids | index($run_id))
+                ]
+                | sort_by(.created_at, .id)
+                | last
+                | .id // empty
+              ' <<< "${artifact_pages}"
+          )"
 
-          while IFS= read -r previous_run_id; do
-            [[ -z "${previous_run_id}" ]] && continue
-
-            rm -rf .state-restore
-            mkdir -p .state-restore
-
-            if gh run download "${previous_run_id}" \
-              --name roth-ira-state \
-              --dir .state-restore >/dev/null 2>&1; then
-
-              if [[ -f .state-restore/roth_ira_state.json ]]; then
-                cp .state-restore/roth_ira_state.json roth_ira_state.json
-                echo "Restored roth_ira_state.json from workflow run ${previous_run_id}."
-                restored="true"
-                break
-              fi
-            fi
-          done < <(
-            gh run list \
-              --workflow "${workflow_file}" \
-              --status completed \
-              --limit 20 \
-              --json databaseId \
-              --jq '.[].databaseId'
-          )
-
-          rm -rf .state-restore
-          echo "restored=${restored}" >> "${GITHUB_OUTPUT}"
-
-          if [[ "${restored}" != "true" ]]; then
+          if [[ -z "${artifact_id}" ]]; then
+            echo "restored=false" >> "${GITHUB_OUTPUT}"
             echo "No prior state artifact was found. This may be the first production run."
+            exit 0
           fi
+
+          gh api \
+            "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" \
+            > .state-restore/state.zip
+          unzip -q .state-restore/state.zip -d .state-restore/unpacked
+
+          if [[ ! -f .state-restore/unpacked/roth_ira_state.json ]]; then
+            echo "::error::State artifact ${artifact_id} is missing roth_ira_state.json."
+            exit 1
+          fi
+
+          cp .state-restore/unpacked/roth_ira_state.json roth_ira_state.json
+          echo "restored=true" >> "${GITHUB_OUTPUT}"
+          echo "Restored roth_ira_state.json from artifact ${artifact_id}."
 
       - name: Check whether today is a US market session
         id: market_session
@@ -183,16 +245,43 @@ jobs:
              inputs.validate_only == false &&
              inputs.run_mode == 'signal')
           }}
+        env:
+          # May be blank after actual holdings have been persisted.
+          # A fresh first run also requires initialize_portfolio=true.
+          INITIALIZE_PORTFOLIO: ${{ inputs.initialize_portfolio }}
+          ROTH_IRA_AMOUNT: >-
+            ${{
+              (github.event_name == 'workflow_dispatch' &&
+               inputs.initialize_portfolio == true &&
+               inputs.run_mode == 'signal') &&
+              secrets.ROTH_IRA_AMOUNT || ''
+            }}
         shell: bash
         run: |
           set -euo pipefail
 
+          initialize_requested="${INITIALIZE_PORTFOLIO:-false}"
           configured_amount="$(
             printf '%s' "${ROTH_IRA_AMOUNT:-}" | tr -d '[:space:]'
           )"
 
-          if [[ ! -f roth_ira_state.json && -z "${configured_amount}" ]]; then
-            echo "::error::No persisted state was restored and ROTH_IRA_AMOUNT is blank."
+          if [[ -f roth_ira_state.json ]]; then
+            if [[ "${initialize_requested}" == "true" ]]; then
+              echo "::error::initialize_portfolio cannot replace existing state."
+              exit 1
+            fi
+            exit 0
+          fi
+
+          if [[ "${GITHUB_EVENT_NAME}" != "workflow_dispatch" ||
+                "${initialize_requested}" != "true" ]]; then
+            echo "::error::No persisted state was restored; refusing implicit initialization."
+            echo "::error::For a genuine first run, manually dispatch signal mode with initialize_portfolio=true."
+            exit 1
+          fi
+
+          if [[ -z "${configured_amount}" ]]; then
+            echo "::error::Explicit initialization requires ROTH_IRA_AMOUNT."
             echo "::error::Create the ROTH_IRA_AMOUNT repository secret for the first run."
             exit 1
           fi
@@ -209,6 +298,31 @@ jobs:
           DISPATCH_RUN_MODE: ${{ inputs.run_mode }}
           EXECUTED_SIGNAL_DATE_INPUT: ${{ inputs.executed_signal_date }}
           EXECUTED_SHARES_INPUT: ${{ inputs.executed_shares }}
+          GMAIL_ADDRESS: >-
+            ${{
+              (github.event_name == 'schedule' ||
+               inputs.run_mode == 'signal') &&
+              secrets.GMAIL_ADDRESS || ''
+            }}
+          GMAIL_APP_PASSWORD: >-
+            ${{
+              (github.event_name == 'schedule' ||
+               inputs.run_mode == 'signal') &&
+              secrets.GMAIL_APP_PASSWORD || ''
+            }}
+          RECEIVER_EMAIL: >-
+            ${{
+              (github.event_name == 'schedule' ||
+               inputs.run_mode == 'signal') &&
+              secrets.RECEIVER_EMAIL || ''
+            }}
+          ROTH_IRA_AMOUNT: >-
+            ${{
+              (github.event_name == 'workflow_dispatch' &&
+               inputs.initialize_portfolio == true &&
+               inputs.run_mode == 'signal') &&
+              secrets.ROTH_IRA_AMOUNT || ''
+            }}
         shell: bash
         run: |
           set -euo pipefail
@@ -280,7 +394,13 @@ jobs:
       # The state is stored as an artifact instead of being committed to the repository.
       # The next run restores the newest available state artifact.
       - name: Persist portfolio state
-        if: ${{ always() && hashFiles('roth_ira_state.json') != '' }}
+        if: >-
+          ${{
+            always() &&
+            !(github.event_name == 'workflow_dispatch' &&
+              inputs.validate_only == true) &&
+            hashFiles('roth_ira_state.json') != ''
+          }}
         uses: actions/upload-artifact@v4
         with:
           name: roth-ira-state
@@ -297,3 +417,12 @@ jobs:
           path: roth_ira.log
           if-no-files-found: ignore
           retention-days: 30
+
+      - name: Upload structured decision audit
+        if: ${{ always() && hashFiles('roth_ira_decision.json') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: roth-ira-decision-${{ github.run_id }}
+          path: roth_ira_decision.json
+          if-no-files-found: ignore
+          retention-days: 90
