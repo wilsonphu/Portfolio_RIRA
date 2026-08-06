@@ -1695,6 +1695,8 @@ def should_rebalance(
     target: dict[str, float],
     band: float = REBALANCE_BAND,
 ) -> bool:
+    if not (0 < band < 1):
+        raise ValueError("Rebalance band must be between zero and one")
     if not existing:
         return True
     tickers = set(existing) | set(target)
@@ -1709,10 +1711,12 @@ def inner_band_rebalance_weights(
     existing: dict[str, float],
     target: dict[str, float],
     destination: float = REBALANCE_DESTINATION,
+    *,
+    trigger_band: float = REBALANCE_BAND,
 ) -> dict[str, float]:
     if not existing:
         return dict(target)
-    if not (0 < destination < REBALANCE_BAND):
+    if not (0 < destination < trigger_band < 1):
         raise ValueError("Destination must be positive and inside the trigger band")
 
     tickers = sorted(set(existing) | set(target))
@@ -1765,7 +1769,14 @@ def build_rebalance_plan(
     existing: dict[str, float],
     result: StrategyResult,
     state: PortfolioState,
+    *,
+    rebalance_band: float = REBALANCE_BAND,
+    rebalance_destination: float = REBALANCE_DESTINATION,
 ) -> RebalancePlan:
+    if not (0 < rebalance_destination < rebalance_band < 1):
+        raise ValueError(
+            "Rebalance destination must be positive and inside the trigger band"
+        )
     target = _with_cash_target(result.target_weights)
     initial_allocation = state.executed_regime == "UNKNOWN" or not existing
     strategy_changed = (
@@ -1795,7 +1806,11 @@ def build_rebalance_plan(
         or tier_changed
         or leader_changed
     )
-    drift_exceeded = should_rebalance(existing, target)
+    drift_exceeded = should_rebalance(
+        existing,
+        target,
+        band=rebalance_band,
+    )
     rebalance_due = full_transition or drift_exceeded
 
     if initial_allocation:
@@ -1816,7 +1831,12 @@ def build_rebalance_plan(
     execution = (
         target
         if full_transition or not rebalance_due
-        else inner_band_rebalance_weights(existing, target)
+        else inner_band_rebalance_weights(
+            existing,
+            target,
+            destination=rebalance_destination,
+            trigger_band=rebalance_band,
+        )
     )
 
     if rebalance_due:
