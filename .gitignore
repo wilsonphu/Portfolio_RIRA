@@ -6,3 +6,5 @@ roth_ira_decision.json
 roth_ira_decision.json.tmp
 .state-restore/
 __pycache__/
+research_outputs/
+research_*.json
