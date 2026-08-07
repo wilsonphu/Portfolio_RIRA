@@ -4,7 +4,10 @@ roth_ira_state.*.backup.json
 roth_ira.log
 roth_ira_decision.json
 roth_ira_decision.json.tmp
+roth_ira_shadow_ledger.jsonl
+roth_ira_shadow_ledger.jsonl.tmp
 .state-restore/
 __pycache__/
 research_outputs/
 research_*.json
+tmp/

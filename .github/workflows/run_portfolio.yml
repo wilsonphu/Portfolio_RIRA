@@ -113,7 +113,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python -m py_compile port12_cloud.py research_backtest.py
+          python -m py_compile \
+            port12_cloud.py \
+            alpha_core.py \
+            alpha_research.py \
+            alpha_paired_research.py \
+            legacy_original_research.py
           python -m unittest discover -s tests -v
 
           python - <<'PY'
@@ -205,6 +210,11 @@ jobs:
           fi
 
           cp .state-restore/unpacked/roth_ira_state.json roth_ira_state.json
+          if [[ -f .state-restore/unpacked/roth_ira_shadow_ledger.jsonl ]]; then
+            cp \
+              .state-restore/unpacked/roth_ira_shadow_ledger.jsonl \
+              roth_ira_shadow_ledger.jsonl
+          fi
           echo "restored=true" >> "${GITHUB_OUTPUT}"
           echo "Restored roth_ira_state.json from artifact ${artifact_id}."
 
@@ -404,7 +414,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: roth-ira-state
-          path: roth_ira_state.json
+          path: |
+            roth_ira_state.json
+            roth_ira_shadow_ledger.jsonl
           if-no-files-found: error
           retention-days: 90
           overwrite: true
