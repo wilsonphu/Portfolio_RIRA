@@ -1,79 +1,93 @@
-# Portfolio research protocol
+# Quantitative research workflow
 
-`research_backtest.py` is an isolated research tool. It imports the reviewed
-production decision functions, but it never reads or writes
-`roth_ira_state.json`, never writes a decision audit, and never sends email.
-Nothing in this harness changes the live allocation.
+`alpha_paired_research.py` is the primary research entry point. It supplies
+both the redesigned seven-path family and the frozen Original strategy with
+views of one exact eight-ticker Open/Close/Volume snapshot. It cannot access
+production state, email, or broker holdings.
 
-## Locked execution model
+The decision rules, candidate registry, costs, and promotion gates are frozen
+in `ALPHA_RESEARCH_PROTOCOL.md`. Historical results remain exploratory because
+parts of the sample and the residual-momentum idea were viewed during design.
 
-- Signals use adjusted data through completed XNYS close `t`.
-- A queued action fills at the adjusted open of the next validated XNYS
-  session.
-- Fractional shares and cash—not a prior target—drive every later weight.
-- Trading costs are deducted from cash on gross security notional. The solver
-  targets exact post-cost weights.
-- Initial deployment costs affect wealth, but initial deployment is excluded
-  from ongoing turnover.
-- Missing sessions, required prices, QQQ signal volume, or execution opens fail
-  closed. Data is never filled, dropped, or replaced with another ticker.
-- Primary results use the first actual common inception of the full ETF
-  universe. A later `--score-start` is a labeled sensitivity run.
+## Reproduce the 2026-08-06 paired study
 
-## Prespecified first-round family
-
-The locked Original is the baseline. Each candidate changes one mechanism:
-
-1. `c1_wide_buffer`: 7.5pp drift trigger / 3.75pp destination.
-2. `c2_bull_reentry_2`: immediate bearish exit / two bullish closes to re-enter.
-3. `c3_vol_hysteresis`: immediate de-risking / buffered two-close re-risking.
-4. `c4_momentum_63`: 63-session SOXL/TECL leader momentum.
-5. `c5_equal_leaders`: equal SOXL/TECL weights in low/moderate tiers.
-
-The descriptive benchmarks are buffered 50/50 SPMO/SMH, QLD buy-and-hold, and
-SPY buy-and-hold. Candidates are not combined after seeing first-round results.
-
-## Reproducible use
-
-Download once and freeze the exact adjusted inputs:
+Download the union once and atomically preserve every IEEE-754 value:
 
 ```powershell
-python research_backtest.py `
-  --start 2014-01-01 `
-  --end 2026-08-06 `
-  --snapshot research_outputs/market_snapshot.csv `
-  --output research_outputs/download_results.json
+python alpha_paired_research.py `
+  --start 2010-01-01 `
+  --end 2026-08-07 `
+  --save-snapshot research_outputs/alpha_paired_union_snapshot.csv `
+  --bootstrap-samples 100 `
+  --output research_outputs/alpha_paired_smoke.json
 ```
 
-Replay the immutable local snapshot for final analysis:
+Replay that immutable snapshot with the full inference budget:
 
 ```powershell
-python research_backtest.py `
-  --start 2014-01-01 `
-  --end 2026-08-06 `
-  --input-snapshot research_outputs/market_snapshot.csv `
-  --cost-bps 0 5 10 25 `
-  --bootstrap-samples 20000 `
-  --output research_outputs/verified_results.json `
-  --ledger-dir research_outputs/verified_ledgers
+python alpha_paired_research.py `
+  --start 2010-01-01 `
+  --end 2026-08-07 `
+  --snapshot research_outputs/alpha_paired_union_snapshot.csv `
+  --bootstrap-samples 10000 `
+  --output research_outputs/alpha_paired_full_results.json `
+  --ledger-dir research_outputs/alpha_paired_ledgers
 ```
 
-Research outputs and market snapshots are intentionally ignored by Git. The
-JSON report records the full-data SHA-256, production fingerprints, locked
-variant definitions, dependency versions, return checksums, and deterministic
-random seed.
+Research outputs are deliberately ignored by Git. The committed findings
+record the exact snapshot, view, family, software, strategy, and schedule
+fingerprints needed to identify the run.
 
-## Interpretation
+`alpha_research.py` remains a standalone five-ticker runner for the redesigned
+family. `legacy_original_research.py` is the isolated, provenance-locked
+Original comparator. Neither is imported by the production engine.
 
-The primary comparison is paired annualized log-growth difference at 10bp.
-The report also provides 0/5/25bp sensitivity, four chronological robustness
-slices, a centered paired moving-block bootstrap, a prespecified
-Benjamini–Hochberg adjustment, complete-calendar-year diagnostics, and a
-CSCV-style candidate-matrix selection-instability diagnostic.
+## Integrity rules
 
-These are exploratory results because the historical span was already viewed.
-The unavailable daily paths for the earlier Strategies A and B cannot be
-reconstructed from summary metrics and therefore cannot honestly enter paired
-inference, DSR, BH, or historical-selection PBO. No candidate is eligible for
-live promotion without an untouched/future shadow period, complete trial
-lineage, acceptable liquidity, and explicit approval.
+- One union of QQQ, SMH, QLD, SOXL, SPY, TECL, SPMO, and GLD.
+- Actual adjusted fund history only; no synthetic pre-inception series.
+- No fill, interpolation, substitution, or silent row deletion.
+- The redesigned model history must begin at SOXL's actual 2010-03-11
+  inception; a shifted start is rejected without changing family identity.
+- A current-day bar is not final until 15 minutes after the XNYS close.
+- Signal at completed close `t`; fractional execution at adjusted open `t+1`.
+- Actual shares and cash drive every later drift decision.
+- Costs are charged on gross security buys plus sells at 0, 10, 25, and 50bp.
+- Initial deployment affects wealth but is excluded from ongoing turnover.
+- HAR and ridge scalers/fits use training observations only.
+- A 21-session label is unavailable until every future return is realized.
+- Snapshot output uses `%.17g`; input uses round-trip float parsing.
+- Current and Original views are checked for bit-identical overlapping values.
+- Every frozen current candidate stays in the seven-trial multiplicity count.
+- Original is an external benchmark, not an eighth selected trial.
+
+## What is and is not machine learning
+
+The production risk forecast is a small, fixed ridge log-variance model using
+5-, 21-, and 63-session daily squared-return variance plus 21-session downside
+variance. Its forecast is conservatively combined with trailing risk and only
+limits the incremental SOXL sleeve.
+
+The directional ridge model is a shadow challenger. It predicts 21-session
+relative return using five frozen features and may only veto the transparent
+overlay in research. It has no live authority. Deep networks, boosted trees,
+HMMs, and reinforcement learning were excluded because a single short ETF
+history cannot support their capacity without severe selection risk.
+
+## Statistical outputs
+
+The paired JSON report includes:
+
+- net CAGR, annualized log growth, drawdown, volatility, tail loss, recovery,
+  underwater time, turnover, costs, and liquidity;
+- Original results over its own executable history and the exact shared
+  current-family interval;
+- rolling three- and five-year comparisons and four chronological slices;
+- paired moving-block intervals at 10bp and 25bp;
+- White Reality Checks versus QLD and static 65/35;
+- deflated-Sharpe and CSCV/PBO diagnostics using the honest seven-trial count;
+- rolling constrained return-based style attribution;
+- return contribution, complete ridge fit history, and all provenance hashes.
+
+These diagnostics measure uncertainty. They do not transform a contaminated
+historical backtest into proof of future alpha.
