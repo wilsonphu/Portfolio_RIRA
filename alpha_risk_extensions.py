@@ -1,9 +1,7 @@
 """alpha_risk_extensions.py
-Episode clustering + 3x-calibrated Chandelier + production-ready breaker
+V4: Episode clustering + 3x-calibrated Chandelier + production-ready breaker
 
-Fixes v3 issues:
-- 82 fires -> ~5-7 fires via drawdown episode clustering
-- 100% win rate -> proper ATR vs trend exit logging, recalibrated for 3x ETFs (1.5-2.5x not 3-4x)
+Final calibrated version (see RESEARCH_RISK_ADDENDUM.md).
 """
 
 import numpy as np
@@ -39,15 +37,16 @@ def drawdown_breaker_clustered(
     cluster_recovery=-0.03,  # must recover to -3% to close episode
     cluster_min_gap_days=20,  # must stay recovered 20 days to count new episode
 ):
-    """Episode clustering so one fire per major bear market, not per wobble.
+    """Episode clustering: one fire per major bear market, not per wobble.
 
-    Expect 2011, 2015, 2018, 2020, 2022 = about 5 episodes over 2011-2026.
+    2011, 2015, 2018, 2020, 2022 = 5 episodes expected 2011-2026.
     """
     exposure = 1.0
     current_idx = -1
     below_count = 0
     hold_counter = 0
     in_episode = False
+    episode_start = None
     days_since_recovery = 999
     exposures_out = []
     levels_out = []
@@ -57,21 +56,28 @@ def drawdown_breaker_clustered(
 
     for idx, dd in enumerate(dd_series):
         date = dd_series.index[idx]
+
+        # track recovery for clustering
         if dd > cluster_recovery:
             days_since_recovery += 1
         else:
             days_since_recovery = 0
+
+        # close episode if recovered sufficiently
         if in_episode and days_since_recovery >= cluster_min_gap_days:
             in_episode = False
             current_episode_id = -1
 
+        # entry logic with confirmation
         target_entry = entry_levels[current_idx+1] if current_idx+1 < len(entry_levels) else None
         if target_entry is not None and dd < target_entry:
             below_count += 1
         else:
+            # check deeper gap
             entered_deeper = False
-            for i in range(current_idx+1, len(entry_levels)):
+            for i in range(current_exposure_idx+1, len(entry_levels)):
                 if dd < entry_levels[i]:
+                    # immediate entry on gap down
                     current_idx = i
                     exposure = exposures[i]
                     hold_counter = 0
@@ -80,6 +86,7 @@ def drawdown_breaker_clustered(
                         in_episode = True
                         episode_id_counter += 1
                         current_episode_id = episode_id_counter
+                        episode_start = date
                     break
             if not entered_deeper:
                 below_count = 0
@@ -93,10 +100,13 @@ def drawdown_breaker_clustered(
                 in_episode = True
                 episode_id_counter += 1
                 current_episode_id = episode_id_counter
+                episode_start = date
 
+        # recovery logic
         if current_idx >= 0:
             hold_counter += 1
             if hold_counter >= min_hold_days and dd > exit_levels[current_idx]:
+                # step up
                 current_idx -= 1
                 exposure = 1.0 if current_idx < 0 else exposures[current_idx]
                 hold_counter = 0
@@ -118,10 +128,10 @@ def backtest_chandelier_v4(
     qqq_close, qqq_sma200,
     ticker_ema20=None,
     atr_period=22, hh_period=22,
-    atr_mult=2.0,
+    atr_mult=2.0,  # 1.5-2.5 for 3x, 3.0-4.0 for 1x
     confirm_closes=2,
 ):
-    """Proper exit reason logging, 3x-calibrated ATR multiples.
+    """V4: Proper exit reason logging, 3x-calibrated ATR multiples.
 
     Returns trades with reason: ATR_EXIT vs TREND_EXIT.
     """
@@ -143,6 +153,7 @@ def backtest_chandelier_v4(
         qqq_sma = qqq_sma200.loc[date]
         qqq_trend = qqq_c > qqq_sma
 
+        # EMA20 reclaim for entry
         ema_ok = True
         if ticker_ema20 is not None and date in ticker_ema20.index:
             ema_ok = c > ticker_ema20.loc[date]
@@ -176,6 +187,7 @@ def backtest_chandelier_v4(
                 below_count += 1
             else:
                 below_count = 0
+
             if below_count >= confirm_closes:
                 ret = c/entry_price -1
                 trades.append({
