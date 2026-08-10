@@ -162,6 +162,49 @@ Historical promotion is still blocked because:
 At the completed 2026-08-06 close, QQQ trend was positive but SMH residual
 momentum was negative. The strategic destination was **100% QLD / 0% SOXL**.
 
+## Preregistered TCN/graph shadow result (2026-08-09)
+
+This was a new post-selection shadow family, not an extension of the earlier
+seven-trial confirmatory family. Its protocol and thresholds were committed
+before the first completed model result. The exact extended-universe snapshot
+fingerprint was
+`2da0387bf9d1c50a380df24387931e4185c77ccd01099fdcb793bc83e7250679`.
+The executable comparison ran from 2016-07-28 through 2026-08-07 for 2,521
+sessions with next-open fractional fills.
+
+### Net results
+
+| Path | CAGR at 10bp | CAGR at 25bp | Max drawdown at 25bp | Log-growth difference vs live at 25bp |
+|---|---:|---:|---:|---:|
+| Frozen live residual/vol55 | 41.84% | 41.29% | -64.54% | baseline |
+| Graph shock haircut | 40.88% | 39.75% | -64.47% | -1.10 points/year |
+| TCN confidence modifier | 34.15% | 33.96% | -63.68% | -5.33 points/year |
+| TCN plus graph | 33.91% | 33.70% | -63.68% | -5.52 points/year |
+| SMA200 cash-gated QLD | 29.18% | 28.38% | -43.40% | -9.58 points/year |
+
+The cash gate reduced drawdown substantially but imposed too large a geometric
+growth penalty for the stated lifelong CAGR-first, high-drawdown-tolerance
+mandate. The permanent QLD core therefore remains the selected live structure.
+
+### Statistical decision
+
+- The TCN's aggregate out-of-sample Brier score was 0.2894 versus a 0.2487
+  base-rate score, for **-16.36% Brier skill** and 0.7844 log loss.
+- The TCN-only and hybrid paths lost annualized log growth in all four
+  chronological slices at both cost assumptions.
+- Their 10bp moving-block median differences were -5.45 and -5.64 points per
+  year; their 95% upper bounds remained negative.
+- Graph-only was positive in one of four slices and had a negative bootstrap
+  median at both costs. At 25bp, its probability of a nonpositive edge was
+  97.47%.
+- Cash-gated QLD was positive in one of four slices and also had a negative
+  bootstrap median at both costs.
+
+Every challenger fails the frozen continued-shadow gate. Seed-stability and
+expanded-trial promotion tests are unnecessary after these earlier decisive
+failures. No result receives prospective or live authority, no production
+weight changes, and no additional notification is justified.
+
 ## Evidence base
 
 - ProShares states that QLD targets 2x the **daily** Nasdaq-100 return and that
