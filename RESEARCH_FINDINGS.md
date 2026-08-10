@@ -223,3 +223,121 @@ weight changes, and no additional notification is justified.
   https://repub.eur.nl/pub/22252
 - Leveraged-ETF path dependence:
   https://epubs.siam.org/doi/pdf/10.1137/090760805
+
+## Leveraged core and satellite universe result (2026-08-09)
+
+### Strategy conclusion
+
+The existing permanent-QLD core with the stateful SOXL overlay remains the
+best maximum-compounding strategy in the frozen eight-path family. At the
+primary 25bp cost assumption it produced 39.09% CAGR, versus 37.42% for the
+closest growth challenger. None of the seven challengers had a positive
+annualized log-growth difference from live.
+
+The 80% QLD / 20% GLD base with the same SOXL overlay is the only candidate
+that met the separately frozen risk-efficiency rule. It sacrificed 1.99
+percentage points of CAGR while improving maximum drawdown by 7.63 points,
+Sharpe from 0.960 to 1.016, and Calmar from 0.606 to 0.652. It is therefore a
+credible balanced alternative for an investor who values a shallower loss and
+better return per unit of risk, but it is not evidence of higher expected
+growth.
+
+### Frozen sample and provenance
+
+- Common actual-fund-history start: 2010-03-11.
+- Common executable interval: 2013-07-12 through 2026-08-07.
+- Executable sessions: 3,288.
+- Data snapshot SHA-256:
+  `59c84803bf08c08db18c4683972844fa70a79b143cc361695818e347f866820d`.
+- Protocol SHA-256:
+  `610e1b7725bf6157a6294399fb75df373331ff8f31a7ae801f70b391618fa4cb`.
+- Strategy fingerprint:
+  `264f356035800fbb7531ac186dc8711b4971a67ed7965e49ac62e4237ed0fd8b`.
+- Software fingerprint:
+  `3a697fd54e5b1f462181343dbe401b3324389bf22695f8e553ee4766861f68ee`.
+- Starting value: $10,000; fractional shares; zero cash return.
+- Primary costs: 25bp on gross buys plus sells.
+- Inference: 10,000 paired 21-session moving-block resamples.
+
+Only actual adjusted observations were used. No synthetic pre-inception data,
+substitution, interpolation, or silent row deletion was permitted. Six actual
+zero-volume observations were retained rather than rewritten as missing.
+
+### Net results at 25bp
+
+| Strategy | CAGR | Max drawdown | Sharpe | Calmar | Gross turnover/year |
+|---|---:|---:|---:|---:|---:|
+| Live QLD + SOXL overlay | 39.09% | -64.54% | 0.960 | 0.606 | 2.57x |
+| QLD + USD overlay | 37.42% | -64.11% | 0.948 | 0.584 | 2.60x |
+| 80% QLD / 20% GLD + SOXL | 37.10% | -56.91% | 1.016 | 0.652 | 2.72x |
+| 50% QLD / 50% SSO + SOXL | 35.25% | -55.78% | 0.941 | 0.632 | 2.62x |
+| QLD-or-SSO router + SOXL | 34.51% | -53.57% | 0.920 | 0.644 | 7.92x |
+| 60% UPRO / 20% GLD / 20% IEF + SOXL | 29.50% | -54.98% | 0.905 | 0.537 | 2.92x |
+| SSO + SOXL overlay | 29.45% | -59.34% | 0.865 | 0.496 | 2.57x |
+| SSO + TECL overlay | 23.14% | -63.11% | 0.749 | 0.367 | 2.66x |
+
+The live path's largest drawdown ran from its 2021-11-19 peak to the
+2022-12-28 trough and recovered on 2024-02-22. The QLD/GLD alternative's
+largest drawdown ran from 2021-12-27 to 2022-11-03 and recovered on
+2024-02-08. Its maximum underwater spell was 531 sessions versus 564 for
+live. This is a useful but modest recovery improvement, not elimination of
+leveraged-equity risk.
+
+### Robustness and rejection decisions
+
+For the QLD/GLD alternative, annualized log growth trailed live by 1.42, 1.44,
+and 1.48 percentage points at 10bp, 25bp, and 50bp. At 25bp only two of four
+chronological slices were positive. Its paired moving-block median difference
+was -1.44 points, with a 95% interval from -5.35 to +2.84 points and a 75.66%
+estimated probability of a nonpositive edge. That is why it is labeled a
+risk-efficiency alternative rather than a growth challenger.
+
+The familywise reality check at 25bp found that even the best challenger had
+an observed annualized log-growth difference of -1.21 points. The adjusted
+p-value was 0.8754 across the honest eight-path trial count. Every challenger
+failed the historical growth gate and every path retains `live_authority=false`.
+
+The SSO variants confirm that lower daily leverage is not automatically a
+better long-run trade. The equal QLD/SSO base improved drawdown by 8.76 points
+but lost 3.84 points of CAGR and did not improve Sharpe. Pure SSO lost 9.64
+points of CAGR. The residual router reduced drawdown but lost 4.58 points of
+CAGR and raised turnover to 7.92x. USD was the closest growth substitute for
+SOXL, but its drawdown improvement was negligible and its edge was negative.
+
+### Allocation implication
+
+At the completed 2026-08-07 close, the selected live strategy remained
+**100% QLD / 0% SOXL** because the semiconductor residual signal was negative.
+The QLD/GLD alternative's same-date state was **76% QLD / 19% GLD / 5% SOXL**.
+Moving to the latter is not an automatic model upgrade; it is a different
+investor-objective choice between maximum historical compounding and better
+historical risk efficiency.
+
+No production allocation changes follow from this post-selection study. A new
+candidate still needs 252 prospectively recorded sessions and three future
+structural satellite decisions before it can be considered for live authority.
+
+### Research rationale
+
+- Residual momentum evidence motivates retaining the transparent existing
+  satellite signal rather than adding another high-capacity predictor:
+  https://papers.ssrn.com/sol3/papers.cfm?abstract_id=2319861
+- Volatility-managed portfolio evidence motivates bounded inverse-risk sizing,
+  while the live design conservatively combines the forecast with trailing
+  risk rather than treating forecast variance as known:
+  https://www.nber.org/papers/w22208
+- Broad return-prediction evidence warns that apparently successful predictive
+  variables frequently fail out of sample, supporting the frozen small family
+  and prospective promotion requirement:
+  https://www.nber.org/papers/w10483
+- The low-beta literature motivates testing lower-leverage broad-market cores,
+  but does not overcome their observed compounding shortfall in this sample:
+  https://www.nber.org/papers/w16601
+- ProShares states that SSO and UPRO seek 2x and 3x daily S&P 500 returns,
+  respectively, so multi-session results remain path dependent:
+  https://www.proshares.com/our-etfs/leveraged-and-inverse/sso
+  and https://www.proshares.com/our-etfs/leveraged-and-inverse/upro
+- ProShares states that USD seeks 2x the daily semiconductor index return, and
+  Direxion states that TECL seeks 3x the daily technology index return:
+  https://www.proshares.com/our-etfs/leveraged-and-inverse/usd
+  and https://www.direxion.com/product/daily-technology-bull-bear-3x-etfs

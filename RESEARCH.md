@@ -131,3 +131,28 @@ python tcn_shadow_research.py `
 The observed 2026-08-09 result rejected the TCN, graph, hybrid, and cash-gated
 challengers. It is recorded in `RESEARCH_FINDINGS.md`; no challenger advances
 to the prospective shadow ledger, and production remains unchanged.
+
+## Leveraged core and satellite universe study
+
+`core_universe_research.py` implements the separately frozen experiment in
+`CORE_UNIVERSE_PROTOCOL.md`. It tests QLD, SSO, UPRO, USD, and TECL alongside
+GLD and IEF diversifiers while preserving the live residual signal, 55% risk
+budget, state transitions, drift controls, next-open fills, and actual-share
+accounting. It is research-only and cannot change a live position.
+
+Replay the immutable common-universe snapshot with the full inference budget:
+
+```powershell
+python core_universe_research.py `
+  --start 2010-01-01 `
+  --end 2026-08-08 `
+  --snapshot research_outputs/core_universe_snapshot.csv `
+  --bootstrap-samples 10000 `
+  --output research_outputs/core_universe_results.json
+```
+
+The observed 2026-08-09 result retained `live_qld_soxl` as the maximum-growth
+choice. The 80% QLD / 20% GLD base qualified as a lower-growth risk-efficiency
+alternative, not a replacement. Every SSO, UPRO, USD, TECL, equal-weight, and
+router challenger failed the frozen growth gate. Exact results and provenance
+are recorded in `RESEARCH_FINDINGS.md`.
