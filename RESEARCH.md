@@ -91,3 +91,43 @@ The paired JSON report includes:
 
 These diagnostics measure uncertainty. They do not transform a contaminated
 historical backtest into proof of future alpha.
+
+## Preregistered TCN and graph shadow study
+
+`tcn_shadow_research.py` implements the separately preregistered experiment in
+`TCN_SHADOW_PROTOCOL.md`. It preserves the frozen OLS residual signal and
+55%-volatility-budget control, tests a 1,937-parameter causal TCN only as a
+one-sided SOXL confidence modifier, and uses graph diffusion only as a shock
+haircut. It has no production-state, notification, or allocation authority.
+
+Install the optional, version-pinned research dependency separately:
+
+```powershell
+python -m pip install -r requirements-research-ml.txt
+```
+
+Create the immutable extended-universe snapshot once:
+
+```powershell
+python tcn_shadow_research.py `
+  --start 2010-01-01 `
+  --end 2026-08-08 `
+  --save-snapshot research_outputs/tcn_shadow_union_snapshot.csv `
+  --output research_outputs/tcn_shadow_smoke.json `
+  --bootstrap-samples 100
+```
+
+Replay the exact snapshot with the frozen inference budget:
+
+```powershell
+python tcn_shadow_research.py `
+  --start 2010-01-01 `
+  --end 2026-08-08 `
+  --snapshot research_outputs/tcn_shadow_union_snapshot.csv `
+  --output research_outputs/tcn_shadow_results.json `
+  --bootstrap-samples 10000
+```
+
+The observed 2026-08-09 result rejected the TCN, graph, hybrid, and cash-gated
+challengers. It is recorded in `RESEARCH_FINDINGS.md`; no challenger advances
+to the prospective shadow ledger, and production remains unchanged.
