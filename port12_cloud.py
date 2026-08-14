@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Production QLD-core/SOXL-overlay allocation engine.
+"""Production TQQQ/UGL-core with a residual-momentum SOXL overlay.
 
-Signals are calculated from completed, adjusted daily bars.  QLD is the
-permanent core; a volatility-sized SOXL overlay is admitted only by the frozen
-QQQ-trend and SMH-residual-strength rules in ``ALPHA_RESEARCH_PROTOCOL.md``.
+Signals are calculated from completed, adjusted daily bars. The permanent core
+is 65% TQQQ / 35% UGL; a volatility-sized SOXL overlay is admitted only by the
+frozen QQQ-trend and SMH-residual-strength rules. The existing QLD/SOXL HAR
+volatility pair remains the conservative sizing signal validated by research.
 Confirmed broker shares and cash are always the source of truth.
 """
 
@@ -37,9 +38,15 @@ import alpha_core as core
 # ---------------------------------------------------------------------------
 MARKET_INDEX = core.QQQ
 SEMICONDUCTOR_SIGNAL = core.SMH
-LEVERAGED_INDEX = core.QLD
+VOLATILITY_INDEX = core.QLD
+LEVERAGED_INDEX = "TQQQ"
+LEVERAGED_GOLD = "UGL"
 LEVERAGED_SEMICONDUCTOR = core.SOXL
 CASH_ASSET = core.CASH
+
+CORE_TQQQ_SHARE = 0.65
+CORE_UGL_SHARE = 0.35
+MAX_ADVERTISED_DAILY_EXPOSURE = 2.7725
 
 # These products can appear in confirmed pre-v8 holdings and must remain
 # priceable until they are explicitly sold.  They are never strategic targets.
@@ -47,16 +54,31 @@ LEGACY_TECH = "TECL"
 LEGACY_DEFENSIVE_EQUITY = "SPMO"
 LEGACY_HEDGE = "GLD"
 LEGACY_HOLDINGS = frozenset(
-    {LEGACY_TECH, LEGACY_DEFENSIVE_EQUITY, LEGACY_HEDGE, SEMICONDUCTOR_SIGNAL}
+    {
+        VOLATILITY_INDEX,
+        LEGACY_TECH,
+        LEGACY_DEFENSIVE_EQUITY,
+        LEGACY_HEDGE,
+        SEMICONDUCTOR_SIGNAL,
+    }
 )
 
 SIGNAL_TICKERS = (MARKET_INDEX, SEMICONDUCTOR_SIGNAL)
-STRATEGIC_TICKERS = (LEVERAGED_INDEX, LEVERAGED_SEMICONDUCTOR)
+VOLATILITY_TICKERS = (VOLATILITY_INDEX, LEVERAGED_SEMICONDUCTOR)
+STRATEGIC_TICKERS = (
+    LEVERAGED_INDEX,
+    LEVERAGED_GOLD,
+    LEVERAGED_SEMICONDUCTOR,
+)
+EQUITY_TICKERS = (LEVERAGED_INDEX, LEVERAGED_SEMICONDUCTOR)
+MODEL_TICKERS = tuple(
+    dict.fromkeys((*SIGNAL_TICKERS, *VOLATILITY_TICKERS, *STRATEGIC_TICKERS))
+)
 VALUATION_TICKERS = tuple(
     sorted(set(STRATEGIC_TICKERS) | set(LEGACY_HOLDINGS))
 )
 ALL_TICKERS = tuple(
-    dict.fromkeys((*SIGNAL_TICKERS, *STRATEGIC_TICKERS, *sorted(LEGACY_HOLDINGS)))
+    dict.fromkeys((*MODEL_TICKERS, *sorted(LEGACY_HOLDINGS)))
 )
 TRADED_TICKERS = frozenset(VALUATION_TICKERS)
 PORTFOLIO_COMPONENTS = TRADED_TICKERS | {CASH_ASSET}
@@ -70,9 +92,9 @@ TRANSACTION_COST_SCENARIOS_BPS = (5, 10, 25)
 MODEL_START_DATE = core.MODEL_HISTORY_START
 REQUIRED_SIGNAL_ROWS = 840
 
-STRATEGY_REVISION = "qld-soxl-residual-vol55-v1"
+STRATEGY_REVISION = "tqqq65-ugl35-soxl-residual-vol55-v2"
 EXPERIMENTAL_LIVE = True
-STATE_VERSION = 8
+STATE_VERSION = 11
 DECISION_AUDIT_SCHEMA_VERSION = 3
 SHADOW_LEDGER_SCHEMA_VERSION = 1
 NEW_YORK = ZoneInfo("America/New_York")
@@ -85,7 +107,9 @@ DECISION_AUDIT_FILE = APP_DIR / "roth_ira_decision.json"
 SHADOW_LEDGER_FILE = APP_DIR / "roth_ira_shadow_ledger.jsonl"
 
 ADVERTISED_DAILY_MULTIPLIERS = {
-    LEVERAGED_INDEX: 2.0,
+    VOLATILITY_INDEX: 2.0,
+    LEVERAGED_INDEX: 3.0,
+    LEVERAGED_GOLD: 2.0,
     LEVERAGED_SEMICONDUCTOR: 3.0,
     SEMICONDUCTOR_SIGNAL: 1.0,
     LEGACY_TECH: 3.0,
@@ -93,6 +117,27 @@ ADVERTISED_DAILY_MULTIPLIERS = {
     LEGACY_HEDGE: 1.0,
     CASH_ASSET: 0.0,
 }
+
+
+def target_weights(soxl_weight: float) -> dict[str, float]:
+    """Return the frozen proportional TQQQ/UGL core plus SOXL overlay."""
+    # Reuse the audited core validator and grid boundary without inheriting its
+    # legacy QLD allocation.
+    core.target_weights(soxl_weight)
+    weight = min(max(float(soxl_weight), 0.0), core.MAX_SOXL_WEIGHT)
+    remaining = 1.0 - weight
+    result = {
+        LEVERAGED_INDEX: CORE_TQQQ_SHARE * remaining,
+        LEVERAGED_GOLD: CORE_UGL_SHARE * remaining,
+        LEVERAGED_SEMICONDUCTOR: weight,
+    }
+    if not np.isclose(sum(result.values()), 1.0, atol=1e-12):
+        raise RuntimeError("Strategic target weights do not sum to 1.0")
+    return result
+
+
+def strategic_daily_exposure(soxl_weight: float) -> float:
+    return advertised_daily_exposure(target_weights(soxl_weight))
 
 
 def strategy_manifest() -> dict[str, object]:
@@ -105,6 +150,7 @@ def strategy_manifest() -> dict[str, object]:
         ),
         "universe": {
             "signals": list(SIGNAL_TICKERS),
+            "volatility_sizing": list(VOLATILITY_TICKERS),
             "strategic_holdings": list(STRATEGIC_TICKERS),
             "legacy_valuation_only": sorted(LEGACY_HOLDINGS),
         },
@@ -135,10 +181,15 @@ def strategy_manifest() -> dict[str, object]:
             "downshift": "immediate",
         },
         "allocation": {
-            "qld": "1_minus_soxl",
+            "core": {
+                "tqqq": CORE_TQQQ_SHARE,
+                "ugl": CORE_UGL_SHARE,
+                "application": "proportional_to_one_minus_soxl",
+            },
+            "soxl": "stateful_residual_momentum_overlay",
             "maximum_soxl": core.MAX_SOXL_WEIGHT,
             "maximum_advertised_daily_exposure": (
-                core.MAX_ADVERTISED_DAILY_EXPOSURE
+                MAX_ADVERTISED_DAILY_EXPOSURE
             ),
         },
         "execution": {
@@ -202,7 +253,7 @@ def calculate_implementation_fingerprint() -> str:
 
 STRATEGY_FINGERPRINT = calculate_strategy_fingerprint()
 EXPECTED_STRATEGY_FINGERPRINT = (
-    "d9ce9aaf3fbc39962598fc09986f1b37b87d4e62559980d81820326534d7e837"
+    "7423ef898b38d6f8cb84621789811729f66f1b9027092b762ed2de2e272537db"
 )
 
 _configured_roth_amount = os.environ.get("ROTH_IRA_AMOUNT", "").strip()
@@ -461,10 +512,10 @@ def validate_configuration() -> None:
         + core.VARIANCE_QUARTER_WINDOW
     ):
         raise RuntimeError("Configured history cannot train the variance model")
-    maximum = core.advertised_daily_exposure(core.MAX_SOXL_WEIGHT)
+    maximum = strategic_daily_exposure(core.MAX_SOXL_WEIGHT)
     if not np.isclose(
         maximum,
-        core.MAX_ADVERTISED_DAILY_EXPOSURE,
+        MAX_ADVERTISED_DAILY_EXPOSURE,
         atol=1e-12,
     ):
         raise RuntimeError("Advertised exposure invariant failed")
@@ -530,7 +581,6 @@ def validate_state(state: PortfolioState) -> None:
         or state.shadow_ledger_chain_hash
     ):
         raise RuntimeError("Empty shadow ledger anchor is inconsistent")
-
     if not isinstance(state.executed_overlay_active, bool):
         raise RuntimeError("executed_overlay_active must be boolean")
     if not _valid_soxl_weight(state.executed_soxl_weight):
@@ -610,7 +660,6 @@ def validate_state(state: PortfolioState) -> None:
             raise RuntimeError(
                 "Shadow ledger anchor is ahead of processed signal state"
             )
-
     if state.last_processed_data_fingerprint and not _is_sha256(
         state.last_processed_data_fingerprint
     ):
@@ -683,6 +732,24 @@ def _migrate_state_payload(
         raise RuntimeError(f"Unsupported state version: {version!r}")
     backup = _backup_legacy_state(version) if backup_legacy else None
     migrated = asdict(PortfolioState())
+
+    # Versions 8-10 already contain the complete production state machine and
+    # outbox. Version 11 removes research-only downside-shadow anchors, while
+    # preserving every broker fact and pending-action field byte-for-value.
+    #
+    # Every common field survives instead of taking the older
+    # conservative reset path below.
+    if numeric_version in {8, 9, 10}:
+        for name in set(migrated) & set(payload):
+            migrated[name] = payload[name]
+        migrated["state_version"] = STATE_VERSION
+        logger.warning(
+            "Migrated state version %r to version %s; backup=%s",
+            version,
+            STATE_VERSION,
+            backup or "disabled",
+        )
+        return migrated
 
     # Holdings and cash are broker facts.  Preserve them exactly across every
     # known schema, including valuation-only products.
@@ -938,7 +1005,7 @@ def market_data_fingerprint(price_data: pd.DataFrame) -> str:
                 float(value)
                 for value in price_data[ticker]
             ]
-            for ticker in (*SIGNAL_TICKERS, *STRATEGIC_TICKERS)
+            for ticker in MODEL_TICKERS
         },
         "latest_valuation_prices": {
             ticker: float(price_data[ticker].iloc[-1])
@@ -1000,7 +1067,7 @@ def download_market_data(
             f"{[item.date().isoformat() for item in unexpected[:5]]}"
         )
     _require_finite_positive(
-        prices.loc[:, [*SIGNAL_TICKERS, *STRATEGIC_TICKERS]],
+        prices.loc[:, list(MODEL_TICKERS)],
         "Prices in the complete quantitative model history",
     )
     _require_finite_positive(
@@ -1095,7 +1162,7 @@ def _calculate_latest_strategy_decision(
 
     try:
         portfolio_volatility = core.calculate_portfolio_volatility(
-            price_data.loc[:, list(STRATEGIC_TICKERS)]
+            price_data.loc[:, list(VOLATILITY_TICKERS)]
         )
         raw_soxl_weight = portfolio_volatility.raw_soxl_weight
     except (ValueError, np.linalg.LinAlgError) as exc:
@@ -1130,7 +1197,7 @@ def _calculate_latest_strategy_decision(
         )
 
     return StrategyDecision(
-        target_weights=core.target_weights(transition.state.soxl_weight),
+        target_weights=target_weights(transition.state.soxl_weight),
         overlay_state=transition.state,
         transition_reason=reason,
         alpha_reviewed=transition.alpha_reviewed,
@@ -1327,10 +1394,10 @@ def drift_triggers(
         for ticker in set(existing) | set(desired)
     )
     existing_equity = sum(
-        existing.get(ticker, 0.0) for ticker in STRATEGIC_TICKERS
+        existing.get(ticker, 0.0) for ticker in EQUITY_TICKERS
     )
     target_equity = sum(
-        desired.get(ticker, 0.0) for ticker in STRATEGIC_TICKERS
+        desired.get(ticker, 0.0) for ticker in EQUITY_TICKERS
     )
     aggregate = (
         abs(existing_equity - target_equity) >= band - 1e-12
@@ -1483,7 +1550,7 @@ def build_rebalance_plan(
     if full_transition or not rebalance_due:
         execution = target
     elif buffered_soxl is not None:
-        execution = _with_cash_target(core.target_weights(buffered_soxl))
+        execution = _with_cash_target(target_weights(buffered_soxl))
     else:
         execution = inner_band_rebalance_weights(
             existing,
@@ -2032,7 +2099,7 @@ def log_decision(strategy_run: StrategyRun) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Append-only chained experimental shadow ledger
+# Append-only chained production signal ledger
 # ---------------------------------------------------------------------------
 def _load_shadow_ledger() -> list[dict[str, object]]:
     if not SHADOW_LEDGER_FILE.exists():
@@ -2341,7 +2408,7 @@ def build_decision_audit(
                 None
                 if volatility is None
                 else {
-                    "qld": _variance_audit(volatility.qld),
+                    "qld_proxy": _variance_audit(volatility.qld),
                     "soxl": _variance_audit(volatility.soxl),
                     "correlation_21": volatility.correlation_21,
                     "correlation_63": volatility.correlation_63,
@@ -2488,13 +2555,13 @@ def build_dashboard(strategy_run: StrategyRun) -> str:
         "INVALID"
         if decision.portfolio_volatility is None
         else (
-            f"QLD {decision.portfolio_volatility.qld.sizing_volatility:.1%}, "
+            f"QLD proxy {decision.portfolio_volatility.qld.sizing_volatility:.1%}, "
             f"SOXL {decision.portfolio_volatility.soxl.sizing_volatility:.1%}"
         )
     )
     lines = [
         "=" * 112,
-        "ROTH IRA — QLD CORE / SOXL ALPHA OVERLAY",
+        "ROTH IRA — TQQQ/UGL CORE / SOXL ALPHA OVERLAY",
         "=" * 112,
         (
             f"Signal close: {strategy_run.signal_date.date()} | "
@@ -2662,7 +2729,7 @@ def build_email_html(
         "CANCELLATION": "PREVIOUS ACTION CANCELLED",
     }[notification.kind]
     return f"""<!doctype html><html><body style="font-family:Arial,sans-serif">
-<h2>ROTH IRA — QLD Core / SOXL Alpha Overlay (Experimental)</h2>
+<h2>ROTH IRA — TQQQ/UGL Core / SOXL Alpha Overlay (Experimental)</h2>
 <p><strong>Research promotion_complete=false.</strong></p>
 <h3>{status}: {plan.reason}</h3>
 <p>Signal close {strategy_run.signal_date.date()} · Portfolio
@@ -2752,7 +2819,7 @@ def parse_signal_date(value: str | None) -> str | None:
 
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="ROTH IRA QLD-core/SOXL-overlay engine"
+        description="ROTH IRA TQQQ/UGL-core/SOXL-overlay engine"
     )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(

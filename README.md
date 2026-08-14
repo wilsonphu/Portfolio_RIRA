@@ -1,92 +1,93 @@
-# Roth IRA QLD/SOXL allocation engine
+# Roth IRA production allocator
 
-This repository runs a stateful, notification-only Roth IRA allocation engine.
-QLD is the permanent core. A maximum 35% SOXL satellite is admitted by QQQ
-trend, SMH residual strength, and a bounded volatility-risk forecast.
-This allocator is explicitly experimental and has not completed the frozen
-research-promotion requirements.
+This repository contains one production system: a stateful, notification-only
+TQQQ/UGL core with a bounded SOXL overlay. It does not connect to a broker or
+place trades automatically.
 
-The engine does not connect to a broker and does not place trades. It emails
-only when an action is new, materially changed, cancelled, or needs delivery
-retry. Ordinary HOLD runs are saved silently.
-Every unseen completed session is replayed after an outage. A hash-chained,
-signal-only shadow ledger is persisted with state so future evidence cannot be
-silently rewritten when the workflow misses a day. Its count, final date, and
-chain hash are anchored in portfolio state; a missing or truncated initialized
-ledger fails closed.
+## Strategy
+
+At strategic SOXL weight `s`, the portfolio target is:
+
+```text
+TQQQ = 65% * (1 - s)
+UGL  = 35% * (1 - s)
+SOXL = s
+```
+
+`s` is restricted to `0%, 5%, ..., 35%`. The SOXL sleeve requires both:
+
+- QQQ strictly above its completed-close 200-session SMA; and
+- positive 21-session residual momentum from a separated-window SMH-on-QQQ
+  OLS model.
+
+The sleeve is sized with the existing causal QLD/SOXL HAR-style volatility
+forecast and a 55% overlay budget. Trend failure exits SOXL immediately.
+Residual exits occur on the fixed 21-session review clock. Re-entry requires
+two distinct eligible closes; volatility reductions are immediate and
+increases require five completed sessions.
+
+The strategy is deployed to production by investor authorization. Historical
+backtests are not evidence that its return advantage will persist. A roughly
+two-thirds portfolio drawdown remains plausible.
+
+## Portfolio state and notifications
+
+Confirmed broker shares and cash—not calculated target weights—are the sole
+source of truth. The engine rebalances only for a structural change, a
+five-percentage-point individual drift, or a five-point aggregate equity
+drift, and normally trades back to the inner 2.5-point band.
+
+Ordinary HOLD runs are silent. Email is sent only for a new action, a material
+update, a one-time cancellation, or a delivery retry. Every unseen completed
+NYSE session is replayed after an outage, and the immutable signal ledger is
+hash-chained and anchored in state.
 
 ## Production workflow
 
-The scheduled GitHub Actions job runs after each completed XNYS close.
+The GitHub Actions workflow runs after completed NYSE closes. When an action
+email arrives:
 
-When an email arrives:
-
-1. Treat its quantities as signal-close estimates.
-2. Recalculate orders from executable next-session prices.
-3. Trade manually at the broker.
-4. Run the workflow with `run_mode: confirm-execution`.
-5. Supply the email's signal date and every final broker holding as
+1. Recalculate the quantities using executable next-session prices.
+2. Execute the trades manually at the broker.
+3. Run the workflow with `run_mode: confirm-execution`.
+4. Supply the email's signal date and every final holding as
    `TICKER=SHARES`, including `CASH=...`.
 
-Confirmed shares and cash—not a prior target—drive every later valuation and
-decision. The engine cannot safely infer fills, partial fills, price
-improvement, dividends, or broker cash.
+Use `run_mode: sync-holdings` only for a contribution, withdrawal, dividend,
+or broker correction when no recommendation is pending. Always supply the
+complete account.
 
-This confirmation is needed only after an action email, not after silent HOLD
-runs. The workflow remembers the last confirmed holdings and suppresses an
-identical pending recommendation.
-
-Use `run_mode: sync-holdings` only for a contribution, withdrawal, dividend, or
-broker correction when no recommendation is pending. Supply the complete
-account, including cash.
-
-## First initialization
+### First initialization
 
 For a genuinely new all-cash account with no saved state:
 
 - dispatch `run_mode: signal`;
-- set `initialize_portfolio: true`;
+- set `initialize_portfolio: true`; and
 - create the `ROTH_IRA_AMOUNT` repository secret.
 
-For an existing invested account, initialize using `sync-holdings` and the
-complete broker holdings. Do not use `ROTH_IRA_AMOUNT` to replace existing
-state.
+For an already-invested account, initialize with `sync-holdings` and complete
+broker holdings. Never use `ROTH_IRA_AMOUNT` to replace existing state.
 
-## Repository secrets
+### Repository secrets
 
 - `ROTH_IRA_AMOUNT`: first-run cash only.
-- `GMAIL_ADDRESS`: sender address, read only when a notification is due.
-- `GMAIL_APP_PASSWORD`: Gmail app password, read only when a notification is
-  due.
-- `RECEIVER_EMAIL`: notification recipient, read only when a notification is
-  due.
+- `GMAIL_ADDRESS`: notification sender.
+- `GMAIL_APP_PASSWORD`: Gmail app password.
+- `RECEIVER_EMAIL`: notification recipient.
 
-No state, holdings, balances, addresses, or credentials belong in Git.
-Production state and the non-sensitive shadow chain are restored and saved as
-the `roth-ira-state` workflow artifact.
-
-SMTP and GitHub artifacts cannot form one atomic transaction. If the runner
-disappears after Gmail accepts a message but before delivery proof is uploaded,
-a rare duplicate retry is possible. Every message includes its signal date and
-exact destination; never execute the same recommendation twice.
+State, holdings, balances, addresses, and credentials must never be committed.
+Production state is restored from and saved to the `roth-ira-state` workflow
+artifact.
 
 ## Local validation
 
 ```powershell
 python -m unittest discover -s tests -v
-python -m py_compile port12_cloud.py alpha_core.py alpha_research.py `
-  alpha_paired_research.py legacy_original_research.py
+python -m py_compile port12_cloud.py alpha_core.py
 python port12_cloud.py --test --roth-amount 10000
 git diff --check
 git status --short
 ```
 
-Test mode may download live yfinance data, but it never saves production state,
-writes an audit/log, or sends email.
-
-## Research
-
-Read `ALPHA_RESEARCH_PROTOCOL.md`, `RESEARCH.md`, and
-`RESEARCH_FINDINGS.md`. The current strategy remains experimental: historical
-results do not prove future alpha, and the committed findings explicitly
-preserve failed promotion flags and model-selection risk.
+Test mode may download live market data, but it never saves production state,
+writes logs or audits, or sends email.

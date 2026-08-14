@@ -115,10 +115,7 @@ jobs:
           set -euo pipefail
           python -m py_compile \
             port12_cloud.py \
-            alpha_core.py \
-            alpha_research.py \
-            alpha_paired_research.py \
-            legacy_original_research.py
+            alpha_core.py
           python -m unittest discover -s tests -v
 
           python - <<'PY'
