@@ -17,7 +17,6 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 import alpha_core as core  # noqa: E402
-import alpha_research as research  # noqa: E402
 import port12_cloud as engine  # noqa: E402
 
 
@@ -36,8 +35,14 @@ def market_prices(rows=900, *, end=SIGNAL_DATE):
             + 0.009 * np.sin(position / 2.3)
             + 0.002 * np.cos(position / 7)
         ),
+        engine.VOLATILITY_INDEX: (
+            0.00065 + 0.012 * np.sin(position / 2.05)
+        ),
         engine.LEVERAGED_INDEX: (
-            0.00070 + 0.013 * np.sin(position / 2.0)
+            0.00090 + 0.019 * np.sin(position / 2.0)
+        ),
+        engine.LEVERAGED_GOLD: (
+            0.00020 + 0.010 * np.sin(position / 2.6)
         ),
         engine.LEVERAGED_SEMICONDUCTOR: (
             0.0010
@@ -95,7 +100,7 @@ def make_decision(
         last_processed_signal_date=last_processed,
     )
     return engine.StrategyDecision(
-        target_weights=core.target_weights(weight),
+        target_weights=engine.target_weights(weight),
         overlay_state=overlay,
         transition_reason=reason,
         alpha_reviewed=False,
@@ -267,7 +272,7 @@ class StrategyTransitionTests(unittest.TestCase):
             base = make_decision()
             return replace(
                 base,
-                target_weights=core.target_weights(
+                target_weights=engine.target_weights(
                     transition.state.soxl_weight
                 ),
                 overlay_state=transition.state,
@@ -407,43 +412,28 @@ class StrategyTransitionTests(unittest.TestCase):
                 position % engine.ALPHA_REVIEW_SESSIONS == 0,
             )
 
-    def test_research_and_production_share_the_review_phase(self):
-        dates = pd.DatetimeIndex(
-            engine._nyse_calendar().sessions_in_range(
-                pd.Timestamp(engine.MODEL_START_DATE),
-                pd.Timestamp("2010-07-01"),
-            )
-        )
-        if dates.tz is not None:
-            dates = dates.tz_convert(None)
-        dates = dates.normalize()
-        panel = research.SignalPanel(
-            frame=pd.DataFrame(
-                {
-                    "trend_positive": True,
-                    "residual_available": True,
-                    "residual_positive": True,
-                },
-                index=dates,
-            ),
-            ridge_details={},
-            data_fingerprint="a" * 64,
-        )
-        schedule = research.build_target_schedule(
-            panel,
-            "residual_35",
-        )
-        production_phase = [
-            engine.alpha_review_due("", date, dates)
-            for date in dates
-        ]
-        self.assertEqual(
-            schedule["alpha_review_due"].tolist(),
-            production_phase,
-        )
-
-
 class SignalIntegrationTests(EngineTestCase):
+    def test_exact_no_crypto_core_target_math(self):
+        self.assertEqual(
+            engine.target_weights(0.0),
+            {
+                engine.LEVERAGED_INDEX: 0.65,
+                engine.LEVERAGED_GOLD: 0.35,
+                engine.LEVERAGED_SEMICONDUCTOR: 0.0,
+            },
+        )
+        middle = engine.target_weights(0.20)
+        self.assertAlmostEqual(middle[engine.LEVERAGED_INDEX], 0.52)
+        self.assertAlmostEqual(middle[engine.LEVERAGED_GOLD], 0.28)
+        self.assertAlmostEqual(middle[engine.LEVERAGED_SEMICONDUCTOR], 0.20)
+        maximum = engine.target_weights(core.MAX_SOXL_WEIGHT)
+        self.assertAlmostEqual(maximum[engine.LEVERAGED_INDEX], 0.4225)
+        self.assertAlmostEqual(maximum[engine.LEVERAGED_GOLD], 0.2275)
+        self.assertAlmostEqual(maximum[engine.LEVERAGED_SEMICONDUCTOR], 0.35)
+        self.assertTrue(
+            {"GBTC", "IBIT", "BTC-USD"}.isdisjoint(engine.ALL_TICKERS)
+        )
+
     def test_strategy_uses_shared_residual_and_volatility_primitives(self):
         prices = market_prices(900)
         state = engine.PortfolioState(cash_balance=10_000.0)
@@ -461,12 +451,17 @@ class SignalIntegrationTests(EngineTestCase):
         volatility.assert_called_once()
         self.assertEqual(
             result.target_weights,
-            core.target_weights(result.overlay_state.soxl_weight),
+            engine.target_weights(result.overlay_state.soxl_weight),
+        )
+        volatility_prices = volatility.call_args.args[0]
+        self.assertEqual(
+            list(volatility_prices.columns),
+            [engine.VOLATILITY_INDEX, engine.LEVERAGED_SEMICONDUCTOR],
         )
 
     def test_flat_volatility_fails_closed_and_immediately_removes_soxl(self):
         prices = market_prices(900)
-        prices[engine.LEVERAGED_INDEX] = 100.0
+        prices[engine.VOLATILITY_INDEX] = 100.0
         prices[engine.LEVERAGED_SEMICONDUCTOR] = 100.0
         state = engine.PortfolioState(
             cash_balance=1_000.0,
@@ -491,10 +486,10 @@ class SignalIntegrationTests(EngineTestCase):
             )
 
     def test_strategy_manifest_has_exact_maximum_exposure(self):
-        target = core.target_weights(core.MAX_SOXL_WEIGHT)
+        target = engine.target_weights(core.MAX_SOXL_WEIGHT)
         self.assertAlmostEqual(
             engine.advertised_daily_exposure(target),
-            2.35,
+            engine.MAX_ADVERTISED_DAILY_EXPOSURE,
         )
         self.assertEqual(
             engine.STRATEGY_FINGERPRINT,
@@ -519,7 +514,11 @@ class RebalanceTests(EngineTestCase):
         decision = make_decision(0.35)
         state = self.aligned_state(0.35)
         plan = engine.build_rebalance_plan(
-            {engine.LEVERAGED_INDEX: 0.70, engine.LEVERAGED_SEMICONDUCTOR: 0.30},
+            {
+                engine.LEVERAGED_INDEX: 0.4725,
+                engine.LEVERAGED_GOLD: 0.1775,
+                engine.LEVERAGED_SEMICONDUCTOR: 0.35,
+            },
             decision,
             state,
         )
@@ -527,8 +526,9 @@ class RebalanceTests(EngineTestCase):
         self.assertTrue(plan.individual_drift_triggered)
         below = engine.build_rebalance_plan(
             {
-                engine.LEVERAGED_INDEX: 0.6999,
-                engine.LEVERAGED_SEMICONDUCTOR: 0.3001,
+                engine.LEVERAGED_INDEX: 0.4724,
+                engine.LEVERAGED_GOLD: 0.1776,
+                engine.LEVERAGED_SEMICONDUCTOR: 0.35,
             },
             decision,
             state,
@@ -538,12 +538,12 @@ class RebalanceTests(EngineTestCase):
     def test_exact_five_point_aggregate_equity_drift_triggers(self):
         individual, aggregate = engine.drift_triggers(
             {
-                engine.LEVERAGED_INDEX: 0.625,
+                engine.LEVERAGED_INDEX: 0.3975,
                 engine.LEVERAGED_SEMICONDUCTOR: 0.325,
+                engine.LEVERAGED_GOLD: 0.2525,
                 engine.CASH_ASSET: 0.025,
-                engine.LEGACY_HEDGE: 0.025,
             },
-            core.target_weights(0.35),
+            engine.target_weights(0.35),
         )
         self.assertFalse(individual)
         self.assertTrue(aggregate)
@@ -551,21 +551,24 @@ class RebalanceTests(EngineTestCase):
     def test_drift_trade_stops_at_inner_destination(self):
         result = engine.inner_band_rebalance_weights(
             {
-                engine.LEVERAGED_INDEX: 0.71,
-                engine.LEVERAGED_SEMICONDUCTOR: 0.29,
+                engine.LEVERAGED_INDEX: 0.4725,
+                engine.LEVERAGED_GOLD: 0.1775,
+                engine.LEVERAGED_SEMICONDUCTOR: 0.35,
             },
-            core.target_weights(0.35),
+            engine.target_weights(0.35),
         )
-        self.assertAlmostEqual(result[engine.LEVERAGED_INDEX], 0.675)
+        self.assertAlmostEqual(result[engine.LEVERAGED_INDEX], 0.4475)
+        self.assertAlmostEqual(result[engine.LEVERAGED_GOLD], 0.2025)
         self.assertAlmostEqual(
             result[engine.LEVERAGED_SEMICONDUCTOR],
-            0.325,
+            0.35,
         )
 
     def test_inner_destination_never_exceeds_the_soxl_cap(self):
         plan = engine.build_rebalance_plan(
             {
-                engine.LEVERAGED_INDEX: 0.60,
+                engine.LEVERAGED_INDEX: 0.35,
+                engine.LEVERAGED_GOLD: 0.25,
                 engine.LEVERAGED_SEMICONDUCTOR: 0.40,
             },
             make_decision(core.MAX_SOXL_WEIGHT),
@@ -577,7 +580,11 @@ class RebalanceTests(EngineTestCase):
         )
         self.assertAlmostEqual(
             plan.execution_weights[engine.LEVERAGED_INDEX],
-            0.65,
+            0.4225,
+        )
+        self.assertAlmostEqual(
+            plan.execution_weights[engine.LEVERAGED_GOLD],
+            0.2275,
         )
 
     def test_risk_off_soxl_is_exactly_sold_below_the_drift_band(self):
@@ -628,7 +635,7 @@ class RebalanceTests(EngineTestCase):
         }
         tiny_table = engine.calculate_execution_table(
             one_row_prices(),
-            engine._with_cash_target(core.target_weights(0.0)),
+            engine._with_cash_target(engine.target_weights(0.0)),
             1_000.0,
             tiny_state,
             actionable=True,
@@ -637,6 +644,29 @@ class RebalanceTests(EngineTestCase):
             tiny_table["Ticker"] == engine.LEGACY_HEDGE
         ].iloc[0]
         self.assertEqual(tiny_row["Action"], "SELL")
+
+    def test_legacy_qld_is_explicitly_sold_for_new_core(self):
+        state = self.aligned_state(0.0)
+        state.shares = {engine.VOLATILITY_INDEX: 10.0}
+        plan = engine.build_rebalance_plan(
+            {engine.VOLATILITY_INDEX: 1.0},
+            make_decision(0.0),
+            state,
+        )
+        self.assertTrue(plan.full_transition)
+        self.assertEqual(plan.reason, "LEGACY_POSITION_EXIT")
+        table = engine.calculate_execution_table(
+            one_row_prices(),
+            plan.execution_weights,
+            1_000.0,
+            state,
+            actionable=True,
+        )
+        qld = table.loc[
+            table["Ticker"] == engine.VOLATILITY_INDEX
+        ].iloc[0]
+        self.assertEqual(qld["TargetPct"], 0.0)
+        self.assertEqual(qld["Action"], "SELL")
 
     def test_strategy_revision_forces_exact_transition(self):
         state = engine.PortfolioState(
@@ -652,7 +682,12 @@ class RebalanceTests(EngineTestCase):
         self.assertTrue(plan.full_transition)
         self.assertEqual(
             plan.execution_weights,
-            {engine.LEVERAGED_INDEX: 1.0, engine.LEVERAGED_SEMICONDUCTOR: 0.0, engine.CASH_ASSET: 0.0},
+            {
+                engine.LEVERAGED_INDEX: 0.65,
+                engine.LEVERAGED_GOLD: 0.35,
+                engine.LEVERAGED_SEMICONDUCTOR: 0.0,
+                engine.CASH_ASSET: 0.0,
+            },
         )
 
 
@@ -768,7 +803,7 @@ class StateAndHoldingsTests(EngineTestCase):
         }
         self.write_state(payload)
         state = engine.load_state(backup_legacy=False)
-        self.assertEqual(state.state_version, 8)
+        self.assertEqual(state.state_version, engine.STATE_VERSION)
         self.assertEqual(state.shares, payload["shares"])
         self.assertEqual(state.cash_balance, 19.87)
         self.assertEqual(state.pending_recommendation_date, "2026-08-04")
@@ -793,6 +828,98 @@ class StateAndHoldingsTests(EngineTestCase):
         self.assertAlmostEqual(
             engine.existing_portfolio_value(state, one_row_prices()),
             505.0,
+        )
+
+    def test_v8_migration_preserves_complete_production_state(self):
+        original = engine.PortfolioState(
+            shares={engine.LEVERAGED_INDEX: 4.5},
+            cash_balance=12.25,
+            target_weights={engine.LEVERAGED_INDEX: 1.0},
+            portfolio_value=1_234.0,
+            overlay_active=True,
+            eligible_streak=4,
+            soxl_weight=0.20,
+            soxl_weight_date="2026-08-04",
+            pending_soxl_weight=0.25,
+            pending_scale_days=2,
+            last_alpha_review_date="2026-08-04",
+            last_processed_signal_date="2026-08-04",
+            shadow_ledger_sessions=1,
+            shadow_ledger_last_signal_date="2026-08-04",
+            shadow_ledger_chain_hash="a" * 64,
+            last_processed_data_fingerprint="b" * 64,
+        )
+        payload = asdict(original)
+        payload["state_version"] = 8
+        self.write_state(payload)
+        migrated = engine.load_state(backup_legacy=False)
+        self.assertEqual(migrated.state_version, engine.STATE_VERSION)
+        for name, value in payload.items():
+            if name != "state_version":
+                self.assertEqual(getattr(migrated, name), value)
+
+    def test_v10_migration_drops_retired_research_only_anchors(self):
+        original = engine.PortfolioState(
+            shares={engine.LEVERAGED_INDEX: 4.5},
+            cash_balance=12.25,
+            pending_recommendation_date="2026-08-04",
+            pending_recommendation_weights={engine.LEVERAGED_INDEX: 1.0},
+            pending_recommendation_fingerprint="a" * 64,
+        )
+        payload = asdict(original)
+        payload["state_version"] = 10
+        payload.update(
+            {
+                "downside_shadow_ledger_sessions": 1,
+                "downside_shadow_ledger_last_signal_date": "2026-08-04",
+                "downside_shadow_ledger_chain_hash": "b" * 64,
+            }
+        )
+        self.write_state(payload)
+        migrated = engine.load_state(backup_legacy=False)
+        self.assertEqual(migrated.state_version, engine.STATE_VERSION)
+        self.assertEqual(migrated.shares, original.shares)
+        self.assertEqual(migrated.cash_balance, original.cash_balance)
+        self.assertEqual(
+            migrated.pending_recommendation_weights,
+            original.pending_recommendation_weights,
+        )
+        self.assertFalse(
+            hasattr(migrated, "downside_shadow_ledger_sessions")
+        )
+
+    def test_v9_migration_preserves_qld_and_forces_new_core_transition(self):
+        original = engine.PortfolioState(
+            shares={engine.VOLATILITY_INDEX: 10.0},
+            target_weights={engine.VOLATILITY_INDEX: 1.0},
+            portfolio_value=1_000.0,
+            executed_strategy_fingerprint=(
+                "d9ce9aaf3fbc39962598fc09986f1b37"
+                "b87d4e62559980d81820326534d7e837"
+            ),
+        )
+        payload = asdict(original)
+        payload["state_version"] = 9
+        self.write_state(payload)
+        migrated = engine.load_state(backup_legacy=False)
+        self.assertEqual(
+            migrated.shares,
+            {engine.VOLATILITY_INDEX: 10.0},
+        )
+        self.assertEqual(
+            migrated.target_weights,
+            {engine.VOLATILITY_INDEX: 1.0},
+        )
+        plan = engine.build_rebalance_plan(
+            {engine.VOLATILITY_INDEX: 1.0},
+            make_decision(0.0),
+            migrated,
+        )
+        self.assertTrue(plan.full_transition)
+        self.assertEqual(plan.reason, "STRATEGY_REVISION_TRANSITION")
+        self.assertEqual(
+            plan.execution_weights,
+            engine._with_cash_target(engine.target_weights(0.0)),
         )
 
     def test_migration_creates_recoverable_backup_when_enabled(self):
@@ -852,7 +979,7 @@ class StateAndHoldingsTests(EngineTestCase):
         state = engine.PortfolioState(
             cash_balance=100.0,
             pending_recommendation_date="2026-08-04",
-            pending_recommendation_weights=engine._with_cash_target(core.target_weights(0.2)),
+            pending_recommendation_weights=engine._with_cash_target(engine.target_weights(0.2)),
             pending_recommendation_overlay_active=True,
             pending_recommendation_soxl_weight=0.2,
             pending_recommendation_notified=True,
@@ -903,7 +1030,7 @@ class NotificationTests(EngineTestCase):
         self.assertTrue(self.state_file.exists())
 
     def test_identical_delivered_pending_action_is_suppressed(self):
-        weights = core.target_weights(0.20)
+        weights = engine.target_weights(0.20)
         state = self.pending_state(weights)
         run = make_run(
             state=state,
@@ -913,7 +1040,7 @@ class NotificationTests(EngineTestCase):
         self.assertEqual(engine.decide_notification(run).kind, "NONE")
 
     def test_undelivered_identical_action_retries_exact_destination(self):
-        weights = core.target_weights(0.20)
+        weights = engine.target_weights(0.20)
         state = self.pending_state(weights, notified=False)
         plan = actionable_plan(weights)
         preserved = engine.preserve_pending_delivery_plan(
@@ -930,11 +1057,11 @@ class NotificationTests(EngineTestCase):
         self.assertEqual(engine.decide_notification(run).kind, "RETRY")
 
     def test_material_update_replaces_pending_action(self):
-        state = self.pending_state(core.target_weights(0.10))
+        state = self.pending_state(engine.target_weights(0.10))
         run = make_run(
             state=state,
             decision=make_decision(0.25),
-            plan=actionable_plan(core.target_weights(0.25)),
+            plan=actionable_plan(engine.target_weights(0.25)),
         )
         notice = engine.decide_notification(run)
         self.assertEqual(notice.kind, "UPDATE")
@@ -949,7 +1076,7 @@ class NotificationTests(EngineTestCase):
         )
 
     def test_cancellation_is_one_time_and_clears_pending_after_delivery(self):
-        state = self.pending_state(core.target_weights(0.20))
+        state = self.pending_state(engine.target_weights(0.20))
         run = make_run(state=state, decision=make_decision(0.20))
         notice = engine.decide_notification(run)
         self.assertEqual(notice.kind, "CANCELLATION")
@@ -966,7 +1093,7 @@ class NotificationTests(EngineTestCase):
         state = engine.PortfolioState(
             shares={engine.LEVERAGED_INDEX: 10.0},
         )
-        weights = core.target_weights(0.20)
+        weights = engine.target_weights(0.20)
         run = make_run(
             state=state,
             decision=make_decision(0.20),
@@ -1011,7 +1138,7 @@ class NotificationTests(EngineTestCase):
     def test_test_mode_never_persists_emails_audit_or_log(self):
         run = make_run(
             state=engine.PortfolioState(cash_balance=1_000.0),
-            plan=actionable_plan(core.target_weights(0.0)),
+            plan=actionable_plan(engine.target_weights(0.0)),
         )
         with mock.patch.object(sys, "argv", ["port12_cloud.py", "--test", "--roth-amount", "1000"]), mock.patch.object(
             engine,
@@ -1035,7 +1162,7 @@ class NotificationTests(EngineTestCase):
 
     def test_delivery_evidence_survives_later_audit_failure(self):
         state = engine.PortfolioState(shares={engine.LEVERAGED_INDEX: 10.0})
-        weights = core.target_weights(0.20)
+        weights = engine.target_weights(0.20)
         run = make_run(
             state=state,
             decision=make_decision(0.20),
@@ -1296,6 +1423,8 @@ class AuditAndCliTests(EngineTestCase):
         self.assertIn("Guard stateful production ref", workflow)
         self.assertIn("roth-ira-state", workflow)
         self.assertIn("roth_ira_shadow_ledger.jsonl", workflow)
+        self.assertNotIn("downside_shadow", workflow)
+        self.assertNotIn("alpha_research.py", workflow)
         self.assertIn("roth-ira-decision", workflow)
         self.assertIn("--confirm-execution", workflow)
         self.assertIn("--sync-holdings", workflow)
