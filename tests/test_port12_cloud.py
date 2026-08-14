@@ -484,16 +484,25 @@ class SignalIntegrationTests(EngineTestCase):
 
     def test_value_milestones_are_inflation_indexed_and_exact(self):
         with mock.patch.dict(os.environ, {"INVESTOR_BIRTH_DATE": ""}):
-            self.assertEqual(
-                engine.lifecycle_value_stage(99_999.99, engine.LIFECYCLE_ANCHOR_DATE),
-                engine.LIFECYCLE_SPRINT,
-            )
-            self.assertEqual(
-                engine.lifecycle_value_stage(100_000.0, engine.LIFECYCLE_ANCHOR_DATE),
-                engine.LIFECYCLE_GLIDE_225,
-            )
+            previous = engine.LIFECYCLE_SPRINT
+            for threshold, stage in engine.LIFECYCLE_VALUE_THRESHOLDS_2026:
+                self.assertEqual(
+                    engine.lifecycle_value_stage(
+                        threshold - 0.01,
+                        engine.LIFECYCLE_ANCHOR_DATE,
+                    ),
+                    previous,
+                )
+                self.assertEqual(
+                    engine.lifecycle_value_stage(
+                        threshold,
+                        engine.LIFECYCLE_ANCHOR_DATE,
+                    ),
+                    stage,
+                )
+                previous = stage
             future = date(2027, 8, 14)
-            adjusted = 100_000.0 * engine.lifecycle_inflation_factor(future)
+            adjusted = 250_000.0 * engine.lifecycle_inflation_factor(future)
             self.assertEqual(
                 engine.lifecycle_value_stage(adjusted - 0.01, future),
                 engine.LIFECYCLE_SPRINT,
@@ -503,10 +512,20 @@ class SignalIntegrationTests(EngineTestCase):
                 engine.LIFECYCLE_GLIDE_225,
             )
 
+    def test_every_delayed_age_ceiling_is_exact(self):
+        previous = engine.LIFECYCLE_SPRINT
+        for threshold, stage in engine.LIFECYCLE_AGE_THRESHOLDS:
+            self.assertEqual(
+                engine.lifecycle_age_stage(threshold - 0.0001),
+                previous,
+            )
+            self.assertEqual(engine.lifecycle_age_stage(threshold), stage)
+            previous = stage
+
     def test_age_ceiling_and_one_way_ratchet_override_account_value(self):
         with mock.patch.dict(
             os.environ,
-            {"INVESTOR_BIRTH_DATE": "1991-08-14"},
+            {"INVESTOR_BIRTH_DATE": "1981-08-14"},
         ):
             age_limited = engine.select_lifecycle_stage(
                 engine.LIFECYCLE_SPRINT,
