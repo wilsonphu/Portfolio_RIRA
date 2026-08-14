@@ -25,7 +25,7 @@ CASH = "CASH"
 
 # Bump this value only after reviewing a decision-semantic change. Source-file
 # bytes belong in implementation lineage, not in the live allocation identity.
-DECISION_SEMANTIC_REVISION = "qld-soxl-core-v1"
+DECISION_SEMANTIC_REVISION = "qld-soxl-tiered-core-v2"
 MODEL_HISTORY_START = "2010-03-11"
 
 SMA_WINDOW = 200
@@ -43,7 +43,7 @@ VARIANCE_MIN_TRAINING = 756
 RIDGE_ALPHA = 10.0
 
 VOLATILITY_BUDGET = 0.55
-SOXL_WEIGHT_GRID = tuple(round(float(value), 2) for value in np.arange(0.0, 0.351, 0.05))
+SOXL_WEIGHT_GRID = (0.0, 0.15, 0.25, 0.35)
 MAX_SOXL_WEIGHT = 0.35
 MAX_ADVERTISED_DAILY_EXPOSURE = 2.35
 
@@ -578,6 +578,37 @@ def choose_soxl_weight(
     return chosen_weight, chosen_volatility
 
 
+def is_soxl_tier(value: object) -> bool:
+    """Return whether ``value`` is one of the frozen strategic SOXL tiers."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    numeric = float(value)
+    return bool(
+        np.isfinite(numeric)
+        and any(
+            abs(numeric - candidate) <= _WEIGHT_TOLERANCE
+            for candidate in SOXL_WEIGHT_GRID
+        )
+    )
+
+
+def floor_soxl_tier(value: float) -> float:
+    """Map a legacy SOXL weight down to the nearest current risk tier."""
+    numeric = float(value)
+    if (
+        not np.isfinite(numeric)
+        or numeric < -_WEIGHT_TOLERANCE
+        or numeric > MAX_SOXL_WEIGHT + _WEIGHT_TOLERANCE
+    ):
+        raise ValueError("SOXL weight is outside the strategic range")
+    bounded = min(max(numeric, 0.0), MAX_SOXL_WEIGHT)
+    return max(
+        candidate
+        for candidate in SOXL_WEIGHT_GRID
+        if candidate <= bounded + _WEIGHT_TOLERANCE
+    )
+
+
 def calculate_portfolio_volatility(
     price_data: pd.DataFrame,
     *,
@@ -633,41 +664,9 @@ def calculate_portfolio_volatility(
 def target_weights(soxl_weight: float) -> dict[str, float]:
     """Return exact strategic QLD/SOXL weights."""
     weight = float(soxl_weight)
-    if (
-        not np.isfinite(weight)
-        or weight < -_WEIGHT_TOLERANCE
-        or weight > MAX_SOXL_WEIGHT + _WEIGHT_TOLERANCE
-    ):
-        raise ValueError("SOXL target weight is outside the strategic range")
-    weight = min(max(weight, 0.0), MAX_SOXL_WEIGHT)
+    if not is_soxl_tier(weight):
+        raise ValueError("SOXL target weight is not a strategic tier")
     return {QLD: 1.0 - weight, SOXL: weight}
-
-
-def buffered_soxl_rebalance_weight(
-    actual_soxl_weight: float,
-    strategic_soxl_weight: float,
-    *,
-    trigger: float,
-    destination: float,
-) -> float | None:
-    """Return the capped inner-band SOXL destination, or ``None``."""
-    actual = float(actual_soxl_weight)
-    strategic = float(strategic_soxl_weight)
-    if (
-        not np.isfinite(actual)
-        or not np.isfinite(strategic)
-        or actual < 0.0
-        or strategic < 0.0
-        or strategic > MAX_SOXL_WEIGHT + _WEIGHT_TOLERANCE
-    ):
-        raise ValueError("SOXL drift weights are invalid")
-    if not (0.0 < destination < trigger < 1.0):
-        raise ValueError("SOXL drift bands are invalid")
-    difference = actual - strategic
-    if abs(difference) + _WEIGHT_TOLERANCE < trigger:
-        return None
-    buffered = strategic + np.sign(difference) * destination
-    return float(np.clip(buffered, 0.0, MAX_SOXL_WEIGHT))
 
 
 def advance_overlay_state(
@@ -698,13 +697,8 @@ def advance_overlay_state(
     if reentry_closes < 1 or upshift_closes < 1:
         raise ValueError("Confirmation counts must be positive")
     raw_weight = float(raw_soxl_weight)
-    if (
-        not np.isfinite(raw_weight)
-        or raw_weight < -_WEIGHT_TOLERANCE
-        or raw_weight > MAX_SOXL_WEIGHT + _WEIGHT_TOLERANCE
-    ):
-        raise ValueError("Raw SOXL weight is outside the strategic range")
-    raw_weight = min(max(raw_weight, 0.0), MAX_SOXL_WEIGHT)
+    if not is_soxl_tier(raw_weight):
+        raise ValueError("Raw SOXL weight is not a strategic tier")
 
     trend = _strict_bool(trend_positive, "trend_positive")
     residual = _strict_bool(residual_positive, "residual_positive")

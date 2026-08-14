@@ -6,7 +6,7 @@ import tempfile
 import types
 import unittest
 from dataclasses import asdict, replace
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from unittest import mock
 
@@ -59,6 +59,13 @@ def market_prices(rows=900, *, end=SIGNAL_DATE):
             0.0001 + 0.004 * np.sin(position / 2.7)
         ),
     }
+    for ticker_number, ticker in enumerate(engine.ALL_TICKERS):
+        returns.setdefault(
+            ticker,
+            0.0002
+            + (0.004 + ticker_number * 0.0002)
+            * np.sin(position / (2.4 + ticker_number * 0.03)),
+        )
     return pd.DataFrame(
         {
             ticker: (70.0 + index_number * 5.0)
@@ -87,6 +94,7 @@ def make_decision(
     reason="HOLD",
     structural=False,
     last_processed="",
+    lifecycle_stage=engine.LIFECYCLE_SPRINT,
 ):
     if active is None:
         active = weight > 0
@@ -100,7 +108,7 @@ def make_decision(
         last_processed_signal_date=last_processed,
     )
     return engine.StrategyDecision(
-        target_weights=engine.target_weights(weight),
+        target_weights=engine.target_weights(weight, lifecycle_stage),
         overlay_state=overlay,
         transition_reason=reason,
         alpha_reviewed=False,
@@ -112,6 +120,7 @@ def make_decision(
         qqq_sma_200=100.0,
         residual_signal=None,
         portfolio_volatility=None,
+        lifecycle_stage=lifecycle_stage,
     )
 
 
@@ -140,6 +149,7 @@ def make_run(
         )
     planning = copy.deepcopy(state)
     engine._apply_overlay_state(planning, decision.overlay_state)
+    engine._apply_lifecycle_state(planning, decision, SIGNAL_DATE)
     table = engine.calculate_execution_table(
         prices,
         plan.execution_weights,
@@ -253,7 +263,7 @@ class StrategyTransitionTests(unittest.TestCase):
         state = engine.PortfolioState(
             overlay_active=True,
             eligible_streak=5,
-            soxl_weight=0.20,
+            soxl_weight=0.25,
             soxl_weight_date=sessions[-3].date().isoformat(),
             last_alpha_review_date=sessions[-3].date().isoformat(),
             last_processed_signal_date=sessions[-3].date().isoformat(),
@@ -266,7 +276,7 @@ class StrategyTransitionTests(unittest.TestCase):
                 signal_date=session,
                 trend_positive=session != bearish_session,
                 residual_positive=True,
-                raw_soxl_weight=0.20,
+                raw_soxl_weight=0.25,
                 alpha_review_due=False,
             )
             base = make_decision()
@@ -347,17 +357,17 @@ class StrategyTransitionTests(unittest.TestCase):
         state = core.OverlayState(
             overlay_active=True,
             eligible_streak=2,
-            soxl_weight=0.30,
+            soxl_weight=0.35,
         )
         down = core.advance_overlay_state(
             state,
             signal_date=SIGNAL_DATE,
             trend_positive=True,
             residual_positive=True,
-            raw_soxl_weight=0.10,
+            raw_soxl_weight=0.15,
             alpha_review_due=False,
         )
-        self.assertEqual(down.state.soxl_weight, 0.10)
+        self.assertEqual(down.state.soxl_weight, 0.15)
         current = down.state
         for day in range(1, 5):
             current = core.advance_overlay_state(
@@ -365,19 +375,19 @@ class StrategyTransitionTests(unittest.TestCase):
                 signal_date=SIGNAL_DATE + pd.Timedelta(days=day),
                 trend_positive=True,
                 residual_positive=True,
-                raw_soxl_weight=0.20,
+                raw_soxl_weight=0.25,
                 alpha_review_due=False,
             ).state
-            self.assertEqual(current.soxl_weight, 0.10)
+            self.assertEqual(current.soxl_weight, 0.15)
         fifth = core.advance_overlay_state(
             current,
             signal_date=SIGNAL_DATE + pd.Timedelta(days=5),
             trend_positive=True,
             residual_positive=True,
-            raw_soxl_weight=0.20,
+            raw_soxl_weight=0.25,
             alpha_review_due=False,
         )
-        self.assertEqual(fifth.state.soxl_weight, 0.20)
+        self.assertEqual(fifth.state.soxl_weight, 0.25)
 
     def test_fresh_reentry_uses_current_scale_immediately(self):
         first = core.advance_overlay_state(
@@ -385,7 +395,7 @@ class StrategyTransitionTests(unittest.TestCase):
             signal_date=SIGNAL_DATE,
             trend_positive=True,
             residual_positive=True,
-            raw_soxl_weight=0.30,
+            raw_soxl_weight=0.35,
             alpha_review_due=True,
         )
         second = core.advance_overlay_state(
@@ -393,11 +403,11 @@ class StrategyTransitionTests(unittest.TestCase):
             signal_date=SIGNAL_DATE + pd.Timedelta(days=1),
             trend_positive=True,
             residual_positive=True,
-            raw_soxl_weight=0.30,
+            raw_soxl_weight=0.35,
             alpha_review_due=True,
         )
         self.assertEqual(second.reason, "OVERLAY_REENTRY")
-        self.assertEqual(second.state.soxl_weight, 0.30)
+        self.assertEqual(second.state.soxl_weight, 0.35)
         self.assertEqual(second.state.pending_scale_days, 0)
 
     def test_alpha_review_uses_fixed_model_history_phase(self):
@@ -422,16 +432,119 @@ class SignalIntegrationTests(EngineTestCase):
                 engine.LEVERAGED_SEMICONDUCTOR: 0.0,
             },
         )
-        middle = engine.target_weights(0.20)
-        self.assertAlmostEqual(middle[engine.LEVERAGED_INDEX], 0.52)
-        self.assertAlmostEqual(middle[engine.LEVERAGED_GOLD], 0.28)
-        self.assertAlmostEqual(middle[engine.LEVERAGED_SEMICONDUCTOR], 0.20)
+        middle = engine.target_weights(0.25)
+        self.assertAlmostEqual(middle[engine.LEVERAGED_INDEX], 0.4875)
+        self.assertAlmostEqual(middle[engine.LEVERAGED_GOLD], 0.2625)
+        self.assertAlmostEqual(middle[engine.LEVERAGED_SEMICONDUCTOR], 0.25)
         maximum = engine.target_weights(core.MAX_SOXL_WEIGHT)
         self.assertAlmostEqual(maximum[engine.LEVERAGED_INDEX], 0.4225)
         self.assertAlmostEqual(maximum[engine.LEVERAGED_GOLD], 0.2275)
         self.assertAlmostEqual(maximum[engine.LEVERAGED_SEMICONDUCTOR], 0.35)
         self.assertTrue(
             {"GBTC", "IBIT", "BTC-USD"}.isdisjoint(engine.ALL_TICKERS)
+        )
+
+    def test_lifecycle_delivery_map_preserves_sources_and_exact_exposure(self):
+        multipliers = {
+            "nasdaq": {
+                engine.LEVERAGED_INDEX: 3.0,
+                engine.VOLATILITY_INDEX: 2.0,
+                engine.UNLEVERAGED_INDEX: 1.0,
+            },
+            "gold": {
+                engine.LEVERAGED_GOLD: 2.0,
+                engine.UNLEVERAGED_GOLD: 1.0,
+            },
+            "semiconductors": {
+                engine.LEVERAGED_SEMICONDUCTOR: 3.0,
+                engine.DOUBLE_SEMICONDUCTOR: 2.0,
+                engine.UNLEVERAGED_SEMICONDUCTOR: 1.0,
+            },
+        }
+        for soxl_weight in core.SOXL_WEIGHT_GRID:
+            expected_sources, _ = engine._risk_source_weights(soxl_weight)
+            for stage in engine.LIFECYCLE_STAGES:
+                weights = engine.target_weights(soxl_weight, stage)
+                exposure = engine.advertised_daily_exposure(weights)
+                ceiling = engine.LIFECYCLE_EXPOSURE_CEILINGS[stage]
+                if ceiling is None:
+                    ceiling = engine.strategic_daily_exposure(soxl_weight)
+                self.assertAlmostEqual(exposure, ceiling, places=12)
+                self.assertAlmostEqual(sum(weights.values()), 1.0, places=12)
+                for source, products in multipliers.items():
+                    actual = sum(
+                        weights.get(ticker, 0.0) * multiplier
+                        for ticker, multiplier in products.items()
+                    )
+                    self.assertAlmostEqual(
+                        actual / exposure,
+                        expected_sources[source],
+                        places=12,
+                    )
+
+    def test_value_milestones_are_inflation_indexed_and_exact(self):
+        with mock.patch.dict(os.environ, {"INVESTOR_BIRTH_DATE": ""}):
+            self.assertEqual(
+                engine.lifecycle_value_stage(99_999.99, engine.LIFECYCLE_ANCHOR_DATE),
+                engine.LIFECYCLE_SPRINT,
+            )
+            self.assertEqual(
+                engine.lifecycle_value_stage(100_000.0, engine.LIFECYCLE_ANCHOR_DATE),
+                engine.LIFECYCLE_GLIDE_225,
+            )
+            future = date(2027, 8, 14)
+            adjusted = 100_000.0 * engine.lifecycle_inflation_factor(future)
+            self.assertEqual(
+                engine.lifecycle_value_stage(adjusted - 0.01, future),
+                engine.LIFECYCLE_SPRINT,
+            )
+            self.assertEqual(
+                engine.lifecycle_value_stage(adjusted, future),
+                engine.LIFECYCLE_GLIDE_225,
+            )
+
+    def test_age_ceiling_and_one_way_ratchet_override_account_value(self):
+        with mock.patch.dict(
+            os.environ,
+            {"INVESTOR_BIRTH_DATE": "1991-08-14"},
+        ):
+            age_limited = engine.select_lifecycle_stage(
+                engine.LIFECYCLE_SPRINT,
+                5_000.0,
+                date(2026, 8, 14),
+            )
+        self.assertEqual(age_limited.stage, engine.LIFECYCLE_GLIDE_225)
+        self.assertEqual(age_limited.reason, "AGE_CEILING")
+        with mock.patch.dict(os.environ, {"INVESTOR_BIRTH_DATE": ""}):
+            ratcheted = engine.select_lifecycle_stage(
+                engine.LIFECYCLE_PHI,
+                5_000.0,
+                engine.LIFECYCLE_ANCHOR_DATE,
+            )
+        self.assertEqual(ratcheted.stage, engine.LIFECYCLE_PHI)
+        self.assertEqual(ratcheted.reason, "RATCHET_HOLD")
+
+    def test_lifecycle_advance_is_an_exact_full_transition(self):
+        state = engine.PortfolioState(
+            lifecycle_stage=engine.LIFECYCLE_SPRINT,
+            executed_lifecycle_stage=engine.LIFECYCLE_SPRINT,
+            executed_strategy_fingerprint=engine.STRATEGY_FINGERPRINT,
+        )
+        decision = make_decision(
+            0.25,
+            lifecycle_stage=engine.LIFECYCLE_TWO_X,
+        )
+        plan = engine.build_rebalance_plan(
+            engine.target_weights(0.25, engine.LIFECYCLE_SPRINT),
+            decision,
+            state,
+        )
+        self.assertTrue(plan.rebalance_due)
+        self.assertTrue(plan.full_transition)
+        self.assertEqual(plan.reason, "LIFECYCLE_STAGE_ADVANCE")
+        self.assertEqual(
+            plan.execution_weights,
+            engine._with_cash_target(decision.target_weights),
         )
 
     def test_strategy_uses_shared_residual_and_volatility_primitives(self):
@@ -580,11 +693,32 @@ class RebalanceTests(EngineTestCase):
         )
         self.assertAlmostEqual(
             plan.execution_weights[engine.LEVERAGED_INDEX],
-            0.4225,
+            0.3975,
         )
         self.assertAlmostEqual(
             plan.execution_weights[engine.LEVERAGED_GOLD],
-            0.2275,
+            0.25125,
+        )
+        self.assertAlmostEqual(
+            plan.execution_weights[engine.CASH_ASSET],
+            0.00125,
+        )
+
+    def test_ordinary_drift_rebalance_returns_soxl_to_exact_tier(self):
+        plan = engine.build_rebalance_plan(
+            {
+                engine.LEVERAGED_INDEX: 0.50,
+                engine.LEVERAGED_GOLD: 0.30,
+                engine.LEVERAGED_SEMICONDUCTOR: 0.20,
+            },
+            make_decision(0.15),
+            self.aligned_state(0.15),
+        )
+        self.assertTrue(plan.rebalance_due)
+        self.assertEqual(plan.reason, "INDIVIDUAL_DRIFT_BAND")
+        self.assertAlmostEqual(
+            plan.execution_weights[engine.LEVERAGED_SEMICONDUCTOR],
+            0.15,
         )
 
     def test_risk_off_soxl_is_exactly_sold_below_the_drift_band(self):
@@ -645,28 +779,26 @@ class RebalanceTests(EngineTestCase):
         ].iloc[0]
         self.assertEqual(tiny_row["Action"], "SELL")
 
-    def test_legacy_qld_is_explicitly_sold_for_new_core(self):
+    def test_qld_is_a_supported_lifecycle_holding(self):
         state = self.aligned_state(0.0)
         state.shares = {engine.VOLATILITY_INDEX: 10.0}
+        state.lifecycle_stage = engine.LIFECYCLE_TWO_X
+        state.executed_lifecycle_stage = engine.LIFECYCLE_TWO_X
+        decision = make_decision(
+            0.0,
+            lifecycle_stage=engine.LIFECYCLE_TWO_X,
+        )
         plan = engine.build_rebalance_plan(
             {engine.VOLATILITY_INDEX: 1.0},
-            make_decision(0.0),
+            decision,
             state,
         )
-        self.assertTrue(plan.full_transition)
-        self.assertEqual(plan.reason, "LEGACY_POSITION_EXIT")
-        table = engine.calculate_execution_table(
-            one_row_prices(),
-            plan.execution_weights,
-            1_000.0,
-            state,
-            actionable=True,
+        self.assertFalse(plan.full_transition)
+        self.assertNotEqual(plan.reason, "LEGACY_POSITION_EXIT")
+        self.assertGreater(
+            decision.target_weights[engine.VOLATILITY_INDEX],
+            0.0,
         )
-        qld = table.loc[
-            table["Ticker"] == engine.VOLATILITY_INDEX
-        ].iloc[0]
-        self.assertEqual(qld["TargetPct"], 0.0)
-        self.assertEqual(qld["Action"], "SELL")
 
     def test_strategy_revision_forces_exact_transition(self):
         state = engine.PortfolioState(
@@ -706,7 +838,7 @@ class MarketDataTests(EngineTestCase):
     def test_signal_window_gap_is_rejected_without_substitution(self):
         prices = market_prices(900)
         original_index = prices.index.copy()
-        prices.iloc[-50, prices.columns.get_loc(engine.LEVERAGED_INDEX)] = np.nan
+        prices.iloc[-50, prices.columns.get_loc(engine.MARKET_INDEX)] = np.nan
         with self.assertRaisesRegex(
             RuntimeError,
             "complete quantitative model history",
@@ -721,6 +853,14 @@ class MarketDataTests(EngineTestCase):
         result, _ = self.download(prices)
         self.assertEqual(len(result), len(prices))
         self.assertTrue(result[engine.LEGACY_HEDGE].iloc[-50] != result[engine.LEGACY_HEDGE].iloc[-50])
+
+    def test_newer_lifecycle_etf_history_is_valuation_only(self):
+        prices = market_prices(900)
+        prices.loc[prices.index[:-250], engine.UNLEVERAGED_INDEX] = np.nan
+        result, _ = self.download(prices)
+        self.assertEqual(len(result), len(prices))
+        self.assertTrue(result[engine.UNLEVERAGED_INDEX].iloc[0] != result[engine.UNLEVERAGED_INDEX].iloc[0])
+        self.assertTrue(np.isfinite(result[engine.UNLEVERAGED_INDEX].iloc[-1]))
 
     def test_missing_required_session_is_rejected(self):
         prices = market_prices(engine.REQUIRED_SIGNAL_ROWS + 1)
@@ -741,7 +881,7 @@ class MarketDataTests(EngineTestCase):
         self.assertTrue(engine._is_sha256(first))
         self.assertNotEqual(first, engine.market_data_fingerprint(second))
         older = prices.copy()
-        older.iloc[-850, older.columns.get_loc(engine.LEVERAGED_INDEX)] *= 1.001
+        older.iloc[-850, older.columns.get_loc(engine.MARKET_INDEX)] *= 1.001
         self.assertNotEqual(first, engine.market_data_fingerprint(older))
 
     def test_same_date_revision_is_rejected(self):
@@ -858,8 +998,10 @@ class StateAndHoldingsTests(EngineTestCase):
             if name not in {
                 "state_version",
                 "last_processed_data_fingerprint",
+                "soxl_weight",
             }:
                 self.assertEqual(getattr(migrated, name), value)
+        self.assertEqual(migrated.soxl_weight, 0.15)
         self.assertEqual(migrated.last_processed_data_fingerprint, "")
         engine.validate_same_date_data_fingerprint(
             migrated,
@@ -901,6 +1043,78 @@ class StateAndHoldingsTests(EngineTestCase):
         )
         self.assertFalse(
             hasattr(migrated, "downside_shadow_ledger_sessions")
+        )
+
+    def test_v11_migration_tiers_model_state_without_losing_broker_or_outbox(self):
+        original = engine.PortfolioState(
+            shares={engine.LEVERAGED_SEMICONDUCTOR: 2.5},
+            cash_balance=12.25,
+            overlay_active=True,
+            eligible_streak=7,
+            soxl_weight=0.30,
+            soxl_weight_date="2026-08-04",
+            pending_soxl_weight=0.35,
+            pending_scale_days=3,
+            last_processed_signal_date="2026-08-04",
+            executed_overlay_active=True,
+            executed_soxl_weight=0.30,
+            executed_strategy_fingerprint="a" * 64,
+            pending_recommendation_date="2026-08-04",
+            pending_recommendation_weights={
+                engine.LEVERAGED_INDEX: 0.52,
+                engine.LEVERAGED_GOLD: 0.28,
+                engine.LEVERAGED_SEMICONDUCTOR: 0.20,
+                engine.CASH_ASSET: 0.0,
+            },
+            pending_recommendation_overlay_active=True,
+            pending_recommendation_soxl_weight=0.20,
+            pending_recommendation_notified=True,
+            pending_recommendation_fingerprint="b" * 64,
+            last_processed_data_fingerprint="c" * 64,
+        )
+        payload = asdict(original)
+        payload["state_version"] = 11
+        self.write_state(payload)
+        migrated = engine.load_state(backup_legacy=False)
+        self.assertEqual(
+            migrated.shares,
+            {engine.LEVERAGED_SEMICONDUCTOR: 2.5},
+        )
+        self.assertEqual(migrated.cash_balance, 12.25)
+        self.assertEqual(migrated.soxl_weight, 0.25)
+        self.assertEqual(migrated.pending_soxl_weight, 0.35)
+        self.assertEqual(migrated.pending_scale_days, 3)
+        self.assertEqual(migrated.executed_soxl_weight, 0.30)
+        self.assertEqual(migrated.pending_recommendation_soxl_weight, 0.20)
+        self.assertTrue(migrated.pending_recommendation_notified)
+        self.assertEqual(migrated.last_processed_data_fingerprint, "c" * 64)
+
+    def test_v12_migration_preserves_broker_facts_and_starts_lifecycle_ratchet(self):
+        original = engine.PortfolioState(
+            shares={engine.LEVERAGED_INDEX: 4.5, engine.LEVERAGED_GOLD: 1.25},
+            cash_balance=12.25,
+            target_weights=engine._with_cash_target(engine.target_weights(0.0)),
+            portfolio_value=1_234.0,
+            last_processed_signal_date="2026-08-04",
+            executed_strategy_fingerprint="a" * 64,
+        )
+        payload = asdict(original)
+        payload["state_version"] = 12
+        for name in (
+            "lifecycle_stage",
+            "lifecycle_stage_date",
+            "executed_lifecycle_stage",
+            "pending_recommendation_lifecycle_stage",
+        ):
+            payload.pop(name)
+        self.write_state(payload)
+        migrated = engine.load_state(backup_legacy=False)
+        self.assertEqual(migrated.shares, original.shares)
+        self.assertEqual(migrated.cash_balance, original.cash_balance)
+        self.assertEqual(migrated.lifecycle_stage, engine.LIFECYCLE_SPRINT)
+        self.assertEqual(
+            migrated.executed_lifecycle_stage,
+            engine.LIFECYCLE_SPRINT,
         )
 
     def test_v9_migration_preserves_qld_and_forces_new_core_transition(self):
@@ -997,9 +1211,10 @@ class StateAndHoldingsTests(EngineTestCase):
         state = engine.PortfolioState(
             cash_balance=100.0,
             pending_recommendation_date="2026-08-04",
-            pending_recommendation_weights=engine._with_cash_target(engine.target_weights(0.2)),
+            pending_recommendation_weights=engine._with_cash_target(engine.target_weights(0.25)),
             pending_recommendation_overlay_active=True,
-            pending_recommendation_soxl_weight=0.2,
+            pending_recommendation_soxl_weight=0.25,
+            pending_recommendation_lifecycle_stage=engine.LIFECYCLE_SPRINT,
             pending_recommendation_notified=True,
             pending_recommendation_fingerprint=engine.STRATEGY_FINGERPRINT,
         )
@@ -1010,7 +1225,11 @@ class StateAndHoldingsTests(EngineTestCase):
             "2026-08-04",
         )
         self.assertEqual(confirmed.cash_balance, 3.25)
-        self.assertEqual(confirmed.executed_soxl_weight, 0.2)
+        self.assertEqual(confirmed.executed_soxl_weight, 0.25)
+        self.assertEqual(
+            confirmed.executed_lifecycle_stage,
+            engine.LIFECYCLE_SPRINT,
+        )
         self.assertFalse(confirmed.pending_recommendation_date)
         synced = engine.sync_holdings(
             {engine.LEVERAGED_INDEX: 8.1, engine.LEVERAGED_SEMICONDUCTOR: 2.0},
@@ -1028,6 +1247,7 @@ class NotificationTests(EngineTestCase):
             pending_recommendation_weights=engine._with_cash_target(weights),
             pending_recommendation_overlay_active=weights.get(engine.LEVERAGED_SEMICONDUCTOR, 0.0) > 0,
             pending_recommendation_soxl_weight=weights.get(engine.LEVERAGED_SEMICONDUCTOR, 0.0),
+            pending_recommendation_lifecycle_stage=engine.LIFECYCLE_SPRINT,
             pending_recommendation_notified=notified,
             pending_recommendation_supersedes_date=supersedes,
             pending_recommendation_fingerprint=engine.STRATEGY_FINGERPRINT,
@@ -1047,18 +1267,52 @@ class NotificationTests(EngineTestCase):
         engine.persist_signal_run(run)
         self.assertTrue(self.state_file.exists())
 
+    def test_lifecycle_action_is_staged_and_ratchet_is_checkpointed(self):
+        state = engine.PortfolioState(
+            shares={engine.LEVERAGED_INDEX: 6.5, engine.LEVERAGED_GOLD: 3.5},
+            lifecycle_stage=engine.LIFECYCLE_SPRINT,
+            executed_lifecycle_stage=engine.LIFECYCLE_SPRINT,
+            executed_strategy_fingerprint=engine.STRATEGY_FINGERPRINT,
+        )
+        decision = make_decision(
+            0.0,
+            lifecycle_stage=engine.LIFECYCLE_GLIDE_225,
+        )
+        plan = actionable_plan(
+            decision.target_weights,
+            reason="LIFECYCLE_STAGE_ADVANCE",
+        )
+        run = make_run(state=state, decision=decision, plan=plan)
+        notice = engine.decide_notification(run)
+        self.assertEqual(notice.kind, "ACTION")
+        engine.prepare_notification_delivery(run, notice)
+        self.assertEqual(
+            state.pending_recommendation_lifecycle_stage,
+            engine.LIFECYCLE_GLIDE_225,
+        )
+        engine.persist_signal_run(run)
+        persisted = engine.load_state()
+        self.assertEqual(
+            persisted.lifecycle_stage,
+            engine.LIFECYCLE_GLIDE_225,
+        )
+        self.assertEqual(
+            persisted.pending_recommendation_lifecycle_stage,
+            engine.LIFECYCLE_GLIDE_225,
+        )
+
     def test_identical_delivered_pending_action_is_suppressed(self):
-        weights = engine.target_weights(0.20)
+        weights = engine.target_weights(0.25)
         state = self.pending_state(weights)
         run = make_run(
             state=state,
-            decision=make_decision(0.20),
+            decision=make_decision(0.25),
             plan=actionable_plan(weights),
         )
         self.assertEqual(engine.decide_notification(run).kind, "NONE")
 
     def test_undelivered_identical_action_retries_exact_destination(self):
-        weights = engine.target_weights(0.20)
+        weights = engine.target_weights(0.25)
         state = self.pending_state(weights, notified=False)
         plan = actionable_plan(weights)
         preserved = engine.preserve_pending_delivery_plan(
@@ -1069,13 +1323,13 @@ class NotificationTests(EngineTestCase):
         self.assertEqual(preserved.reason, "PENDING_DELIVERY_RETRY")
         run = make_run(
             state=state,
-            decision=make_decision(0.20),
+            decision=make_decision(0.25),
             plan=preserved,
         )
         self.assertEqual(engine.decide_notification(run).kind, "RETRY")
 
     def test_material_update_replaces_pending_action(self):
-        state = self.pending_state(engine.target_weights(0.10))
+        state = self.pending_state(engine.target_weights(0.15))
         run = make_run(
             state=state,
             decision=make_decision(0.25),
@@ -1094,8 +1348,8 @@ class NotificationTests(EngineTestCase):
         )
 
     def test_cancellation_is_one_time_and_clears_pending_after_delivery(self):
-        state = self.pending_state(engine.target_weights(0.20))
-        run = make_run(state=state, decision=make_decision(0.20))
+        state = self.pending_state(engine.target_weights(0.25))
+        run = make_run(state=state, decision=make_decision(0.25))
         notice = engine.decide_notification(run)
         self.assertEqual(notice.kind, "CANCELLATION")
         with mock.patch.object(engine, "save_state"):
@@ -1111,10 +1365,10 @@ class NotificationTests(EngineTestCase):
         state = engine.PortfolioState(
             shares={engine.LEVERAGED_INDEX: 10.0},
         )
-        weights = engine.target_weights(0.20)
+        weights = engine.target_weights(0.25)
         run = make_run(
             state=state,
-            decision=make_decision(0.20),
+            decision=make_decision(0.25),
             plan=actionable_plan(weights),
         )
         notice = engine.decide_notification(run)
@@ -1135,7 +1389,7 @@ class NotificationTests(EngineTestCase):
         self.assertFalse(persisted.pending_recommendation_notified)
         self.assertEqual(
             persisted.pending_recommendation_soxl_weight,
-            0.20,
+            0.25,
         )
 
     def test_missing_credentials_fail_only_for_actual_notification(self):
@@ -1180,10 +1434,10 @@ class NotificationTests(EngineTestCase):
 
     def test_delivery_evidence_survives_later_audit_failure(self):
         state = engine.PortfolioState(shares={engine.LEVERAGED_INDEX: 10.0})
-        weights = engine.target_weights(0.20)
+        weights = engine.target_weights(0.25)
         run = make_run(
             state=state,
-            decision=make_decision(0.20),
+            decision=make_decision(0.25),
             plan=actionable_plan(weights),
         )
         notice = engine.decide_notification(run)

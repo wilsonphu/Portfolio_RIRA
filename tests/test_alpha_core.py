@@ -217,6 +217,29 @@ class VarianceModelTests(unittest.TestCase):
 
 
 class VolatilitySizingTests(unittest.TestCase):
+    def test_soxl_allocations_are_only_the_four_frozen_tiers(self):
+        self.assertEqual(alpha.SOXL_WEIGHT_GRID, (0.0, 0.15, 0.25, 0.35))
+        self.assertEqual(alpha.floor_soxl_tier(0.20), 0.15)
+        self.assertEqual(alpha.floor_soxl_tier(0.30), 0.25)
+        with self.assertRaisesRegex(ValueError, "strategic tier"):
+            alpha.target_weights(0.20)
+
+    def test_each_soxl_tier_is_reachable_from_the_volatility_budget(self):
+        cases = (
+            (0.50, 1.00, 0.0),
+            (0.30, 1.50, 0.15),
+            (0.40, 1.00, 0.25),
+            (0.30, 0.60, 0.35),
+        )
+        for qld_volatility, soxl_volatility, expected in cases:
+            with self.subTest(expected=expected):
+                selected, _ = alpha.choose_soxl_weight(
+                    qld_volatility,
+                    soxl_volatility,
+                    0.80,
+                )
+                self.assertEqual(selected, expected)
+
     def test_correlation_uses_the_maximum_available_finite_window(self):
         self.assertEqual(
             alpha.conservative_finite_correlation(np.nan, 0.82),
@@ -357,10 +380,10 @@ class OverlayTransitionTests(unittest.TestCase):
             signal_date=pd.Timestamp("2026-08-04"),
             trend_positive=True,
             residual_positive=True,
-            raw_soxl_weight=0.20,
+            raw_soxl_weight=0.25,
             alpha_review_due=False,
         )
-        self.assertEqual(downshift.state.soxl_weight, 0.20)
+        self.assertEqual(downshift.state.soxl_weight, 0.25)
         self.assertEqual(downshift.reason, "VOLATILITY_DOWNSHIFT")
 
         exited = alpha.advance_overlay_state(
@@ -379,7 +402,7 @@ class OverlayTransitionTests(unittest.TestCase):
         state = alpha.OverlayState(
             overlay_active=True,
             eligible_streak=5,
-            soxl_weight=0.10,
+            soxl_weight=0.15,
             last_processed_signal_date="2026-08-02",
         )
         for offset, date_text in enumerate(
@@ -391,11 +414,11 @@ class OverlayTransitionTests(unittest.TestCase):
                 signal_date=pd.Timestamp(date_text),
                 trend_positive=True,
                 residual_positive=True,
-                raw_soxl_weight=0.30,
+                raw_soxl_weight=0.35,
                 alpha_review_due=False,
             )
             state = transition.state
-            self.assertEqual(state.soxl_weight, 0.10)
+            self.assertEqual(state.soxl_weight, 0.15)
             self.assertEqual(state.pending_scale_days, offset)
             self.assertEqual(transition.reason, "VOLATILITY_UPSHIFT_PENDING")
 
@@ -404,10 +427,10 @@ class OverlayTransitionTests(unittest.TestCase):
             signal_date=pd.Timestamp("2026-08-07"),
             trend_positive=True,
             residual_positive=True,
-            raw_soxl_weight=0.30,
+            raw_soxl_weight=0.35,
             alpha_review_due=False,
         )
-        self.assertEqual(fifth.state.soxl_weight, 0.30)
+        self.assertEqual(fifth.state.soxl_weight, 0.35)
         self.assertEqual(fifth.state.pending_scale_days, 0)
         self.assertEqual(fifth.reason, "VOLATILITY_UPSHIFT")
 
