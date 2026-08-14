@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Production TQQQ/UGL-core with a residual-momentum SOXL overlay.
+"""Production lifecycle Roth allocation engine.
 
 Signals are calculated from completed, adjusted daily bars. The permanent core
-is 65% TQQQ / 35% UGL; a volatility-sized SOXL overlay is admitted only by the
-frozen QQQ-trend and SMH-residual-strength rules. The existing QLD/SOXL HAR
-volatility pair remains the conservative sizing signal validated by research.
+starts at 65% TQQQ / 35% UGL; a volatility-sized SOXL overlay is admitted only
+by the frozen QQQ-trend and SMH-residual-strength rules. As portfolio value and
+investor age advance, a one-way lifecycle ratchet replaces 3x products with
+2x/1x equivalents while preserving the model's risk-source proportions.
 Confirmed broker shares and cash are always the source of truth.
 """
 
@@ -42,11 +43,61 @@ VOLATILITY_INDEX = core.QLD
 LEVERAGED_INDEX = "TQQQ"
 LEVERAGED_GOLD = "UGL"
 LEVERAGED_SEMICONDUCTOR = core.SOXL
+DOUBLE_SEMICONDUCTOR = "USD"
+UNLEVERAGED_INDEX = "QQQM"
+UNLEVERAGED_GOLD = "GLDM"
+UNLEVERAGED_SEMICONDUCTOR = core.SMH
+TREASURY_RESERVE = "SGOV"
 CASH_ASSET = core.CASH
 
 CORE_TQQQ_SHARE = 0.65
 CORE_UGL_SHARE = 0.35
 MAX_ADVERTISED_DAILY_EXPOSURE = 2.7725
+
+LIFECYCLE_SPRINT = "SPRINT"
+LIFECYCLE_GLIDE_225 = "GLIDE_225"
+LIFECYCLE_TWO_X = "TWO_X"
+LIFECYCLE_PHI = "PHI"
+LIFECYCLE_ONE_THREE = "ONE_THREE"
+LIFECYCLE_ONE_X = "ONE_X"
+LIFECYCLE_RETIREMENT = "RETIREMENT"
+LIFECYCLE_STAGES = (
+    LIFECYCLE_SPRINT,
+    LIFECYCLE_GLIDE_225,
+    LIFECYCLE_TWO_X,
+    LIFECYCLE_PHI,
+    LIFECYCLE_ONE_THREE,
+    LIFECYCLE_ONE_X,
+    LIFECYCLE_RETIREMENT,
+)
+LIFECYCLE_EXPOSURE_CEILINGS = {
+    LIFECYCLE_SPRINT: None,
+    LIFECYCLE_GLIDE_225: 2.25,
+    LIFECYCLE_TWO_X: 2.0,
+    LIFECYCLE_PHI: (1.0 + 5.0**0.5) / 2.0,
+    LIFECYCLE_ONE_THREE: 1.30,
+    LIFECYCLE_ONE_X: 1.0,
+    LIFECYCLE_RETIREMENT: 0.75,
+}
+# Portfolio milestones are stated in 2026 dollars and automatically indexed.
+LIFECYCLE_VALUE_THRESHOLDS_2026 = (
+    (100_000.0, LIFECYCLE_GLIDE_225),
+    (150_000.0, LIFECYCLE_TWO_X),
+    (250_000.0, LIFECYCLE_PHI),
+    (500_000.0, LIFECYCLE_ONE_THREE),
+    (1_000_000.0, LIFECYCLE_ONE_X),
+)
+LIFECYCLE_AGE_THRESHOLDS = (
+    (35.0, LIFECYCLE_GLIDE_225),
+    (40.0, LIFECYCLE_TWO_X),
+    (45.0, LIFECYCLE_PHI),
+    (50.0, LIFECYCLE_ONE_THREE),
+    (55.0, LIFECYCLE_ONE_X),
+    (59.5, LIFECYCLE_RETIREMENT),
+)
+LIFECYCLE_INFLATION_RATE = 0.025
+LIFECYCLE_ANCHOR_DATE = date(2026, 8, 14)
+LIFECYCLE_ANCHOR_AGE = 23.0
 
 # These products can appear in confirmed pre-v8 holdings and must remain
 # priceable until they are explicitly sold.  They are never strategic targets.
@@ -55,11 +106,9 @@ LEGACY_DEFENSIVE_EQUITY = "SPMO"
 LEGACY_HEDGE = "GLD"
 LEGACY_HOLDINGS = frozenset(
     {
-        VOLATILITY_INDEX,
         LEGACY_TECH,
         LEGACY_DEFENSIVE_EQUITY,
         LEGACY_HEDGE,
-        SEMICONDUCTOR_SIGNAL,
     }
 )
 
@@ -69,16 +118,36 @@ STRATEGIC_TICKERS = (
     LEVERAGED_INDEX,
     LEVERAGED_GOLD,
     LEVERAGED_SEMICONDUCTOR,
+    VOLATILITY_INDEX,
+    DOUBLE_SEMICONDUCTOR,
+    UNLEVERAGED_INDEX,
+    UNLEVERAGED_GOLD,
+    UNLEVERAGED_SEMICONDUCTOR,
+    TREASURY_RESERVE,
 )
-EQUITY_TICKERS = (LEVERAGED_INDEX, LEVERAGED_SEMICONDUCTOR)
-MODEL_TICKERS = tuple(
-    dict.fromkeys((*SIGNAL_TICKERS, *VOLATILITY_TICKERS, *STRATEGIC_TICKERS))
+EQUITY_TICKERS = (
+    LEVERAGED_INDEX,
+    LEVERAGED_SEMICONDUCTOR,
+    VOLATILITY_INDEX,
+    DOUBLE_SEMICONDUCTOR,
+    UNLEVERAGED_INDEX,
+    UNLEVERAGED_SEMICONDUCTOR,
 )
+SEMICONDUCTOR_HOLDINGS = (
+    LEVERAGED_SEMICONDUCTOR,
+    DOUBLE_SEMICONDUCTOR,
+    UNLEVERAGED_SEMICONDUCTOR,
+)
+# Newer lifecycle holdings need only a valid latest price. They are deliberately
+# excluded from complete-history model validation and cannot affect signals.
+MODEL_TICKERS = tuple(dict.fromkeys((*SIGNAL_TICKERS, *VOLATILITY_TICKERS)))
 VALUATION_TICKERS = tuple(
     sorted(set(STRATEGIC_TICKERS) | set(LEGACY_HOLDINGS))
 )
 ALL_TICKERS = tuple(
-    dict.fromkeys((*MODEL_TICKERS, *sorted(LEGACY_HOLDINGS)))
+    dict.fromkeys(
+        (*MODEL_TICKERS, *STRATEGIC_TICKERS, *sorted(LEGACY_HOLDINGS))
+    )
 )
 TRADED_TICKERS = frozenset(VALUATION_TICKERS)
 PORTFOLIO_COMPONENTS = TRADED_TICKERS | {CASH_ASSET}
@@ -92,10 +161,10 @@ TRANSACTION_COST_SCENARIOS_BPS = (5, 10, 25)
 MODEL_START_DATE = core.MODEL_HISTORY_START
 REQUIRED_SIGNAL_ROWS = 840
 
-STRATEGY_REVISION = "tqqq65-ugl35-soxl-tiered-residual-vol55-v3"
+STRATEGY_REVISION = "tqqq65-ugl35-soxl-tiered-lifecycle-v4"
 EXPERIMENTAL_LIVE = True
-STATE_VERSION = 12
-DECISION_AUDIT_SCHEMA_VERSION = 3
+STATE_VERSION = 13
+DECISION_AUDIT_SCHEMA_VERSION = 4
 SHADOW_LEDGER_SCHEMA_VERSION = 1
 NEW_YORK = ZoneInfo("America/New_York")
 MARKET_CLOSE_BUFFER_MINUTES = 15
@@ -111,6 +180,10 @@ ADVERTISED_DAILY_MULTIPLIERS = {
     LEVERAGED_INDEX: 3.0,
     LEVERAGED_GOLD: 2.0,
     LEVERAGED_SEMICONDUCTOR: 3.0,
+    DOUBLE_SEMICONDUCTOR: 2.0,
+    UNLEVERAGED_INDEX: 1.0,
+    UNLEVERAGED_GOLD: 1.0,
+    TREASURY_RESERVE: 0.0,
     SEMICONDUCTOR_SIGNAL: 1.0,
     LEGACY_TECH: 3.0,
     LEGACY_DEFENSIVE_EQUITY: 1.0,
@@ -119,7 +192,7 @@ ADVERTISED_DAILY_MULTIPLIERS = {
 }
 
 
-def target_weights(soxl_weight: float) -> dict[str, float]:
+def aggressive_target_weights(soxl_weight: float) -> dict[str, float]:
     """Return the frozen proportional TQQQ/UGL core plus SOXL overlay."""
     # Reuse the audited core validator and grid boundary without inheriting its
     # legacy QLD allocation.
@@ -136,8 +209,85 @@ def target_weights(soxl_weight: float) -> dict[str, float]:
     return result
 
 
-def strategic_daily_exposure(soxl_weight: float) -> float:
-    return advertised_daily_exposure(target_weights(soxl_weight))
+def _risk_source_weights(soxl_weight: float) -> tuple[dict[str, float], float]:
+    aggressive = aggressive_target_weights(soxl_weight)
+    source_exposure = {
+        "nasdaq": 3.0 * aggressive[LEVERAGED_INDEX],
+        "gold": 2.0 * aggressive[LEVERAGED_GOLD],
+        "semiconductors": 3.0 * aggressive[LEVERAGED_SEMICONDUCTOR],
+    }
+    total = float(sum(source_exposure.values()))
+    if not np.isfinite(total) or total <= 0:
+        raise RuntimeError("Aggressive source exposure is invalid")
+    return (
+        {name: value / total for name, value in source_exposure.items()},
+        total,
+    )
+
+
+def _blend_weights(
+    left: dict[str, float],
+    right: dict[str, float],
+    left_fraction: float,
+) -> dict[str, float]:
+    fraction = float(left_fraction)
+    if not np.isfinite(fraction) or fraction < 0 or fraction > 1:
+        raise ValueError("Blend fraction must be in [0, 1]")
+    result = {
+        ticker: fraction * left.get(ticker, 0.0)
+        + (1.0 - fraction) * right.get(ticker, 0.0)
+        for ticker in set(left) | set(right)
+    }
+    return {ticker: weight for ticker, weight in result.items() if weight > 1e-12}
+
+
+def target_weights(
+    soxl_weight: float,
+    lifecycle_stage: str = LIFECYCLE_SPRINT,
+) -> dict[str, float]:
+    """Map the alpha sleeves into the delivery leverage for a lifecycle stage."""
+    if lifecycle_stage not in LIFECYCLE_STAGES:
+        raise ValueError(f"Unknown lifecycle stage: {lifecycle_stage!r}")
+    aggressive = aggressive_target_weights(soxl_weight)
+    if lifecycle_stage == LIFECYCLE_SPRINT:
+        return aggressive
+
+    sources, aggressive_exposure = _risk_source_weights(soxl_weight)
+    double = {
+        VOLATILITY_INDEX: sources["nasdaq"],
+        LEVERAGED_GOLD: sources["gold"],
+        DOUBLE_SEMICONDUCTOR: sources["semiconductors"],
+    }
+    single = {
+        UNLEVERAGED_INDEX: sources["nasdaq"],
+        UNLEVERAGED_GOLD: sources["gold"],
+        UNLEVERAGED_SEMICONDUCTOR: sources["semiconductors"],
+    }
+    ceiling = LIFECYCLE_EXPOSURE_CEILINGS[lifecycle_stage]
+    if ceiling is None:
+        raise RuntimeError("Non-sprint lifecycle stage has no exposure ceiling")
+    if ceiling >= 2.0:
+        fraction = (ceiling - 2.0) / (aggressive_exposure - 2.0)
+        result = _blend_weights(aggressive, double, fraction)
+    elif ceiling >= 1.0:
+        result = _blend_weights(double, single, ceiling - 1.0)
+    else:
+        result = {
+            ticker: ceiling * weight for ticker, weight in single.items()
+        }
+        result[TREASURY_RESERVE] = 1.0 - ceiling
+    if not np.isclose(sum(result.values()), 1.0, atol=1e-12):
+        raise RuntimeError("Lifecycle target weights do not sum to 1.0")
+    if not np.isclose(advertised_daily_exposure(result), ceiling, atol=1e-12):
+        raise RuntimeError("Lifecycle target exposure does not match its ceiling")
+    return result
+
+
+def strategic_daily_exposure(
+    soxl_weight: float,
+    lifecycle_stage: str = LIFECYCLE_SPRINT,
+) -> float:
+    return advertised_daily_exposure(target_weights(soxl_weight, lifecycle_stage))
 
 
 def strategy_manifest() -> dict[str, object]:
@@ -191,6 +341,32 @@ def strategy_manifest() -> dict[str, object]:
             "maximum_advertised_daily_exposure": (
                 MAX_ADVERTISED_DAILY_EXPOSURE
             ),
+            "lifecycle": {
+                "stages": list(LIFECYCLE_STAGES),
+                "exposure_ceilings": LIFECYCLE_EXPOSURE_CEILINGS,
+                "value_thresholds_2026_dollars": [
+                    [threshold, stage]
+                    for threshold, stage in LIFECYCLE_VALUE_THRESHOLDS_2026
+                ],
+                "age_thresholds": [
+                    [age, stage] for age, stage in LIFECYCLE_AGE_THRESHOLDS
+                ],
+                "inflation_rate": LIFECYCLE_INFLATION_RATE,
+                "anchor_date": LIFECYCLE_ANCHOR_DATE.isoformat(),
+                "anchor_age": LIFECYCLE_ANCHOR_AGE,
+                "birth_date_override": "optional_INVESTOR_BIRTH_DATE",
+                "ratchet": "one_way_never_relever_after_stage_advance",
+                "mapping": {
+                    "nasdaq": [LEVERAGED_INDEX, VOLATILITY_INDEX, UNLEVERAGED_INDEX],
+                    "gold": [LEVERAGED_GOLD, UNLEVERAGED_GOLD],
+                    "semiconductors": [
+                        LEVERAGED_SEMICONDUCTOR,
+                        DOUBLE_SEMICONDUCTOR,
+                        UNLEVERAGED_SEMICONDUCTOR,
+                    ],
+                    "reserve": TREASURY_RESERVE,
+                },
+            },
         },
         "execution": {
             "signal": "completed_close",
@@ -254,7 +430,7 @@ def calculate_implementation_fingerprint() -> str:
 
 STRATEGY_FINGERPRINT = calculate_strategy_fingerprint()
 EXPECTED_STRATEGY_FINGERPRINT = (
-    "dfdca66d06fd7dc088a467f3822809be18006b7cc5baeda2ab99d4142fb8b9e2"
+    "0937d2798b9599d047170d473348393c0ef1ab324f10fdf5340d86323bb6dcce"
 )
 
 _configured_roth_amount = os.environ.get("ROTH_IRA_AMOUNT", "").strip()
@@ -324,6 +500,22 @@ class StrategyDecision:
     processed_signal_dates: tuple[str, ...] = ()
     transition_path: tuple[str, ...] = ()
     shadow_observations: tuple[ShadowObservation, ...] = ()
+    lifecycle_stage: str = LIFECYCLE_SPRINT
+    lifecycle_reason: str = ""
+    estimated_investor_age: float = LIFECYCLE_ANCHOR_AGE
+    lifecycle_value_stage: str = LIFECYCLE_SPRINT
+    lifecycle_age_stage: str = LIFECYCLE_SPRINT
+    lifecycle_stage_advanced: bool = False
+
+
+@dataclass(frozen=True)
+class LifecycleSelection:
+    stage: str
+    reason: str
+    estimated_age: float
+    value_stage: str
+    age_stage: str
+    advanced: bool
 
 
 @dataclass(frozen=True)
@@ -375,18 +567,22 @@ class PortfolioState:
     pending_scale_days: int = 0
     last_alpha_review_date: str = ""
     last_processed_signal_date: str = ""
+    lifecycle_stage: str = LIFECYCLE_SPRINT
+    lifecycle_stage_date: str = ""
     shadow_ledger_sessions: int = 0
     shadow_ledger_last_signal_date: str = ""
     shadow_ledger_chain_hash: str = ""
 
     executed_overlay_active: bool = False
     executed_soxl_weight: float = 0.0
+    executed_lifecycle_stage: str = LIFECYCLE_SPRINT
     executed_strategy_fingerprint: str = ""
 
     pending_recommendation_date: str = ""
     pending_recommendation_weights: dict[str, float] = field(default_factory=dict)
     pending_recommendation_overlay_active: bool = False
     pending_recommendation_soxl_weight: float = 0.0
+    pending_recommendation_lifecycle_stage: str = ""
     pending_recommendation_notified: bool = False
     pending_recommendation_supersedes_date: str = ""
     pending_recommendation_fingerprint: str = ""
@@ -463,6 +659,140 @@ def _with_cash_target(weights: dict[str, float]) -> dict[str, float]:
     return result
 
 
+def _lifecycle_rank(stage: str) -> int:
+    try:
+        return LIFECYCLE_STAGES.index(stage)
+    except ValueError as exc:
+        raise ValueError(f"Unknown lifecycle stage: {stage!r}") from exc
+
+
+def estimated_investor_age(as_of: date) -> float:
+    """Return exact configured age or the conservative dated age anchor."""
+    birth_date_text = os.environ.get("INVESTOR_BIRTH_DATE", "").strip()
+    if birth_date_text:
+        try:
+            birth_date = date.fromisoformat(birth_date_text)
+        except ValueError as exc:
+            raise RuntimeError(
+                "INVESTOR_BIRTH_DATE must use YYYY-MM-DD"
+            ) from exc
+        if birth_date >= as_of:
+            raise RuntimeError("INVESTOR_BIRTH_DATE must be before the signal date")
+        years = as_of.year - birth_date.year
+        try:
+            birthday = birth_date.replace(year=as_of.year)
+        except ValueError:
+            birthday = date(as_of.year, 2, 28)
+        if as_of < birthday:
+            years -= 1
+            try:
+                last_birthday = birth_date.replace(year=as_of.year - 1)
+            except ValueError:
+                last_birthday = date(as_of.year - 1, 2, 28)
+            next_birthday = birthday
+        else:
+            last_birthday = birthday
+            try:
+                next_birthday = birth_date.replace(year=as_of.year + 1)
+            except ValueError:
+                next_birthday = date(as_of.year + 1, 2, 28)
+        fraction = (as_of - last_birthday).days / (
+            next_birthday - last_birthday
+        ).days
+        return float(years + fraction)
+    return LIFECYCLE_ANCHOR_AGE + (
+        (as_of - LIFECYCLE_ANCHOR_DATE).days / 365.2425
+    )
+
+
+def lifecycle_inflation_factor(as_of: date) -> float:
+    years = (as_of - LIFECYCLE_ANCHOR_DATE).days / 365.2425
+    factor = (1.0 + LIFECYCLE_INFLATION_RATE) ** years
+    if not np.isfinite(factor) or factor <= 0:
+        raise RuntimeError("Lifecycle inflation factor is invalid")
+    return float(factor)
+
+
+def lifecycle_value_stage(portfolio_value: float, as_of: date) -> str:
+    if not np.isfinite(portfolio_value) or portfolio_value <= 0:
+        raise ValueError("Lifecycle portfolio value must be positive")
+    stage = LIFECYCLE_SPRINT
+    factor = lifecycle_inflation_factor(as_of)
+    for threshold, candidate in LIFECYCLE_VALUE_THRESHOLDS_2026:
+        if portfolio_value >= threshold * factor - 1e-9:
+            stage = candidate
+    return stage
+
+
+def lifecycle_age_stage(age: float) -> str:
+    if not np.isfinite(age) or age < 0:
+        raise ValueError("Investor age must be nonnegative and finite")
+    stage = LIFECYCLE_SPRINT
+    for threshold, candidate in LIFECYCLE_AGE_THRESHOLDS:
+        if age >= threshold - 1e-12:
+            stage = candidate
+    return stage
+
+
+def select_lifecycle_stage(
+    current_stage: str,
+    portfolio_value: float,
+    as_of: date,
+) -> LifecycleSelection:
+    """Apply value/age ceilings through a one-way safety ratchet."""
+    current_rank = _lifecycle_rank(current_stage)
+    age = estimated_investor_age(as_of)
+    value_stage = lifecycle_value_stage(portfolio_value, as_of)
+    age_stage = lifecycle_age_stage(age)
+    value_rank = _lifecycle_rank(value_stage)
+    age_rank = _lifecycle_rank(age_stage)
+    selected_rank = max(current_rank, value_rank, age_rank)
+    selected = LIFECYCLE_STAGES[selected_rank]
+    advanced = selected_rank > current_rank
+    if not advanced:
+        reason = "RATCHET_HOLD"
+    elif value_rank == selected_rank and age_rank == selected_rank:
+        reason = "VALUE_AND_AGE_MILESTONE"
+    elif age_rank == selected_rank:
+        reason = "AGE_CEILING"
+    else:
+        reason = "VALUE_MILESTONE"
+    return LifecycleSelection(
+        stage=selected,
+        reason=reason,
+        estimated_age=float(age),
+        value_stage=value_stage,
+        age_stage=age_stage,
+        advanced=advanced,
+    )
+
+
+def apply_lifecycle_policy(
+    decision: StrategyDecision,
+    state: PortfolioState,
+    portfolio_value: float,
+    signal_date: pd.Timestamp,
+) -> StrategyDecision:
+    selection = select_lifecycle_stage(
+        state.lifecycle_stage,
+        portfolio_value,
+        pd.Timestamp(signal_date).date(),
+    )
+    return replace(
+        decision,
+        target_weights=target_weights(
+            decision.overlay_state.soxl_weight,
+            selection.stage,
+        ),
+        lifecycle_stage=selection.stage,
+        lifecycle_reason=selection.reason,
+        estimated_investor_age=selection.estimated_age,
+        lifecycle_value_stage=selection.value_stage,
+        lifecycle_age_stage=selection.age_stage,
+        lifecycle_stage_advanced=selection.advanced,
+    )
+
+
 def _validate_weight_mapping(
     weights: object,
     field_name: str,
@@ -519,6 +849,26 @@ def validate_configuration() -> None:
         atol=1e-12,
     ):
         raise RuntimeError("Advertised exposure invariant failed")
+    if tuple(stage for _, stage in LIFECYCLE_VALUE_THRESHOLDS_2026) != (
+        LIFECYCLE_GLIDE_225,
+        LIFECYCLE_TWO_X,
+        LIFECYCLE_PHI,
+        LIFECYCLE_ONE_THREE,
+        LIFECYCLE_ONE_X,
+    ):
+        raise RuntimeError("Lifecycle value-stage order is invalid")
+    for soxl_weight in core.SOXL_WEIGHT_GRID:
+        for stage in LIFECYCLE_STAGES:
+            weights = target_weights(soxl_weight, stage)
+            if not np.isclose(sum(weights.values()), 1.0, atol=1e-12):
+                raise RuntimeError("Lifecycle allocation invariant failed")
+            ceiling = LIFECYCLE_EXPOSURE_CEILINGS[stage]
+            if ceiling is not None and not np.isclose(
+                advertised_daily_exposure(weights),
+                ceiling,
+                atol=1e-12,
+            ):
+                raise RuntimeError("Lifecycle exposure invariant failed")
 
 
 def validate_state(state: PortfolioState) -> None:
@@ -565,6 +915,8 @@ def validate_state(state: PortfolioState) -> None:
         raise RuntimeError("An inactive overlay cannot retain SOXL weight")
     if state.pending_scale_days == 0 and state.pending_soxl_weight != 0.0:
         raise RuntimeError("A pending SOXL weight requires pending scale days")
+    if state.lifecycle_stage not in LIFECYCLE_STAGES:
+        raise RuntimeError("lifecycle_stage is invalid")
     if (
         not isinstance(state.shadow_ledger_sessions, int)
         or isinstance(state.shadow_ledger_sessions, bool)
@@ -590,6 +942,8 @@ def validate_state(state: PortfolioState) -> None:
         and state.executed_soxl_weight != 0.0
     ):
         raise RuntimeError("Inactive executed metadata cannot retain SOXL weight")
+    if state.executed_lifecycle_stage not in LIFECYCLE_STAGES:
+        raise RuntimeError("executed_lifecycle_stage is invalid")
     if state.executed_strategy_fingerprint and not _is_sha256(
         state.executed_strategy_fingerprint
     ):
@@ -624,10 +978,13 @@ def validate_state(state: PortfolioState) -> None:
             raise RuntimeError("Pending recommendation is missing weights")
         if not _is_sha256(state.pending_recommendation_fingerprint):
             raise RuntimeError("Pending recommendation fingerprint is invalid")
+        if state.pending_recommendation_lifecycle_stage not in LIFECYCLE_STAGES:
+            raise RuntimeError("Pending lifecycle stage is invalid")
     elif (
         state.pending_recommendation_weights
         or state.pending_recommendation_overlay_active
         or state.pending_recommendation_soxl_weight != 0.0
+        or state.pending_recommendation_lifecycle_stage
         or state.pending_recommendation_notified
         or state.pending_recommendation_supersedes_date
         or state.pending_recommendation_fingerprint
@@ -637,6 +994,7 @@ def validate_state(state: PortfolioState) -> None:
     today = datetime.now(NEW_YORK).date()
     for name in (
         "soxl_weight_date",
+        "lifecycle_stage_date",
         "last_alpha_review_date",
         "last_processed_signal_date",
         "shadow_ledger_last_signal_date",
@@ -733,16 +1091,16 @@ def _migrate_state_payload(
     backup = _backup_legacy_state(version) if backup_legacy else None
     migrated = asdict(PortfolioState())
 
-    # Versions 8-11 already contain the complete production state machine and
-    # outbox. Version 12 replaces the old five-point sizing grid with four
-    # deliberate tiers. Broker facts and pending-action evidence remain exact;
-    # only the live model state is conservatively mapped down to a valid tier.
+    # Versions 8-12 already contain the complete production state machine and
+    # outbox. Version 13 adds the monotonic lifecycle ratchet. Broker facts and
+    # pending-action evidence remain exact; older actions begin in SPRINT and
+    # are intentionally reconsidered under the new strategy fingerprint.
     #
     # Versions 8 and 9 fingerprinted the retired QLD/SOXL universe. That hash
     # cannot be compared with the expanded TQQQ/UGL universe on a same-date
     # deployment, so retain the processed date but begin a new data-hash
     # lineage. Versions 10 and 11 used the current universe and keep the hash.
-    if numeric_version in {8, 9, 10, 11}:
+    if numeric_version in {8, 9, 10, 11, 12}:
         for name in set(migrated) & set(payload):
             migrated[name] = payload[name]
         if numeric_version in {8, 9}:
@@ -759,6 +1117,10 @@ def _migrate_state_payload(
         ):
             migrated["pending_soxl_weight"] = 0.0
             migrated["pending_scale_days"] = 0
+        if migrated["pending_recommendation_date"]:
+            migrated["pending_recommendation_lifecycle_stage"] = (
+                LIFECYCLE_SPRINT
+            )
         migrated["state_version"] = STATE_VERSION
         logger.warning(
             "Migrated state version %r to version %s; backup=%s",
@@ -798,6 +1160,7 @@ def _migrate_state_payload(
         if name in payload:
             migrated[name] = payload[name]
     if migrated["pending_recommendation_date"]:
+        migrated["pending_recommendation_lifecycle_stage"] = LIFECYCLE_SPRINT
         if not _is_sha256(migrated["pending_recommendation_fingerprint"]):
             # Old outbox schemas could stage an action without recording its
             # strategy identity.  A fixed legacy identity preserves the action
@@ -862,10 +1225,12 @@ def save_state(state: PortfolioState) -> None:
     temporary.write_text(payload, encoding="utf-8")
     os.replace(temporary, STATE_FILE)
     logger.info(
-        "State saved: holdings=%s overlay=%s SOXL=%.0f%% pending=%s notified=%s",
+        "State saved: holdings=%s overlay=%s SOXL=%.0f%% lifecycle=%s "
+        "pending=%s notified=%s",
         len(state.shares),
         state.overlay_active,
         state.soxl_weight * 100.0,
+        state.lifecycle_stage,
         state.pending_recommendation_date or "NONE",
         state.pending_recommendation_notified,
     )
@@ -1145,6 +1510,22 @@ def _apply_overlay_state(
     state.pending_scale_days = overlay.pending_scale_days
     state.last_alpha_review_date = overlay.last_alpha_review_date
     state.last_processed_signal_date = overlay.last_processed_signal_date
+
+
+def _apply_lifecycle_state(
+    state: PortfolioState,
+    decision: StrategyDecision,
+    signal_date: pd.Timestamp,
+) -> None:
+    if decision.lifecycle_stage not in LIFECYCLE_STAGES:
+        raise RuntimeError("Decision lifecycle stage is invalid")
+    if _lifecycle_rank(decision.lifecycle_stage) < _lifecycle_rank(
+        state.lifecycle_stage
+    ):
+        raise RuntimeError("Lifecycle ratchet cannot move to a riskier stage")
+    if decision.lifecycle_stage != state.lifecycle_stage:
+        state.lifecycle_stage = decision.lifecycle_stage
+        state.lifecycle_stage_date = pd.Timestamp(signal_date).date().isoformat()
 
 
 def _calculate_latest_strategy_decision(
@@ -1532,19 +1913,23 @@ def build_rebalance_plan(
     strategy_changed = (
         state.executed_strategy_fingerprint != STRATEGY_FINGERPRINT
     )
+    lifecycle_changed = (
+        state.executed_lifecycle_stage != decision.lifecycle_stage
+    )
     structure_changed = (
         state.executed_overlay_active != decision.overlay_state.overlay_active
         or abs(
             state.executed_soxl_weight - decision.overlay_state.soxl_weight
         )
         > 1e-12
+        or lifecycle_changed
     )
     legacy_exit = any(
         existing.get(ticker, 0.0) > 1e-12 for ticker in LEGACY_HOLDINGS
     )
     risk_off_residual_exit = (
-        existing.get(LEVERAGED_SEMICONDUCTOR, 0.0) > 1e-12
-        and target.get(LEVERAGED_SEMICONDUCTOR, 0.0) <= 1e-12
+        any(existing.get(ticker, 0.0) > 1e-12 for ticker in SEMICONDUCTOR_HOLDINGS)
+        and not any(target.get(ticker, 0.0) > 1e-12 for ticker in SEMICONDUCTOR_HOLDINGS)
     )
     individual, aggregate = drift_triggers(
         existing,
@@ -1564,6 +1949,8 @@ def build_rebalance_plan(
         reason = "LEGACY_POSITION_EXIT"
     elif risk_off_residual_exit:
         reason = "RISK_OFF_RESIDUAL_EXIT"
+    elif lifecycle_changed:
+        reason = "LIFECYCLE_STAGE_ADVANCE"
     elif structure_changed:
         reason = decision.transition_reason
     elif individual:
@@ -1581,10 +1968,9 @@ def build_rebalance_plan(
             destination=rebalance_destination,
             trigger_band=rebalance_band,
             fixed_weights={
-                LEVERAGED_SEMICONDUCTOR: target.get(
-                    LEVERAGED_SEMICONDUCTOR,
-                    0.0,
-                )
+                ticker: target.get(ticker, 0.0)
+                for ticker in SEMICONDUCTOR_HOLDINGS
+                if ticker in set(existing) | set(target)
             },
         )
     if rebalance_due:
@@ -1806,13 +2192,20 @@ def run_strategy(
     fingerprint = market_data_fingerprint(price_data)
     state = load_state(backup_legacy=backup_legacy_state)
     validate_same_date_data_fingerprint(state, signal_date, fingerprint)
-    decision = calculate_strategy_decision(price_data, state)
     portfolio_value, planning = resolve_portfolio_value(
         roth_amount,
         state,
         price_data,
     )
+    decision = calculate_strategy_decision(price_data, state)
+    decision = apply_lifecycle_policy(
+        decision,
+        state,
+        portfolio_value,
+        signal_date,
+    )
     _apply_overlay_state(planning, decision.overlay_state)
+    _apply_lifecycle_state(planning, decision, signal_date)
     current_weights = existing_weights(planning, price_data)
     plan = build_rebalance_plan(current_weights, decision, planning)
     plan = preserve_pending_delivery_plan(plan, state, current_weights)
@@ -1862,6 +2255,8 @@ def _pending_recommendation_matches(strategy_run: StrategyRun) -> bool:
             state.pending_recommendation_soxl_weight - overlay.soxl_weight
         )
         <= 1e-12
+        and state.pending_recommendation_lifecycle_stage
+        == strategy_run.decision.lifecycle_stage
         and _weights_close(
             state.pending_recommendation_weights,
             strategy_run.rebalance_plan.execution_weights,
@@ -1917,6 +2312,11 @@ def persist_signal_run(strategy_run: StrategyRun) -> None:
     if not state.shares and state.cash_balance == 0:
         state.cash_balance = strategy_run.planning_state.cash_balance
     _apply_overlay_state(state, strategy_run.decision.overlay_state)
+    _apply_lifecycle_state(
+        state,
+        strategy_run.decision,
+        strategy_run.signal_date,
+    )
     state.last_processed_signal_date = (
         strategy_run.signal_date.date().isoformat()
     )
@@ -1933,6 +2333,9 @@ def persist_signal_run(strategy_run: StrategyRun) -> None:
         )
         state.executed_soxl_weight = (
             strategy_run.decision.overlay_state.soxl_weight
+        )
+        state.executed_lifecycle_stage = (
+            strategy_run.decision.lifecycle_stage
         )
         state.executed_strategy_fingerprint = STRATEGY_FINGERPRINT
     save_state(state)
@@ -1956,6 +2359,9 @@ def prepare_notification_delivery(
         )
         state.pending_recommendation_overlay_active = overlay.overlay_active
         state.pending_recommendation_soxl_weight = overlay.soxl_weight
+        state.pending_recommendation_lifecycle_stage = (
+            strategy_run.decision.lifecycle_stage
+        )
         state.pending_recommendation_notified = False
         state.pending_recommendation_supersedes_date = (
             notification.previous_recommendation_date
@@ -2012,6 +2418,7 @@ def _clear_pending_recommendation(state: PortfolioState) -> None:
     state.pending_recommendation_weights = {}
     state.pending_recommendation_overlay_active = False
     state.pending_recommendation_soxl_weight = 0.0
+    state.pending_recommendation_lifecycle_stage = ""
     state.pending_recommendation_notified = False
     state.pending_recommendation_supersedes_date = ""
     state.pending_recommendation_fingerprint = ""
@@ -2064,6 +2471,9 @@ def confirm_execution(
         state.executed_soxl_weight = (
             state.pending_recommendation_soxl_weight
         )
+        state.executed_lifecycle_stage = (
+            state.pending_recommendation_lifecycle_stage
+        )
         state.executed_strategy_fingerprint = (
             state.pending_recommendation_fingerprint
         )
@@ -2071,6 +2481,7 @@ def confirm_execution(
         state.target_weights = {}
         state.executed_overlay_active = False
         state.executed_soxl_weight = 0.0
+        state.executed_lifecycle_stage = state.lifecycle_stage
         state.executed_strategy_fingerprint = ""
     _clear_pending_recommendation(state)
     save_state(state)
@@ -2104,7 +2515,8 @@ def log_decision(strategy_run: StrategyRun) -> None:
     logger.info(
         "decision signal_date=%s strategy=%s strategy_fp=%s data_fp=%s "
         "trend=%s residual_positive=%s raw_soxl=%.2f active=%s "
-        "soxl=%.2f transition=%s failure=%s rebalance=%s reason=%s "
+        "soxl=%.2f transition=%s lifecycle=%s lifecycle_reason=%s age=%.2f "
+        "failure=%s rebalance=%s reason=%s "
         "turnover=%.6f orders=%s current=%s target=%s destination=%s",
         strategy_run.signal_date.date(),
         STRATEGY_REVISION,
@@ -2116,6 +2528,9 @@ def log_decision(strategy_run: StrategyRun) -> None:
         decision.overlay_state.overlay_active,
         decision.overlay_state.soxl_weight,
         decision.transition_reason,
+        decision.lifecycle_stage,
+        decision.lifecycle_reason,
+        decision.estimated_investor_age,
         decision.failure_reason or "NONE",
         plan.rebalance_due,
         plan.reason,
@@ -2452,6 +2867,17 @@ def build_decision_audit(
         },
         "decision": {
             "transition_reason": decision.transition_reason,
+            "lifecycle": {
+                "stage": decision.lifecycle_stage,
+                "reason": decision.lifecycle_reason,
+                "stage_advanced": decision.lifecycle_stage_advanced,
+                "estimated_investor_age": decision.estimated_investor_age,
+                "value_stage": decision.lifecycle_value_stage,
+                "age_stage": decision.lifecycle_age_stage,
+                "exposure_ceiling": LIFECYCLE_EXPOSURE_CEILINGS[
+                    decision.lifecycle_stage
+                ],
+            },
             "processed_signal_dates": list(
                 decision.processed_signal_dates
             ),
@@ -2590,7 +3016,7 @@ def build_dashboard(strategy_run: StrategyRun) -> str:
     )
     lines = [
         "=" * 112,
-        "ROTH IRA — TQQQ/UGL CORE / SOXL ALPHA OVERLAY",
+        "ROTH IRA - LIFECYCLE ALPHA ALLOCATION",
         "=" * 112,
         (
             f"Signal close: {strategy_run.signal_date.date()} | "
@@ -2609,6 +3035,12 @@ def build_dashboard(strategy_run: StrategyRun) -> str:
             f"Volatility sizing: {sizing_volatility} | "
             f"raw SOXL {decision.raw_soxl_weight:.0%} | "
             f"state SOXL {decision.overlay_state.soxl_weight:.0%}"
+        ),
+        (
+            f"Lifecycle: {decision.lifecycle_stage} "
+            f"({decision.lifecycle_reason}) | estimated age "
+            f"{decision.estimated_investor_age:.1f} | value/age gates "
+            f"{decision.lifecycle_value_stage}/{decision.lifecycle_age_stage}"
         ),
         (
             f"Transition: {decision.transition_reason} | "
@@ -2667,9 +3099,10 @@ def build_dashboard(strategy_run: StrategyRun) -> str:
                 "next-session executable prices, then confirm complete holdings."
             ),
             (
-                f"Drift trigger/non-SOXL destination: {REBALANCE_BAND:.0%}/"
-                f"{REBALANCE_DESTINATION:.1%}; SOXL returns to its exact "
-                f"0/15/25/35% tier; cap {core.MAX_SOXL_WEIGHT:.0%}; "
+                f"Drift trigger/non-overlay destination: {REBALANCE_BAND:.0%}/"
+                f"{REBALANCE_DESTINATION:.1%}; the semiconductor sleeve "
+                "returns to its exact latent 0/15/25/35% source tier; "
+                f"cap {core.MAX_SOXL_WEIGHT:.0%}; "
                 "no margin or options."
             ),
             "=" * 112,
@@ -2759,11 +3192,12 @@ def build_email_html(
         "CANCELLATION": "PREVIOUS ACTION CANCELLED",
     }[notification.kind]
     return f"""<!doctype html><html><body style="font-family:Arial,sans-serif">
-<h2>ROTH IRA — TQQQ/UGL Core / SOXL Alpha Overlay (Experimental)</h2>
+<h2>ROTH IRA Lifecycle Alpha Allocation (Experimental)</h2>
 <p><strong>Research promotion_complete=false.</strong></p>
 <h3>{status}: {plan.reason}</h3>
 <p>Signal close {strategy_run.signal_date.date()} · Portfolio
-${strategy_run.portfolio_value:,.2f} · SOXL target
+${strategy_run.portfolio_value:,.2f} · Lifecycle stage
+{strategy_run.decision.lifecycle_stage} · Latent SOXL tier
 {strategy_run.decision.overlay_state.soxl_weight:.0%}</p>
 <table style="border-collapse:collapse" cellpadding="7">
 <tr><th>Ticker</th><th>Price</th><th>Current</th><th>Target</th>
@@ -2849,7 +3283,7 @@ def parse_signal_date(value: str | None) -> str | None:
 
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="ROTH IRA TQQQ/UGL-core/SOXL-overlay engine"
+        description="ROTH IRA lifecycle alpha allocation engine"
     )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(

@@ -1,8 +1,9 @@
 # Roth IRA production allocator
 
 This repository contains one production system: a stateful, notification-only
-TQQQ/UGL core with a bounded SOXL overlay. It does not connect to a broker or
-place trades automatically.
+TQQQ/UGL core with a bounded SOXL overlay and a permanent lifecycle
+deleveraging ratchet. It does not connect to a broker or place trades
+automatically.
 
 ## Strategy
 
@@ -32,17 +33,52 @@ that fits the risk budget. If 15% does not fit, SOXL remains at 0%. Any
 triggered rebalance returns SOXL to its exact strategic tier; other positions
 normally stop at the inner drift band.
 
+## Automatic lifecycle ratchet
+
+Portfolio value and investor age independently impose a maximum delivery
+leverage. The safer of the two rules wins. Once a stage advances, it never
+moves backward after a drawdown.
+
+| Stage | 2026-dollar value gate | Age gate | Advertised daily exposure |
+|---|---:|---:|---:|
+| `SPRINT` | below $100,000 | below 35 | current 2.65x-2.77x |
+| `GLIDE_225` | $100,000 | 35 | 2.25x |
+| `TWO_X` | $150,000 | 40 | 2.00x |
+| `PHI` | $250,000 | 45 | 1.618x |
+| `ONE_THREE` | $500,000 | 50 | 1.30x |
+| `ONE_X` | $1,000,000 | 55 | 1.00x |
+| `RETIREMENT` | age only | 59.5 | 0.75x plus 25% SGOV |
+
+Value gates are indexed at 2.5% annually from August 14, 2026, so they retain
+roughly constant purchasing power. The default age estimate starts at age 23
+on that date. Set the optional `INVESTOR_BIRTH_DATE` repository secret in
+`YYYY-MM-DD` format for exact age boundaries.
+
+The alpha model still determines the Nasdaq/gold/semiconductor source mix. The
+lifecycle layer changes only how that exposure is delivered:
+
+- Nasdaq: TQQQ to QLD to QQQM.
+- Gold: UGL to a UGL/GLDM blend to GLDM.
+- Semiconductors: SOXL to USD to SMH.
+- Retirement reserve: SGOV.
+
+Between integer leverage levels the engine blends adjacent products to hit the
+stage ceiling exactly. It does not silently switch the Nasdaq thesis to the
+S&P 500. Lifecycle transitions are structural actions, bypass the drift band,
+and generate one email with the complete destination portfolio.
+
 The strategy is deployed to production by investor authorization. Historical
-backtests are not evidence that its return advantage will persist. A roughly
-two-thirds portfolio drawdown remains plausible.
+backtests are not evidence that its return advantage will persist. Before the
+first lifecycle milestone, a roughly two-thirds portfolio drawdown remains
+plausible. Deleveraging is a risk-control rule, not an additional alpha claim.
 
 ## Portfolio state and notifications
 
 Confirmed broker shares and cash—not calculated target weights—are the sole
 source of truth. The engine rebalances only for a structural change, a
 five-percentage-point individual drift, or a five-point aggregate equity
-drift. SOXL returns to its exact strategic tier; other positions normally
-trade back to the inner 2.5-point band.
+drift. The active semiconductor delivery sleeve returns to the exact latent
+SOXL tier; other positions normally trade back to the inner 2.5-point band.
 
 Ordinary HOLD runs are silent. Email is sent only for a new action, a material
 update, a one-time cancellation, or a delivery retry. Every unseen completed
@@ -81,6 +117,8 @@ broker holdings. Never use `ROTH_IRA_AMOUNT` to replace existing state.
 - `GMAIL_ADDRESS`: notification sender.
 - `GMAIL_APP_PASSWORD`: Gmail app password.
 - `RECEIVER_EMAIL`: notification recipient.
+- `INVESTOR_BIRTH_DATE`: optional exact birth date in `YYYY-MM-DD`; otherwise
+  the dated age-23 anchor is used.
 
 State, holdings, balances, addresses, and credentials must never be committed.
 Production state is restored from and saved to the `roth-ira-state` workflow

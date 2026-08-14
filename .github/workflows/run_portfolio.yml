@@ -305,6 +305,7 @@ jobs:
           DISPATCH_RUN_MODE: ${{ inputs.run_mode }}
           EXECUTED_SIGNAL_DATE_INPUT: ${{ inputs.executed_signal_date }}
           EXECUTED_SHARES_INPUT: ${{ inputs.executed_shares }}
+          INVESTOR_BIRTH_DATE: ${{ secrets.INVESTOR_BIRTH_DATE }}
           GMAIL_ADDRESS: >-
             ${{
               (github.event_name == 'schedule' ||
