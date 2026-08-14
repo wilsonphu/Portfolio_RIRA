@@ -92,9 +92,9 @@ TRANSACTION_COST_SCENARIOS_BPS = (5, 10, 25)
 MODEL_START_DATE = core.MODEL_HISTORY_START
 REQUIRED_SIGNAL_ROWS = 840
 
-STRATEGY_REVISION = "tqqq65-ugl35-soxl-residual-vol55-v2"
+STRATEGY_REVISION = "tqqq65-ugl35-soxl-tiered-residual-vol55-v3"
 EXPERIMENTAL_LIVE = True
-STATE_VERSION = 11
+STATE_VERSION = 12
 DECISION_AUDIT_SCHEMA_VERSION = 3
 SHADOW_LEDGER_SCHEMA_VERSION = 1
 NEW_YORK = ZoneInfo("America/New_York")
@@ -197,7 +197,8 @@ def strategy_manifest() -> dict[str, object]:
             "fill": "next_session",
             "missed_sessions": "replay_all_unseen_completed_sessions",
             "drift_trigger": REBALANCE_BAND,
-            "drift_destination": REBALANCE_DESTINATION,
+            "non_soxl_drift_destination": REBALANCE_DESTINATION,
+            "soxl_drift_destination": "exact_strategic_tier",
             "risk_off_soxl_exit": "exact_and_bypasses_drift",
             "actual_shares_and_cash": "sole_current_weight_source",
         },
@@ -253,7 +254,7 @@ def calculate_implementation_fingerprint() -> str:
 
 STRATEGY_FINGERPRINT = calculate_strategy_fingerprint()
 EXPECTED_STRATEGY_FINGERPRINT = (
-    "7423ef898b38d6f8cb84621789811729f66f1b9027092b762ed2de2e272537db"
+    "dfdca66d06fd7dc088a467f3822809be18006b7cc5baeda2ab99d4142fb8b9e2"
 )
 
 _configured_roth_amount = os.environ.get("ROTH_IRA_AMOUNT", "").strip()
@@ -486,16 +487,15 @@ def _validate_weight_mapping(
 
 
 def _valid_soxl_weight(value: object) -> bool:
+    """Accept a bounded weight stored by a current or historical decision."""
     if not _is_valid_number(value):
         return False
     numeric = float(value)
-    return (
-        numeric <= core.MAX_SOXL_WEIGHT + 1e-12
-        and any(
-            abs(numeric - candidate) <= 1e-12
-            for candidate in core.SOXL_WEIGHT_GRID
-        )
-    )
+    return numeric <= core.MAX_SOXL_WEIGHT + 1e-12
+
+
+def _valid_soxl_tier(value: object) -> bool:
+    return _valid_soxl_weight(value) and core.is_soxl_tier(value)
 
 
 def validate_configuration() -> None:
@@ -550,9 +550,9 @@ def validate_state(state: PortfolioState) -> None:
         or state.eligible_streak < 0
     ):
         raise RuntimeError("eligible_streak is invalid")
-    if not _valid_soxl_weight(state.soxl_weight):
+    if not _valid_soxl_tier(state.soxl_weight):
         raise RuntimeError("soxl_weight is invalid")
-    if not _valid_soxl_weight(state.pending_soxl_weight):
+    if not _valid_soxl_tier(state.pending_soxl_weight):
         raise RuntimeError("pending_soxl_weight is invalid")
     if (
         not isinstance(state.pending_scale_days, int)
@@ -733,19 +733,32 @@ def _migrate_state_payload(
     backup = _backup_legacy_state(version) if backup_legacy else None
     migrated = asdict(PortfolioState())
 
-    # Versions 8-10 already contain the complete production state machine and
-    # outbox. Version 11 removes research-only downside-shadow anchors, while
-    # preserving every broker fact and pending-action field byte-for-value.
+    # Versions 8-11 already contain the complete production state machine and
+    # outbox. Version 12 replaces the old five-point sizing grid with four
+    # deliberate tiers. Broker facts and pending-action evidence remain exact;
+    # only the live model state is conservatively mapped down to a valid tier.
     #
     # Versions 8 and 9 fingerprinted the retired QLD/SOXL universe. That hash
     # cannot be compared with the expanded TQQQ/UGL universe on a same-date
     # deployment, so retain the processed date but begin a new data-hash
-    # lineage. Version 10 already used the current universe and keeps its hash.
-    if numeric_version in {8, 9, 10}:
+    # lineage. Versions 10 and 11 used the current universe and keep the hash.
+    if numeric_version in {8, 9, 10, 11}:
         for name in set(migrated) & set(payload):
             migrated[name] = payload[name]
         if numeric_version in {8, 9}:
             migrated["last_processed_data_fingerprint"] = ""
+        migrated["soxl_weight"] = core.floor_soxl_tier(
+            float(migrated["soxl_weight"])
+        )
+        migrated["pending_soxl_weight"] = core.floor_soxl_tier(
+            float(migrated["pending_soxl_weight"])
+        )
+        if (
+            migrated["pending_soxl_weight"] <= migrated["soxl_weight"]
+            or migrated["pending_soxl_weight"] == 0.0
+        ):
+            migrated["pending_soxl_weight"] = 0.0
+            migrated["pending_scale_days"] = 0
         migrated["state_version"] = STATE_VERSION
         logger.warning(
             "Migrated state version %r to version %s; backup=%s",
@@ -1423,6 +1436,7 @@ def inner_band_rebalance_weights(
     destination: float = REBALANCE_DESTINATION,
     *,
     trigger_band: float = REBALANCE_BAND,
+    fixed_weights: dict[str, float] | None = None,
 ) -> dict[str, float]:
     if not existing:
         return dict(target)
@@ -1444,6 +1458,23 @@ def inner_band_rebalance_weights(
         raise RuntimeError("Target portfolio weights do not sum to 1.0")
     lower = np.maximum(0.0, desired - destination)
     upper = np.minimum(1.0, desired + destination)
+    fixed = fixed_weights or {}
+    unknown_fixed = set(fixed) - set(tickers)
+    if unknown_fixed:
+        raise ValueError(
+            f"Fixed weights contain unknown components: {sorted(unknown_fixed)}"
+        )
+    for ticker, value in fixed.items():
+        numeric = float(value)
+        index = tickers.index(ticker)
+        if (
+            not np.isfinite(numeric)
+            or numeric < lower[index] - 1e-12
+            or numeric > upper[index] + 1e-12
+        ):
+            raise ValueError(f"Fixed weight for {ticker} is outside its band")
+        lower[index] = numeric
+        upper[index] = numeric
     soxl_index = (
         tickers.index(LEVERAGED_SEMICONDUCTOR)
         if LEVERAGED_SEMICONDUCTOR in tickers
@@ -1541,26 +1572,20 @@ def build_rebalance_plan(
         reason = "AGGREGATE_EQUITY_DRIFT_BAND"
     else:
         reason = "HOLD"
-    buffered_soxl = (
-        None
-        if full_transition or not rebalance_due
-        else core.buffered_soxl_rebalance_weight(
-            existing.get(LEVERAGED_SEMICONDUCTOR, 0.0),
-            target.get(LEVERAGED_SEMICONDUCTOR, 0.0),
-            trigger=rebalance_band,
-            destination=rebalance_destination,
-        )
-    )
     if full_transition or not rebalance_due:
         execution = target
-    elif buffered_soxl is not None:
-        execution = _with_cash_target(target_weights(buffered_soxl))
     else:
         execution = inner_band_rebalance_weights(
             existing,
             target,
             destination=rebalance_destination,
             trigger_band=rebalance_band,
+            fixed_weights={
+                LEVERAGED_SEMICONDUCTOR: target.get(
+                    LEVERAGED_SEMICONDUCTOR,
+                    0.0,
+                )
+            },
         )
     if rebalance_due:
         components = set(existing) | set(execution)
@@ -2642,9 +2667,10 @@ def build_dashboard(strategy_run: StrategyRun) -> str:
                 "next-session executable prices, then confirm complete holdings."
             ),
             (
-                f"Drift trigger/destination: {REBALANCE_BAND:.0%}/"
-                f"{REBALANCE_DESTINATION:.1%}; SOXL cap "
-                f"{core.MAX_SOXL_WEIGHT:.0%}; no margin or options."
+                f"Drift trigger/non-SOXL destination: {REBALANCE_BAND:.0%}/"
+                f"{REBALANCE_DESTINATION:.1%}; SOXL returns to its exact "
+                f"0/15/25/35% tier; cap {core.MAX_SOXL_WEIGHT:.0%}; "
+                "no margin or options."
             ),
             "=" * 112,
         ]

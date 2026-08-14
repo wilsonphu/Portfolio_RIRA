@@ -14,7 +14,8 @@ UGL  = 35% * (1 - s)
 SOXL = s
 ```
 
-`s` is restricted to `0%, 5%, ..., 35%`. The SOXL sleeve requires both:
+`s` is restricted to four deliberate tiers: `0%`, `15%`, `25%`, or `35%`.
+The SOXL sleeve requires both:
 
 - QQQ strictly above its completed-close 200-session SMA; and
 - positive 21-session residual momentum from a separated-window SMH-on-QQQ
@@ -26,6 +27,11 @@ Residual exits occur on the fixed 21-session review clock. Re-entry requires
 two distinct eligible closes; volatility reductions are immediate and
 increases require five completed sessions.
 
+When both alpha gates are open, the volatility model chooses the highest tier
+that fits the risk budget. If 15% does not fit, SOXL remains at 0%. Any
+triggered rebalance returns SOXL to its exact strategic tier; other positions
+normally stop at the inner drift band.
+
 The strategy is deployed to production by investor authorization. Historical
 backtests are not evidence that its return advantage will persist. A roughly
 two-thirds portfolio drawdown remains plausible.
@@ -35,7 +41,8 @@ two-thirds portfolio drawdown remains plausible.
 Confirmed broker shares and cash—not calculated target weights—are the sole
 source of truth. The engine rebalances only for a structural change, a
 five-percentage-point individual drift, or a five-point aggregate equity
-drift, and normally trades back to the inner 2.5-point band.
+drift. SOXL returns to its exact strategic tier; other positions normally
+trade back to the inner 2.5-point band.
 
 Ordinary HOLD runs are silent. Email is sent only for a new action, a material
 update, a one-time cancellation, or a delivery retry. Every unseen completed
