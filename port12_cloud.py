@@ -737,11 +737,15 @@ def _migrate_state_payload(
     # outbox. Version 11 removes research-only downside-shadow anchors, while
     # preserving every broker fact and pending-action field byte-for-value.
     #
-    # Every common field survives instead of taking the older
-    # conservative reset path below.
+    # Versions 8 and 9 fingerprinted the retired QLD/SOXL universe. That hash
+    # cannot be compared with the expanded TQQQ/UGL universe on a same-date
+    # deployment, so retain the processed date but begin a new data-hash
+    # lineage. Version 10 already used the current universe and keeps its hash.
     if numeric_version in {8, 9, 10}:
         for name in set(migrated) & set(payload):
             migrated[name] = payload[name]
+        if numeric_version in {8, 9}:
+            migrated["last_processed_data_fingerprint"] = ""
         migrated["state_version"] = STATE_VERSION
         logger.warning(
             "Migrated state version %r to version %s; backup=%s",

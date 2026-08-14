@@ -830,7 +830,7 @@ class StateAndHoldingsTests(EngineTestCase):
             505.0,
         )
 
-    def test_v8_migration_preserves_complete_production_state(self):
+    def test_v8_migration_preserves_state_and_resets_old_data_hash(self):
         original = engine.PortfolioState(
             shares={engine.LEVERAGED_INDEX: 4.5},
             cash_balance=12.25,
@@ -855,8 +855,17 @@ class StateAndHoldingsTests(EngineTestCase):
         migrated = engine.load_state(backup_legacy=False)
         self.assertEqual(migrated.state_version, engine.STATE_VERSION)
         for name, value in payload.items():
-            if name != "state_version":
+            if name not in {
+                "state_version",
+                "last_processed_data_fingerprint",
+            }:
                 self.assertEqual(getattr(migrated, name), value)
+        self.assertEqual(migrated.last_processed_data_fingerprint, "")
+        engine.validate_same_date_data_fingerprint(
+            migrated,
+            pd.Timestamp("2026-08-04"),
+            "c" * 64,
+        )
 
     def test_v10_migration_drops_retired_research_only_anchors(self):
         original = engine.PortfolioState(
@@ -865,6 +874,8 @@ class StateAndHoldingsTests(EngineTestCase):
             pending_recommendation_date="2026-08-04",
             pending_recommendation_weights={engine.LEVERAGED_INDEX: 1.0},
             pending_recommendation_fingerprint="a" * 64,
+            last_processed_signal_date="2026-08-04",
+            last_processed_data_fingerprint="c" * 64,
         )
         payload = asdict(original)
         payload["state_version"] = 10
@@ -884,6 +895,10 @@ class StateAndHoldingsTests(EngineTestCase):
             migrated.pending_recommendation_weights,
             original.pending_recommendation_weights,
         )
+        self.assertEqual(
+            migrated.last_processed_data_fingerprint,
+            original.last_processed_data_fingerprint,
+        )
         self.assertFalse(
             hasattr(migrated, "downside_shadow_ledger_sessions")
         )
@@ -893,6 +908,8 @@ class StateAndHoldingsTests(EngineTestCase):
             shares={engine.VOLATILITY_INDEX: 10.0},
             target_weights={engine.VOLATILITY_INDEX: 1.0},
             portfolio_value=1_000.0,
+            last_processed_signal_date="2026-08-04",
+            last_processed_data_fingerprint="b" * 64,
             executed_strategy_fingerprint=(
                 "d9ce9aaf3fbc39962598fc09986f1b37"
                 "b87d4e62559980d81820326534d7e837"
@@ -910,6 +927,7 @@ class StateAndHoldingsTests(EngineTestCase):
             migrated.target_weights,
             {engine.VOLATILITY_INDEX: 1.0},
         )
+        self.assertEqual(migrated.last_processed_data_fingerprint, "")
         plan = engine.build_rebalance_plan(
             {engine.VOLATILITY_INDEX: 1.0},
             make_decision(0.0),
