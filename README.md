@@ -41,13 +41,13 @@ moves backward after a drawdown.
 
 | Stage | 2026-dollar value gate | Age gate | Advertised daily exposure |
 |---|---:|---:|---:|
-| `SPRINT` | below $100,000 | below 35 | current 2.65x-2.77x |
-| `GLIDE_225` | $100,000 | 35 | 2.25x |
-| `TWO_X` | $150,000 | 40 | 2.00x |
-| `PHI` | $250,000 | 45 | 1.618x |
-| `ONE_THREE` | $500,000 | 50 | 1.30x |
-| `ONE_X` | $1,000,000 | 55 | 1.00x |
-| `RETIREMENT` | age only | 59.5 | 0.75x plus 25% SGOV |
+| `SPRINT` | below $250,000 | below 45 | current 2.65x-2.77x |
+| `GLIDE_225` | $250,000 | 45 | 2.25x |
+| `TWO_X` | $500,000 | 50 | 2.00x |
+| `PHI` | $1,000,000 | 55 | 1.618x |
+| `ONE_THREE` | $2,000,000 | 59.5 | 1.30x |
+| `ONE_X` | $5,000,000 | 65 | 1.00x |
+| `RETIREMENT` | age only | 70 | 0.75x plus 25% SGOV |
 
 Value gates are indexed at 2.5% annually from August 14, 2026, so they retain
 roughly constant purchasing power. The default age estimate starts at age 23
@@ -63,9 +63,11 @@ lifecycle layer changes only how that exposure is delivered:
 - Retirement reserve: SGOV.
 
 Between integer leverage levels the engine blends adjacent products to hit the
-stage ceiling exactly. It does not silently switch the Nasdaq thesis to the
-S&P 500. Lifecycle transitions are structural actions, bypass the drift band,
-and generate one email with the complete destination portfolio.
+stage ceiling exactly. The delayed-deleveraging ratchet deliberately retains
+the full sprint through the 30s and early 40s unless the inflation-adjusted
+$250,000 value gate is reached first. It does not silently switch the Nasdaq
+thesis to the S&P 500. Lifecycle transitions are structural actions, bypass the
+drift band, and generate one email with the complete destination portfolio.
 
 The strategy is deployed to production by investor authorization. Historical
 backtests are not evidence that its return advantage will persist. Before the
