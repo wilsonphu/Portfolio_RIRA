@@ -43,6 +43,9 @@ VOLATILITY_INDEX = core.QLD
 LEVERAGED_INDEX = "TQQQ"
 LEVERAGED_GOLD = "UGL"
 LEVERAGED_SEMICONDUCTOR = core.SOXL
+FORWARD_ANTI_BETA = "BTAL"
+FORWARD_BROAD_EQUITY = "SPY"
+FORWARD_LEVERAGED_BROAD_EQUITY = "SSO"
 DOUBLE_SEMICONDUCTOR = "USD"
 UNLEVERAGED_INDEX = "QQQM"
 UNLEVERAGED_GOLD = "GLDM"
@@ -165,7 +168,8 @@ STRATEGY_REVISION = "tqqq65-ugl35-soxl-delayed-lifecycle-v5"
 EXPERIMENTAL_LIVE = True
 STATE_VERSION = 13
 DECISION_AUDIT_SCHEMA_VERSION = 4
-SHADOW_LEDGER_SCHEMA_VERSION = 1
+SHADOW_LEDGER_SCHEMA_VERSION = 2
+LEGACY_SHADOW_LEDGER_SCHEMA_VERSION = 1
 NEW_YORK = ZoneInfo("America/New_York")
 MARKET_CLOSE_BUFFER_MINUTES = 15
 
@@ -180,6 +184,8 @@ ADVERTISED_DAILY_MULTIPLIERS = {
     LEVERAGED_INDEX: 3.0,
     LEVERAGED_GOLD: 2.0,
     LEVERAGED_SEMICONDUCTOR: 3.0,
+    FORWARD_BROAD_EQUITY: 1.0,
+    FORWARD_LEVERAGED_BROAD_EQUITY: 2.0,
     DOUBLE_SEMICONDUCTOR: 2.0,
     UNLEVERAGED_INDEX: 1.0,
     UNLEVERAGED_GOLD: 1.0,
@@ -415,6 +421,375 @@ def calculate_strategy_fingerprint(
     )
 
 
+def _forward_experiment_manifest_v1() -> dict[str, object]:
+    """Return the original frozen prospective comparison protocol."""
+    return {
+        "revision": "prospective-allocation-shadow-v1",
+        "start_rule": "first_v2_shadow_observation",
+        "information": "completed_adjusted_close_only",
+        "execution": "next_session_close_proxy",
+        "distributions": "adjusted_close_total_return",
+        "contributions": "excluded",
+        "transaction_cost_bps_per_one_way_turnover": 25,
+        "comparators": {
+            "production_v5": {
+                "allocation": "live_alpha_and_lifecycle_target",
+                "rebalance": "live_stateful_execution_rules",
+            },
+            "permanent_sprint": {
+                "allocation": "live_alpha_with_sprint_delivery_forever",
+                "rebalance": "same_stateful_alpha_target",
+            },
+            "qld_soxl_same_alpha": {
+                "allocation": "QLD_one_minus_SOXL_plus_SOXL",
+                "rebalance": "same_stateful_alpha_target",
+            },
+            "tqqq_btal_50_50_band_5pp": {
+                "allocation": {
+                    "TQQQ": 0.5,
+                    "BTAL": 0.5,
+                },
+                "rebalance_trigger": (
+                    "either_weight_at_least_5pp_from_target"
+                ),
+                "rebalance_destination": {
+                    "TQQQ": 0.5,
+                    "BTAL": 0.5,
+                },
+            },
+        },
+        "promotion_rule": (
+            "no_production_change_without_prospective_net_log_growth_and_"
+            "drawdown_review"
+        ),
+    }
+
+
+def forward_experiment_manifest() -> dict[str, object]:
+    """Return the second frozen prospective comparison protocol.
+
+    These policies are research shadows only. They cannot alter production
+    targets, broker holdings, drift decisions, or notification behavior.
+    """
+    manifest = copy.deepcopy(_forward_experiment_manifest_v1())
+    manifest["revision"] = "prospective-allocation-shadow-v2"
+    manifest["start_rule"] = (
+        "first_observation_with_prospective_allocation_shadow_v2_fingerprint"
+    )
+    comparators = manifest["comparators"]
+    if not isinstance(comparators, dict):
+        raise RuntimeError("Forward comparator manifest is invalid")
+    comparators.update(
+        {
+            "production_v5_band_2_5pp": {
+                "allocation": "live_alpha_and_lifecycle_target",
+                "rebalance_trigger": (
+                    "either_weight_at_least_2_5pp_from_target"
+                ),
+                "rebalance_destination": "1_25pp_from_target",
+                "status": "shadow_only_frequency_sensitivity",
+            },
+            "tqqq_spy_65_35_same_alpha_lifecycle": {
+                "allocation": (
+                    "replace_UGL_with_SPY_preserve_65_35_core_and_"
+                    "source_exposure_through_lifecycle"
+                ),
+                "rebalance": "live_5pp_trigger_2_5pp_destination",
+                "lifecycle": (
+                    "shared_production_v5_stage_control_not_independent_nav"
+                ),
+                "status": "shadow_only_controlled_sleeve_substitution",
+            },
+            "tqqq_sso_65_35_same_alpha_lifecycle": {
+                "allocation": (
+                    "replace_UGL_with_SSO_and_GLDM_with_SPY_through_"
+                    "the_same_lifecycle"
+                ),
+                "rebalance": "live_5pp_trigger_2_5pp_destination",
+                "lifecycle": (
+                    "shared_production_v5_stage_control_not_independent_nav"
+                ),
+                "status": "shadow_only_controlled_sleeve_substitution",
+            },
+        }
+    )
+    return manifest
+
+
+LEGACY_FORWARD_EXPERIMENT_FINGERPRINT = (
+    "1fa3b361e9e8884aa8241644d9738ff096ea1dd3c1567a654295998e1d7d3e59"
+)
+if canonical_sha256(_forward_experiment_manifest_v1()) != (
+    LEGACY_FORWARD_EXPERIMENT_FINGERPRINT
+):
+    raise RuntimeError("Frozen v1 forward experiment manifest changed")
+FORWARD_EXPERIMENT_FINGERPRINT = (
+    "d629684eb029b6730cf4bba3c95af254d15a30b007925a8e3240cde3fa41d5d6"
+)
+if canonical_sha256(forward_experiment_manifest()) != (
+    FORWARD_EXPERIMENT_FINGERPRINT
+):
+    raise RuntimeError("Frozen v2 forward experiment manifest changed")
+
+
+_FORWARD_V1_LIFECYCLE_EXPOSURE_CEILINGS = {
+    "SPRINT": None,
+    "GLIDE_225": 2.25,
+    "TWO_X": 2.0,
+    "PHI": (1.0 + 5.0**0.5) / 2.0,
+    "ONE_THREE": 1.30,
+    "ONE_X": 1.0,
+    "RETIREMENT": 0.75,
+}
+_FORWARD_V1_ADVERTISED_MULTIPLIERS = {
+    "TQQQ": 3.0,
+    "UGL": 2.0,
+    "SOXL": 3.0,
+    "QLD": 2.0,
+    "USD": 2.0,
+    "QQQM": 1.0,
+    "GLDM": 1.0,
+    "SMH": 1.0,
+    "SGOV": 0.0,
+    "SPY": 1.0,
+    "SSO": 2.0,
+}
+
+
+def _forward_v1_soxl_weight(soxl_weight: float) -> float:
+    weight = float(soxl_weight)
+    if not any(
+        abs(weight - tier) <= 1e-12 for tier in (0.0, 0.15, 0.25, 0.35)
+    ):
+        raise ValueError("SOXL target weight is not a frozen v1 tier")
+    return weight
+
+
+def _forward_v1_exposure(weights: dict[str, float]) -> float:
+    try:
+        return float(
+            sum(
+                weight * _FORWARD_V1_ADVERTISED_MULTIPLIERS[ticker]
+                for ticker, weight in weights.items()
+            )
+        )
+    except KeyError as exc:
+        raise RuntimeError("Frozen forward target has an unknown ticker") from exc
+
+
+def _forward_v1_target_weights(
+    soxl_weight: float,
+    lifecycle_stage: str,
+) -> dict[str, float]:
+    """Reproduce v5 targets without depending on mutable live aliases."""
+    weight = _forward_v1_soxl_weight(soxl_weight)
+    if lifecycle_stage not in _FORWARD_V1_LIFECYCLE_EXPOSURE_CEILINGS:
+        raise ValueError(f"Unknown frozen v1 lifecycle stage: {lifecycle_stage!r}")
+    remaining = 1.0 - weight
+    aggressive = {
+        "TQQQ": 0.65 * remaining,
+        "UGL": 0.35 * remaining,
+        "SOXL": weight,
+    }
+    if lifecycle_stage == "SPRINT":
+        return aggressive
+
+    source_exposure = {
+        "nasdaq": 3.0 * aggressive["TQQQ"],
+        "gold": 2.0 * aggressive["UGL"],
+        "semiconductors": 3.0 * aggressive["SOXL"],
+    }
+    aggressive_exposure = float(sum(source_exposure.values()))
+    sources = {
+        name: exposure / aggressive_exposure
+        for name, exposure in source_exposure.items()
+    }
+    double = {
+        "QLD": sources["nasdaq"],
+        "UGL": sources["gold"],
+        "USD": sources["semiconductors"],
+    }
+    single = {
+        "QQQM": sources["nasdaq"],
+        "GLDM": sources["gold"],
+        "SMH": sources["semiconductors"],
+    }
+    ceiling = _FORWARD_V1_LIFECYCLE_EXPOSURE_CEILINGS[lifecycle_stage]
+    if ceiling is None:
+        raise RuntimeError("Frozen non-sprint stage has no exposure ceiling")
+    if ceiling >= 2.0:
+        fraction = (ceiling - 2.0) / (aggressive_exposure - 2.0)
+        left, right = aggressive, double
+    elif ceiling >= 1.0:
+        fraction = ceiling - 1.0
+        left, right = double, single
+    else:
+        result = {
+            ticker: ceiling * target_weight
+            for ticker, target_weight in single.items()
+        }
+        result["SGOV"] = 1.0 - ceiling
+        return result
+    result = {
+        ticker: fraction * left.get(ticker, 0.0)
+        + (1.0 - fraction) * right.get(ticker, 0.0)
+        for ticker in set(left) | set(right)
+    }
+    return {
+        ticker: target_weight
+        for ticker, target_weight in result.items()
+        if target_weight > 1e-12
+    }
+
+
+def _legacy_forward_shadow_targets(
+    soxl_weight: float,
+    lifecycle_stage: str,
+) -> dict[str, dict[str, float]]:
+    weight = _forward_v1_soxl_weight(soxl_weight)
+    return {
+        "production_v5": _forward_v1_target_weights(weight, lifecycle_stage),
+        "permanent_sprint": _forward_v1_target_weights(weight, "SPRINT"),
+        "qld_soxl_same_alpha": {"QLD": 1.0 - weight, "SOXL": weight},
+        "tqqq_btal_50_50_band_5pp": {
+            "TQQQ": 0.5,
+            "BTAL": 0.5,
+        },
+    }
+
+
+def _forward_spy_target_weights(
+    soxl_weight: float,
+    lifecycle_stage: str,
+) -> dict[str, float]:
+    """Return a source-preserving SPY-core shadow target.
+
+    SPY is a 1x sleeve, so it cannot use production's 3x/2x/1x mapper.
+    The non-sprint mapping instead preserves each source's advertised
+    exposure while using the least leverage needed in the Nasdaq and
+    semiconductor sleeves to hit the lifecycle ceiling exactly.
+    """
+    weight = _forward_v1_soxl_weight(soxl_weight)
+    if lifecycle_stage not in _FORWARD_V1_LIFECYCLE_EXPOSURE_CEILINGS:
+        raise ValueError(
+            f"Unknown frozen v2 lifecycle stage: {lifecycle_stage!r}"
+        )
+    remaining = 1.0 - weight
+    aggressive = {
+        "TQQQ": 0.65 * remaining,
+        "SPY": 0.35 * remaining,
+        "SOXL": weight,
+    }
+    if lifecycle_stage == "SPRINT":
+        return aggressive
+
+    source_exposure = {
+        "nasdaq": 3.0 * aggressive["TQQQ"],
+        "broad_equity": aggressive["SPY"],
+        "semiconductors": 3.0 * aggressive["SOXL"],
+    }
+    total_exposure = float(sum(source_exposure.values()))
+    sources = {
+        name: exposure / total_exposure
+        for name, exposure in source_exposure.items()
+    }
+    ceiling = _FORWARD_V1_LIFECYCLE_EXPOSURE_CEILINGS[lifecycle_stage]
+    if ceiling is None:
+        raise RuntimeError("Non-sprint lifecycle stage has no exposure ceiling")
+    if ceiling < 1.0:
+        result = {
+            "QQQM": ceiling * sources["nasdaq"],
+            "SPY": ceiling * sources["broad_equity"],
+            "SMH": ceiling * sources["semiconductors"],
+            "SGOV": 1.0 - ceiling,
+        }
+    else:
+        broad_weight = ceiling * sources["broad_equity"]
+        other_source_share = sources["nasdaq"] + sources["semiconductors"]
+        other_capital = 1.0 - broad_weight
+        delivery_leverage = ceiling * other_source_share / other_capital
+        if delivery_leverage < 1.0 - 1e-12 or (
+            delivery_leverage > 3.0 + 1e-12
+        ):
+            raise RuntimeError("SPY shadow delivery leverage is infeasible")
+        result = {"SPY": broad_weight}
+        delivery_pairs = {
+            "nasdaq": ("TQQQ", "QLD", "QQQM"),
+            "semiconductors": ("SOXL", "USD", "SMH"),
+        }
+        for source_name, (triple, double, single) in delivery_pairs.items():
+            source_capital = (
+                ceiling * sources[source_name] / delivery_leverage
+            )
+            if delivery_leverage >= 2.0:
+                source_delivery = {
+                    triple: delivery_leverage - 2.0,
+                    double: 3.0 - delivery_leverage,
+                }
+            else:
+                source_delivery = {
+                    double: delivery_leverage - 1.0,
+                    single: 2.0 - delivery_leverage,
+                }
+            for ticker, fraction in source_delivery.items():
+                result[ticker] = (
+                    result.get(ticker, 0.0) + source_capital * fraction
+                )
+    result = {
+        ticker: value for ticker, value in result.items() if value > 1e-12
+    }
+    if not np.isclose(sum(result.values()), 1.0, atol=1e-12):
+        raise RuntimeError("SPY shadow target weights do not sum to 1.0")
+    if not np.isclose(_forward_v1_exposure(result), ceiling, atol=1e-12):
+        raise RuntimeError("SPY shadow target misses lifecycle exposure ceiling")
+    return result
+
+
+def _forward_sso_target_weights(
+    soxl_weight: float,
+    lifecycle_stage: str,
+) -> dict[str, float]:
+    """Return the production lifecycle map with SSO/SPY replacing gold."""
+    ticker_map = {"UGL": "SSO", "GLDM": "SPY"}
+    result: dict[str, float] = {}
+    for ticker, weight in _forward_v1_target_weights(
+        soxl_weight,
+        lifecycle_stage,
+    ).items():
+        replacement = ticker_map.get(ticker, ticker)
+        result[replacement] = result.get(replacement, 0.0) + weight
+    return result
+
+
+def forward_shadow_targets(
+    soxl_weight: float,
+    lifecycle_stage: str,
+    experiment_fingerprint: str | None = None,
+) -> dict[str, dict[str, float]]:
+    """Return exact target maps for every frozen prospective comparator."""
+    fingerprint = experiment_fingerprint or FORWARD_EXPERIMENT_FINGERPRINT
+    result = _legacy_forward_shadow_targets(soxl_weight, lifecycle_stage)
+    if fingerprint == LEGACY_FORWARD_EXPERIMENT_FINGERPRINT:
+        return result
+    if fingerprint != FORWARD_EXPERIMENT_FINGERPRINT:
+        raise ValueError("Unknown forward experiment fingerprint")
+    result.update(
+        {
+            "production_v5_band_2_5pp": _forward_v1_target_weights(
+                soxl_weight,
+                lifecycle_stage,
+            ),
+            "tqqq_spy_65_35_same_alpha_lifecycle": (
+                _forward_spy_target_weights(soxl_weight, lifecycle_stage)
+            ),
+            "tqqq_sso_65_35_same_alpha_lifecycle": (
+                _forward_sso_target_weights(soxl_weight, lifecycle_stage)
+            ),
+        }
+    )
+    return result
+
+
 def calculate_implementation_fingerprint() -> str:
     return canonical_sha256(
         {
@@ -480,6 +855,9 @@ class ShadowObservation:
     transition_reason: str
     structural_change: bool
     failure_reason: str
+    lifecycle_stage: str
+    forward_experiment_fingerprint: str
+    forward_targets: dict[str, dict[str, float]]
 
 
 @dataclass(frozen=True)
@@ -778,6 +1156,20 @@ def apply_lifecycle_policy(
         portfolio_value,
         pd.Timestamp(signal_date).date(),
     )
+    observations = decision.shadow_observations
+    if observations:
+        latest = observations[-1]
+        observations = (
+            *observations[:-1],
+            replace(
+                latest,
+                lifecycle_stage=selection.stage,
+                forward_targets=forward_shadow_targets(
+                    decision.overlay_state.soxl_weight,
+                    selection.stage,
+                ),
+            ),
+        )
     return replace(
         decision,
         target_weights=target_weights(
@@ -790,6 +1182,7 @@ def apply_lifecycle_policy(
         lifecycle_value_stage=selection.value_stage,
         lifecycle_age_stage=selection.age_stage,
         lifecycle_stage_advanced=selection.advanced,
+        shadow_observations=observations,
     )
 
 
@@ -1666,6 +2059,14 @@ def calculate_strategy_decision(
                 transition_reason=decision.transition_reason,
                 structural_change=decision.structural_change,
                 failure_reason=decision.failure_reason,
+                lifecycle_stage=working.lifecycle_stage,
+                forward_experiment_fingerprint=(
+                    FORWARD_EXPERIMENT_FINGERPRINT
+                ),
+                forward_targets=forward_shadow_targets(
+                    decision.overlay_state.soxl_weight,
+                    working.lifecycle_stage,
+                ),
             )
         )
     final = decisions[-1]
@@ -2555,8 +2956,13 @@ def _load_shadow_ledger() -> list[dict[str, object]]:
     records: list[dict[str, object]] = []
     previous_hash = ""
     previous_date: date | None = None
-    expected_observation_fields = {
+    current_observation_fields = {
         item.name for item in fields(ShadowObservation)
+    }
+    legacy_observation_fields = current_observation_fields - {
+        "lifecycle_stage",
+        "forward_experiment_fingerprint",
+        "forward_targets",
     }
     for line_number, line in enumerate(lines, start=1):
         if not line.strip():
@@ -2577,50 +2983,73 @@ def _load_shadow_ledger() -> list[dict[str, object]]:
             "observation",
         }:
             raise RuntimeError("Shadow ledger record schema is invalid")
-        if record["schema_version"] != SHADOW_LEDGER_SCHEMA_VERSION:
+        schema_version = record["schema_version"]
+        if schema_version not in {
+            LEGACY_SHADOW_LEDGER_SCHEMA_VERSION,
+            SHADOW_LEDGER_SCHEMA_VERSION,
+        }:
             raise RuntimeError("Shadow ledger schema version is invalid")
         if not _is_sha256(record["strategy_fingerprint"]):
             raise RuntimeError("Shadow ledger strategy fingerprint is invalid")
         if record["previous_hash"] != previous_hash:
             raise RuntimeError("Shadow ledger chain linkage is invalid")
         observation = record["observation"]
+        expected_fields = (
+            legacy_observation_fields
+            if schema_version == LEGACY_SHADOW_LEDGER_SCHEMA_VERSION
+            else current_observation_fields
+        )
         if (
             not isinstance(observation, dict)
-            or set(observation) != expected_observation_fields
+            or set(observation) != expected_fields
         ):
             raise RuntimeError("Shadow ledger observation schema is invalid")
-        try:
-            parsed = ShadowObservation(**observation)
-        except TypeError as exc:
-            raise RuntimeError(
-                "Shadow ledger observation fields are invalid"
-            ) from exc
         signal_date = _parse_iso_date(
-            parsed.signal_date,
+            str(observation["signal_date"]),
             "shadow_signal_date",
         )
         if signal_date is None or (
             previous_date is not None and signal_date <= previous_date
         ):
             raise RuntimeError("Shadow ledger dates are not strictly increasing")
-        if not _is_sha256(parsed.data_fingerprint):
+        if not _is_sha256(observation["data_fingerprint"]):
             raise RuntimeError("Shadow ledger data fingerprint is invalid")
-        if not isinstance(parsed.trend_positive, bool) or not isinstance(
-            parsed.residual_positive,
+        if not isinstance(
+            observation["trend_positive"],
             bool,
-        ):
+        ) or not isinstance(observation["residual_positive"], bool):
             raise RuntimeError("Shadow ledger signals must be boolean")
-        if not isinstance(parsed.overlay_active, bool) or not isinstance(
-            parsed.structural_change,
+        if not isinstance(
+            observation["overlay_active"],
             bool,
-        ):
+        ) or not isinstance(observation["structural_change"], bool):
             raise RuntimeError("Shadow ledger state flags must be boolean")
-        if not _valid_soxl_weight(parsed.raw_soxl_weight) or not (
-            _valid_soxl_weight(parsed.soxl_weight)
+        if not _valid_soxl_weight(observation["raw_soxl_weight"]) or not (
+            _valid_soxl_weight(observation["soxl_weight"])
         ):
             raise RuntimeError("Shadow ledger SOXL weights are invalid")
+        if schema_version == SHADOW_LEDGER_SCHEMA_VERSION:
+            if observation["lifecycle_stage"] not in LIFECYCLE_STAGES:
+                raise RuntimeError("Shadow ledger lifecycle stage is invalid")
+            experiment_fingerprint = observation[
+                "forward_experiment_fingerprint"
+            ]
+            if experiment_fingerprint not in {
+                LEGACY_FORWARD_EXPERIMENT_FINGERPRINT,
+                FORWARD_EXPERIMENT_FINGERPRINT,
+            }:
+                raise RuntimeError(
+                    "Shadow ledger forward experiment fingerprint is invalid"
+                )
+            expected_targets = forward_shadow_targets(
+                float(observation["soxl_weight"]),
+                str(observation["lifecycle_stage"]),
+                str(experiment_fingerprint),
+            )
+            if observation["forward_targets"] != expected_targets:
+                raise RuntimeError("Shadow ledger forward targets are invalid")
         hash_payload = {
-            "schema_version": record["schema_version"],
+            "schema_version": schema_version,
             "strategy_fingerprint": record["strategy_fingerprint"],
             "previous_hash": record["previous_hash"],
             "observation": observation,
@@ -2682,6 +3111,38 @@ def _validate_shadow_ledger_anchor(
     return anchored
 
 
+def _expected_shadow_observation_for_record(
+    expected: dict[str, object],
+    record: dict[str, object],
+) -> dict[str, object]:
+    """Render a deterministic replay in the record's historical protocol."""
+    normalized = copy.deepcopy(expected)
+    schema_version = record["schema_version"]
+    if schema_version == LEGACY_SHADOW_LEDGER_SCHEMA_VERSION:
+        for field_name in (
+            "lifecycle_stage",
+            "forward_experiment_fingerprint",
+            "forward_targets",
+        ):
+            normalized.pop(field_name)
+        return normalized
+    if schema_version != SHADOW_LEDGER_SCHEMA_VERSION:
+        raise RuntimeError("Shadow ledger schema version is invalid")
+    recorded_observation = record["observation"]
+    if not isinstance(recorded_observation, dict):
+        raise RuntimeError("Shadow ledger observation schema is invalid")
+    experiment_fingerprint = str(
+        recorded_observation["forward_experiment_fingerprint"]
+    )
+    normalized["forward_experiment_fingerprint"] = experiment_fingerprint
+    normalized["forward_targets"] = forward_shadow_targets(
+        float(normalized["soxl_weight"]),
+        str(normalized["lifecycle_stage"]),
+        experiment_fingerprint,
+    )
+    return normalized
+
+
 def append_shadow_ledger(strategy_run: StrategyRun) -> dict[str, object]:
     """Atomically append distinct causal observations to the hash chain."""
     records = _load_shadow_ledger()
@@ -2699,9 +3160,12 @@ def append_shadow_ledger(strategy_run: StrategyRun) -> dict[str, object]:
     for record in records[anchored:]:
         observation = record["observation"]
         signal_date = str(observation["signal_date"])
+        expected = expected_by_date.get(signal_date)
         if (
             record["strategy_fingerprint"] != STRATEGY_FINGERPRINT
-            or expected_by_date.get(signal_date) != observation
+            or expected is None
+            or _expected_shadow_observation_for_record(expected, record)
+            != observation
         ):
             raise RuntimeError(
                 "Shadow ledger contains unanchored observations that do not "

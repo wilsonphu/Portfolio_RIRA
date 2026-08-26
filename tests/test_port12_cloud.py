@@ -1497,6 +1497,190 @@ class AuditAndCliTests(EngineTestCase):
             transition_reason="ALPHA_BLOCK",
             structural_change=structural,
             failure_reason="",
+            lifecycle_stage=engine.LIFECYCLE_SPRINT,
+            forward_experiment_fingerprint=(
+                engine.FORWARD_EXPERIMENT_FINGERPRINT
+            ),
+            forward_targets=engine.forward_shadow_targets(
+                0.0,
+                engine.LIFECYCLE_SPRINT,
+            ),
+        )
+
+    def test_forward_shadow_definitions_are_frozen_and_non_production(self):
+        targets = engine.forward_shadow_targets(
+            0.25,
+            engine.LIFECYCLE_PHI,
+        )
+        self.assertEqual(
+            targets["production_v5"],
+            engine.target_weights(0.25, engine.LIFECYCLE_PHI),
+        )
+        self.assertEqual(
+            targets["permanent_sprint"],
+            engine.target_weights(0.25, engine.LIFECYCLE_SPRINT),
+        )
+        self.assertEqual(
+            targets["qld_soxl_same_alpha"],
+            {
+                engine.VOLATILITY_INDEX: 0.75,
+                engine.LEVERAGED_SEMICONDUCTOR: 0.25,
+            },
+        )
+        self.assertEqual(
+            targets["tqqq_btal_50_50_band_5pp"],
+            {
+                engine.LEVERAGED_INDEX: 0.5,
+                engine.FORWARD_ANTI_BETA: 0.5,
+            },
+        )
+        self.assertEqual(
+            targets["production_v5_band_2_5pp"],
+            targets["production_v5"],
+        )
+        self.assertEqual(
+            targets["tqqq_sso_65_35_same_alpha_lifecycle"],
+            {
+                {
+                    engine.LEVERAGED_GOLD:
+                    engine.FORWARD_LEVERAGED_BROAD_EQUITY,
+                    engine.UNLEVERAGED_GOLD:
+                    engine.FORWARD_BROAD_EQUITY,
+                }.get(ticker, ticker): weight
+                for ticker, weight in engine.target_weights(
+                    0.25,
+                    engine.LIFECYCLE_PHI,
+                ).items()
+            },
+        )
+        self.assertNotEqual(
+            targets["tqqq_spy_65_35_same_alpha_lifecycle"],
+            targets["production_v5"],
+        )
+        self.assertTrue(
+            {
+                engine.FORWARD_ANTI_BETA,
+                engine.FORWARD_BROAD_EQUITY,
+                engine.FORWARD_LEVERAGED_BROAD_EQUITY,
+            }.isdisjoint(engine.ALL_TICKERS)
+        )
+        self.assertEqual(
+            engine.FORWARD_EXPERIMENT_FINGERPRINT,
+            engine.canonical_sha256(engine.forward_experiment_manifest()),
+        )
+        self.assertNotEqual(
+            engine.LEGACY_FORWARD_EXPERIMENT_FINGERPRINT,
+            engine.FORWARD_EXPERIMENT_FINGERPRINT,
+        )
+
+    def test_forward_equity_core_shadows_hit_every_lifecycle_ceiling(self):
+        for soxl_weight in core.SOXL_WEIGHT_GRID:
+            for stage in engine.LIFECYCLE_STAGES:
+                targets = engine.forward_shadow_targets(soxl_weight, stage)
+                for name in (
+                    "tqqq_spy_65_35_same_alpha_lifecycle",
+                    "tqqq_sso_65_35_same_alpha_lifecycle",
+                ):
+                    weights = targets[name]
+                    self.assertAlmostEqual(sum(weights.values()), 1.0, places=12)
+                    if stage != engine.LIFECYCLE_SPRINT:
+                        self.assertAlmostEqual(
+                            engine.advertised_daily_exposure(weights),
+                            engine.LIFECYCLE_EXPOSURE_CEILINGS[stage],
+                            places=12,
+                        )
+        sprint = engine.forward_shadow_targets(
+            0.0,
+            engine.LIFECYCLE_SPRINT,
+        )
+        self.assertEqual(
+            sprint["tqqq_spy_65_35_same_alpha_lifecycle"],
+            {
+                engine.LEVERAGED_INDEX: 0.65,
+                engine.FORWARD_BROAD_EQUITY: 0.35,
+                engine.LEVERAGED_SEMICONDUCTOR: 0.0,
+            },
+        )
+        self.assertEqual(
+            sprint["tqqq_sso_65_35_same_alpha_lifecycle"],
+            {
+                engine.LEVERAGED_INDEX: 0.65,
+                engine.FORWARD_LEVERAGED_BROAD_EQUITY: 0.35,
+                engine.LEVERAGED_SEMICONDUCTOR: 0.0,
+            },
+        )
+
+    def test_shadow_loader_preserves_legacy_experiment_semantics(self):
+        observation = asdict(self.shadow_observation())
+        observation["forward_experiment_fingerprint"] = (
+            engine.LEGACY_FORWARD_EXPERIMENT_FINGERPRINT
+        )
+        observation["forward_targets"] = engine.forward_shadow_targets(
+            0.0,
+            engine.LIFECYCLE_SPRINT,
+            engine.LEGACY_FORWARD_EXPERIMENT_FINGERPRINT,
+        )
+        self.assertNotIn(
+            "tqqq_spy_65_35_same_alpha_lifecycle",
+            observation["forward_targets"],
+        )
+        payload = {
+            "schema_version": engine.SHADOW_LEDGER_SCHEMA_VERSION,
+            "strategy_fingerprint": "b" * 64,
+            "previous_hash": "",
+            "observation": observation,
+        }
+        record = {
+            **payload,
+            "record_hash": engine.canonical_sha256(payload),
+        }
+        self.shadow_file.write_text(
+            json.dumps(record, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(engine._load_shadow_ledger(), [record])
+
+    def test_shadow_loader_accepts_and_extends_legacy_v1_chain(self):
+        observation = asdict(self.shadow_observation())
+        for name in (
+            "lifecycle_stage",
+            "forward_experiment_fingerprint",
+            "forward_targets",
+        ):
+            observation.pop(name)
+        payload = {
+            "schema_version": engine.LEGACY_SHADOW_LEDGER_SCHEMA_VERSION,
+            "strategy_fingerprint": "b" * 64,
+            "previous_hash": "",
+            "observation": observation,
+        }
+        legacy = {
+            **payload,
+            "record_hash": engine.canonical_sha256(payload),
+        }
+        self.shadow_file.write_text(
+            json.dumps(legacy, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        records = engine._load_shadow_ledger()
+        self.assertEqual(len(records), 1)
+        state = engine.PortfolioState(
+            shadow_ledger_sessions=1,
+            shadow_ledger_last_signal_date="2026-08-04",
+            shadow_ledger_chain_hash=legacy["record_hash"],
+        )
+        next_observation = self.shadow_observation("2026-08-05")
+        decision = replace(
+            make_decision(),
+            shadow_observations=(next_observation,),
+        )
+        summary = engine.append_shadow_ledger(
+            make_run(state=state, decision=decision)
+        )
+        self.assertEqual(summary["sessions"], 2)
+        self.assertEqual(
+            engine._load_shadow_ledger()[-1]["schema_version"],
+            engine.SHADOW_LEDGER_SCHEMA_VERSION,
         )
 
     def test_shadow_ledger_is_chained_idempotent_and_tamper_evident(self):
@@ -1613,6 +1797,67 @@ class AuditAndCliTests(EngineTestCase):
                     decision=mismatched,
                 )
             )
+
+    def test_legacy_shadow_chain_ahead_of_state_normalizes_exact_replay(self):
+        current = self.shadow_observation("2026-08-04")
+        for schema_version, experiment_fingerprint in (
+            (engine.LEGACY_SHADOW_LEDGER_SCHEMA_VERSION, None),
+            (
+                engine.SHADOW_LEDGER_SCHEMA_VERSION,
+                engine.LEGACY_FORWARD_EXPERIMENT_FINGERPRINT,
+            ),
+        ):
+            with self.subTest(
+                schema_version=schema_version,
+                experiment_fingerprint=experiment_fingerprint,
+            ):
+                observation = asdict(current)
+                if experiment_fingerprint is None:
+                    for field_name in (
+                        "lifecycle_stage",
+                        "forward_experiment_fingerprint",
+                        "forward_targets",
+                    ):
+                        observation.pop(field_name)
+                else:
+                    observation["forward_experiment_fingerprint"] = (
+                        experiment_fingerprint
+                    )
+                    observation["forward_targets"] = (
+                        engine.forward_shadow_targets(
+                            current.soxl_weight,
+                            current.lifecycle_stage,
+                            experiment_fingerprint,
+                        )
+                    )
+                payload = {
+                    "schema_version": schema_version,
+                    "strategy_fingerprint": engine.STRATEGY_FINGERPRINT,
+                    "previous_hash": "",
+                    "observation": observation,
+                }
+                record = {
+                    **payload,
+                    "record_hash": engine.canonical_sha256(payload),
+                }
+                self.shadow_file.write_text(
+                    json.dumps(record, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+
+                stale = engine.PortfolioState()
+                replay = replace(
+                    make_decision(),
+                    shadow_observations=(current,),
+                )
+                summary = engine.append_shadow_ledger(
+                    make_run(state=stale, decision=replay)
+                )
+                self.assertEqual(summary["sessions"], 1)
+                self.assertEqual(
+                    stale.shadow_ledger_chain_hash,
+                    record["record_hash"],
+                )
 
     def test_shadow_append_failure_cannot_advance_persisted_signal_state(self):
         decision = replace(

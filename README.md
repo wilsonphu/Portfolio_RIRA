@@ -22,16 +22,17 @@ The SOXL sleeve requires both:
 - positive 21-session residual momentum from a separated-window SMH-on-QQQ
   OLS model.
 
-The sleeve is sized with the existing causal QLD/SOXL HAR-style volatility
-forecast and a 55% overlay budget. Trend failure exits SOXL immediately.
-Residual exits occur on the fixed 21-session review clock. Re-entry requires
-two distinct eligible closes; volatility reductions are immediate and
-increases require five completed sessions.
+The residual signal is the alpha gate. The 200-session trend rule is retained
+as a defensive SOXL exit fuse, not as a standalone return claim. The sleeve is
+sized with the causal QLD/SOXL HAR-style volatility forecast and a 55% overlay
+admission budget. The budget chooses among the frozen tiers; it is not a
+promise that subsequently realized portfolio volatility will remain below
+55%.
 
-When both alpha gates are open, the volatility model chooses the highest tier
-that fits the risk budget. If 15% does not fit, SOXL remains at 0%. Any
-triggered rebalance returns SOXL to its exact strategic tier; other positions
-normally stop at the inner drift band.
+Trend failure exits SOXL immediately. Residual exits occur on the fixed
+21-session review clock. Re-entry requires two distinct eligible closes;
+volatility reductions are immediate and increases require five completed
+sessions. If 15% does not fit, SOXL remains at 0%.
 
 ## Automatic lifecycle ratchet
 
@@ -63,16 +64,13 @@ lifecycle layer changes only how that exposure is delivered:
 - Retirement reserve: SGOV.
 
 Between integer leverage levels the engine blends adjacent products to hit the
-stage ceiling exactly. The delayed-deleveraging ratchet deliberately retains
-the full sprint through the 30s and early 40s unless the inflation-adjusted
-$250,000 value gate is reached first. It does not silently switch the Nasdaq
-thesis to the S&P 500. Lifecycle transitions are structural actions, bypass the
-drift band, and generate one email with the complete destination portfolio.
+stage ceiling exactly. Lifecycle transitions are structural actions, bypass
+the drift band, and generate one email with the complete destination
+portfolio.
 
-The strategy is deployed to production by investor authorization. Historical
-backtests are not evidence that its return advantage will persist. Before the
-first lifecycle milestone, a roughly two-thirds portfolio drawdown remains
-plausible. Deleveraging is a risk-control rule, not an additional alpha claim.
+The strategy is deployed by investor authorization. Historical backtests do
+not prove that its return advantage will persist. Before the first lifecycle
+milestone, a roughly two-thirds drawdown remains plausible.
 
 ## Portfolio state and notifications
 
@@ -125,6 +123,15 @@ broker holdings. Never use `ROTH_IRA_AMOUNT` to replace existing state.
 State, holdings, balances, addresses, and credentials must never be committed.
 Production state is restored from and saved to the `roth-ira-state` workflow
 artifact.
+
+## Research governance
+
+The production runner records non-trading comparison targets in its
+hash-chained shadow ledger. These controls can measure drift-band sensitivity
+and SPY/SSO core substitutions, but they cannot alter live holdings, orders,
+state transitions, or notifications. A variant must pass the frozen rules in
+`STRATEGY_DEVELOPMENT_PROTOCOL.md` before promotion. Research reports and raw
+outputs stay outside the production repository.
 
 ## Local validation
 
