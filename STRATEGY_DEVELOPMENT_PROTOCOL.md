@@ -1,6 +1,6 @@
 # Strategy development protocol
 
-Frozen on 2026-08-25. This document governs research around the Roth IRA
+Revised on 2026-09-12. This document governs research around the Roth IRA
 allocator. It is not a trade instruction and cannot change production state.
 
 ## Objective
@@ -19,7 +19,7 @@ live strategy fingerprint.
 At latent SOXL tier `s` in `{0%, 15%, 25%, 35%}`, the sprint target is:
 
 ```text
-TQQQ = 65% * (1 - s)
+QLD  = 65% * (1 - s)
 UGL  = 35% * (1 - s)
 SOXL = s
 ```
@@ -35,8 +35,14 @@ limits candidate tiers; it does not guarantee future realized volatility.
 Trend failure exits immediately, re-entry needs two distinct closes,
 volatility cuts are immediate, and increases wait five completed sessions.
 
-The permanent lifecycle ratchet changes delivery leverage according to age and
+The permanent lifecycle ratchet changes delivery exposure according to age and
 inflation-adjusted account value. It is a risk policy, not an alpha claim.
+
+The QLD foundation was promoted by investor authorization as a deliberate
+reduction in daily leveraged Nasdaq exposure. The controlled 2013-2026 study
+showed lower growth and lower drawdown than the prior TQQQ foundation; it did
+not establish additional alpha. The prior TQQQ strategy remains a research
+benchmark.
 
 ## Evidence retained from the 2026-08-25 review
 
@@ -57,8 +63,8 @@ inflation-adjusted account value. It is a risk policy, not an alpha claim.
   allocation.
 
 These results are exploratory because the same finite history has been examined
-many times. They justify retaining the existing design, not claiming a durable
-out-of-sample edge.
+many times. They support retaining the tested signal and execution components,
+not claiming a durable out-of-sample edge.
 
 ## Data and timing rules
 
@@ -77,11 +83,12 @@ out-of-sample edge.
 Every complete study must report:
 
 1. production with its actual stateful alpha, lifecycle, and drift rules;
-2. the same 65/35 TQQQ/UGL core without SOXL;
-3. permanent sprint, isolating lifecycle effects;
-4. QLD buy-and-hold as the simple leveraged-Nasdaq anchor;
-5. the challenger with no favorable change to timing or cost assumptions; and
-6. a zero-cost path only as attribution, never as the decision result.
+2. the same 65/35 QLD/UGL foundation without SOXL;
+3. the retired 65/35 TQQQ/UGL production control;
+4. permanent sprint, isolating lifecycle effects;
+5. QLD buy-and-hold as the simple leveraged-Nasdaq anchor;
+6. the challenger with no favorable change to timing or cost assumptions; and
+7. a zero-cost path only as attribution, never as the decision result.
 
 Share quantities and cash must evolve through time. Replacing holdings with
 target weights each day is an implicit free rebalance and invalidates a path.

@@ -447,7 +447,7 @@ class SignalIntegrationTests(EngineTestCase):
     def test_lifecycle_delivery_map_preserves_sources_and_exact_exposure(self):
         multipliers = {
             "nasdaq": {
-                engine.LEVERAGED_INDEX: 3.0,
+                engine.LEVERAGED_INDEX: 2.0,
                 engine.VOLATILITY_INDEX: 2.0,
                 engine.UNLEVERAGED_INDEX: 1.0,
             },
@@ -469,6 +469,11 @@ class SignalIntegrationTests(EngineTestCase):
                 ceiling = engine.LIFECYCLE_EXPOSURE_CEILINGS[stage]
                 if ceiling is None:
                     ceiling = engine.strategic_daily_exposure(soxl_weight)
+                else:
+                    ceiling = min(
+                        ceiling,
+                        engine.strategic_daily_exposure(soxl_weight),
+                    )
                 self.assertAlmostEqual(exposure, ceiling, places=12)
                 self.assertAlmostEqual(sum(weights.values()), 1.0, places=12)
                 for source, products in multipliers.items():
@@ -797,6 +802,46 @@ class RebalanceTests(EngineTestCase):
             tiny_table["Ticker"] == engine.LEGACY_HEDGE
         ].iloc[0]
         self.assertEqual(tiny_row["Action"], "SELL")
+
+    def test_retired_tqqq_core_is_sold_during_qld_transition(self):
+        state = self.aligned_state(0.0)
+        state.shares = {
+            engine.LEGACY_TRIPLE_INDEX: 0.10,
+            engine.LEVERAGED_INDEX: 6.4,
+            engine.LEVERAGED_GOLD: 3.5,
+        }
+        current = {
+            engine.LEGACY_TRIPLE_INDEX: 0.01,
+            engine.LEVERAGED_INDEX: 0.64,
+            engine.LEVERAGED_GOLD: 0.35,
+        }
+        plan = engine.build_rebalance_plan(
+            current,
+            make_decision(0.0),
+            state,
+        )
+        self.assertTrue(plan.full_transition)
+        self.assertEqual(plan.reason, "LEGACY_POSITION_EXIT")
+        self.assertEqual(
+            plan.execution_weights.get(engine.LEGACY_TRIPLE_INDEX, 0.0),
+            0.0,
+        )
+        self.assertAlmostEqual(
+            plan.execution_weights[engine.LEVERAGED_INDEX],
+            0.65,
+        )
+        table = engine.calculate_execution_table(
+            one_row_prices(),
+            plan.execution_weights,
+            1_000.0,
+            state,
+            actionable=True,
+        )
+        tqqq = table.loc[
+            table["Ticker"] == engine.LEGACY_TRIPLE_INDEX
+        ].iloc[0]
+        self.assertEqual(tqqq["Action"], "SELL")
+        self.assertEqual(tqqq["TargetPct"], 0.0)
 
     def test_qld_is_a_supported_lifecycle_holding(self):
         state = self.aligned_state(0.0)
@@ -1514,11 +1559,11 @@ class AuditAndCliTests(EngineTestCase):
         )
         self.assertEqual(
             targets["production_v5"],
-            engine.target_weights(0.25, engine.LIFECYCLE_PHI),
+            engine._forward_v1_target_weights(0.25, engine.LIFECYCLE_PHI),
         )
         self.assertEqual(
             targets["permanent_sprint"],
-            engine.target_weights(0.25, engine.LIFECYCLE_SPRINT),
+            engine._forward_v1_target_weights(0.25, engine.LIFECYCLE_SPRINT),
         )
         self.assertEqual(
             targets["qld_soxl_same_alpha"],
@@ -1530,7 +1575,7 @@ class AuditAndCliTests(EngineTestCase):
         self.assertEqual(
             targets["tqqq_btal_50_50_band_5pp"],
             {
-                engine.LEVERAGED_INDEX: 0.5,
+                "TQQQ": 0.5,
                 engine.FORWARD_ANTI_BETA: 0.5,
             },
         )
@@ -1547,7 +1592,7 @@ class AuditAndCliTests(EngineTestCase):
                     engine.UNLEVERAGED_GOLD:
                     engine.FORWARD_BROAD_EQUITY,
                 }.get(ticker, ticker): weight
-                for ticker, weight in engine.target_weights(
+                for ticker, weight in engine._forward_v1_target_weights(
                     0.25,
                     engine.LIFECYCLE_PHI,
                 ).items()
@@ -1596,7 +1641,7 @@ class AuditAndCliTests(EngineTestCase):
         self.assertEqual(
             sprint["tqqq_spy_65_35_same_alpha_lifecycle"],
             {
-                engine.LEVERAGED_INDEX: 0.65,
+                "TQQQ": 0.65,
                 engine.FORWARD_BROAD_EQUITY: 0.35,
                 engine.LEVERAGED_SEMICONDUCTOR: 0.0,
             },
@@ -1604,7 +1649,7 @@ class AuditAndCliTests(EngineTestCase):
         self.assertEqual(
             sprint["tqqq_sso_65_35_same_alpha_lifecycle"],
             {
-                engine.LEVERAGED_INDEX: 0.65,
+                "TQQQ": 0.65,
                 engine.FORWARD_LEVERAGED_BROAD_EQUITY: 0.35,
                 engine.LEVERAGED_SEMICONDUCTOR: 0.0,
             },

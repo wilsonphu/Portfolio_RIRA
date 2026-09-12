@@ -1,7 +1,7 @@
 # Roth IRA production allocator
 
 This repository contains one production system: a stateful, notification-only
-TQQQ/UGL core with a bounded SOXL overlay and a permanent lifecycle
+QLD/UGL foundation with a bounded SOXL overlay and a permanent lifecycle
 deleveraging ratchet. It does not connect to a broker or place trades
 automatically.
 
@@ -10,7 +10,7 @@ automatically.
 At strategic SOXL weight `s`, the portfolio target is:
 
 ```text
-TQQQ = 65% * (1 - s)
+QLD  = 65% * (1 - s)
 UGL  = 35% * (1 - s)
 SOXL = s
 ```
@@ -19,7 +19,7 @@ SOXL = s
 The SOXL sleeve requires both:
 
 - QQQ strictly above its completed-close 200-session SMA; and
-- positive 21-session residual momentum from a separated-window SMH-on-QQQ
+- positive 63-session residual momentum from a separated-window SMH-on-QQQ
   OLS model.
 
 The residual signal is the alpha gate. The 200-session trend rule is retained
@@ -42,7 +42,7 @@ moves backward after a drawdown.
 
 | Stage | 2026-dollar value gate | Age gate | Advertised daily exposure |
 |---|---:|---:|---:|
-| `SPRINT` | below $250,000 | below 45 | current 2.65x-2.77x |
+| `SPRINT` | below $250,000 | below 45 | current 2.00x-2.35x |
 | `GLIDE_225` | $250,000 | 45 | 2.25x |
 | `TWO_X` | $500,000 | 50 | 2.00x |
 | `PHI` | $1,000,000 | 55 | 1.618x |
@@ -58,19 +58,20 @@ on that date. Set the optional `INVESTOR_BIRTH_DATE` repository secret in
 The alpha model still determines the Nasdaq/gold/semiconductor source mix. The
 lifecycle layer changes only how that exposure is delivered:
 
-- Nasdaq: TQQQ to QLD to QQQM.
+- Nasdaq: QLD to QQQM.
 - Gold: UGL to a UGL/GLDM blend to GLDM.
 - Semiconductors: SOXL to USD to SMH.
 - Retirement reserve: SGOV.
 
-Between integer leverage levels the engine blends adjacent products to hit the
-stage ceiling exactly. Lifecycle transitions are structural actions, bypass
-the drift band, and generate one email with the complete destination
-portfolio.
+Between integer exposure levels the engine blends adjacent products to remain
+at or below the stage ceiling. A stage does not add exposure when the current
+target is already below its ceiling. Lifecycle transitions are structural
+actions, bypass the drift band, and generate one email with the complete
+destination portfolio.
 
 The strategy is deployed by investor authorization. Historical backtests do
 not prove that its return advantage will persist. Before the first lifecycle
-milestone, a roughly two-thirds drawdown remains plausible.
+milestone, a loss of half the portfolio remains plausible.
 
 ## Portfolio state and notifications
 

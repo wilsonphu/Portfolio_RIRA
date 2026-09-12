@@ -2,10 +2,11 @@
 """Production lifecycle Roth allocation engine.
 
 Signals are calculated from completed, adjusted daily bars. The permanent core
-starts at 65% TQQQ / 35% UGL; a volatility-sized SOXL overlay is admitted only
+starts at 65% QLD / 35% UGL; a volatility-sized SOXL overlay is admitted only
 by the frozen QQQ-trend and SMH-residual-strength rules. As portfolio value and
-investor age advance, a one-way lifecycle ratchet replaces 3x products with
-2x/1x equivalents while preserving the model's risk-source proportions.
+investor age advance, a one-way lifecycle ratchet replaces 2x/3x products
+with lower-exposure equivalents while preserving the model's risk-source
+proportions.
 Confirmed broker shares and cash are always the source of truth.
 """
 
@@ -40,7 +41,7 @@ import alpha_core as core
 MARKET_INDEX = core.QQQ
 SEMICONDUCTOR_SIGNAL = core.SMH
 VOLATILITY_INDEX = core.QLD
-LEVERAGED_INDEX = "TQQQ"
+LEVERAGED_INDEX = core.QLD
 LEVERAGED_GOLD = "UGL"
 LEVERAGED_SEMICONDUCTOR = core.SOXL
 FORWARD_ANTI_BETA = "BTAL"
@@ -53,9 +54,9 @@ UNLEVERAGED_SEMICONDUCTOR = core.SMH
 TREASURY_RESERVE = "SGOV"
 CASH_ASSET = core.CASH
 
-CORE_TQQQ_SHARE = 0.65
+CORE_QLD_SHARE = 0.65
 CORE_UGL_SHARE = 0.35
-MAX_ADVERTISED_DAILY_EXPOSURE = 2.7725
+MAX_ADVERTISED_DAILY_EXPOSURE = 2.35
 
 LIFECYCLE_SPRINT = "SPRINT"
 LIFECYCLE_GLIDE_225 = "GLIDE_225"
@@ -107,34 +108,44 @@ LIFECYCLE_ANCHOR_AGE = 23.0
 LEGACY_TECH = "TECL"
 LEGACY_DEFENSIVE_EQUITY = "SPMO"
 LEGACY_HEDGE = "GLD"
+LEGACY_TRIPLE_INDEX = "TQQQ"
 LEGACY_HOLDINGS = frozenset(
     {
         LEGACY_TECH,
         LEGACY_DEFENSIVE_EQUITY,
         LEGACY_HEDGE,
+        LEGACY_TRIPLE_INDEX,
     }
 )
 
 SIGNAL_TICKERS = (MARKET_INDEX, SEMICONDUCTOR_SIGNAL)
 VOLATILITY_TICKERS = (VOLATILITY_INDEX, LEVERAGED_SEMICONDUCTOR)
-STRATEGIC_TICKERS = (
-    LEVERAGED_INDEX,
-    LEVERAGED_GOLD,
-    LEVERAGED_SEMICONDUCTOR,
-    VOLATILITY_INDEX,
-    DOUBLE_SEMICONDUCTOR,
-    UNLEVERAGED_INDEX,
-    UNLEVERAGED_GOLD,
-    UNLEVERAGED_SEMICONDUCTOR,
-    TREASURY_RESERVE,
+STRATEGIC_TICKERS = tuple(
+    dict.fromkeys(
+        (
+            LEVERAGED_INDEX,
+            LEVERAGED_GOLD,
+            LEVERAGED_SEMICONDUCTOR,
+            VOLATILITY_INDEX,
+            DOUBLE_SEMICONDUCTOR,
+            UNLEVERAGED_INDEX,
+            UNLEVERAGED_GOLD,
+            UNLEVERAGED_SEMICONDUCTOR,
+            TREASURY_RESERVE,
+        )
+    )
 )
-EQUITY_TICKERS = (
-    LEVERAGED_INDEX,
-    LEVERAGED_SEMICONDUCTOR,
-    VOLATILITY_INDEX,
-    DOUBLE_SEMICONDUCTOR,
-    UNLEVERAGED_INDEX,
-    UNLEVERAGED_SEMICONDUCTOR,
+EQUITY_TICKERS = tuple(
+    dict.fromkeys(
+        (
+            LEVERAGED_INDEX,
+            LEVERAGED_SEMICONDUCTOR,
+            VOLATILITY_INDEX,
+            DOUBLE_SEMICONDUCTOR,
+            UNLEVERAGED_INDEX,
+            UNLEVERAGED_SEMICONDUCTOR,
+        )
+    )
 )
 SEMICONDUCTOR_HOLDINGS = (
     LEVERAGED_SEMICONDUCTOR,
@@ -164,7 +175,7 @@ TRANSACTION_COST_SCENARIOS_BPS = (5, 10, 25)
 MODEL_START_DATE = core.MODEL_HISTORY_START
 REQUIRED_SIGNAL_ROWS = 840
 
-STRATEGY_REVISION = "tqqq65-ugl35-soxl-delayed-lifecycle-v5"
+STRATEGY_REVISION = "qld65-ugl35-soxl-delayed-lifecycle-v6"
 EXPERIMENTAL_LIVE = True
 STATE_VERSION = 13
 DECISION_AUDIT_SCHEMA_VERSION = 4
@@ -181,7 +192,7 @@ SHADOW_LEDGER_FILE = APP_DIR / "roth_ira_shadow_ledger.jsonl"
 
 ADVERTISED_DAILY_MULTIPLIERS = {
     VOLATILITY_INDEX: 2.0,
-    LEVERAGED_INDEX: 3.0,
+    LEVERAGED_INDEX: 2.0,
     LEVERAGED_GOLD: 2.0,
     LEVERAGED_SEMICONDUCTOR: 3.0,
     FORWARD_BROAD_EQUITY: 1.0,
@@ -194,19 +205,19 @@ ADVERTISED_DAILY_MULTIPLIERS = {
     LEGACY_TECH: 3.0,
     LEGACY_DEFENSIVE_EQUITY: 1.0,
     LEGACY_HEDGE: 1.0,
+    LEGACY_TRIPLE_INDEX: 3.0,
     CASH_ASSET: 0.0,
 }
 
 
 def aggressive_target_weights(soxl_weight: float) -> dict[str, float]:
-    """Return the frozen proportional TQQQ/UGL core plus SOXL overlay."""
-    # Reuse the audited core validator and grid boundary without inheriting its
-    # legacy QLD allocation.
+    """Return the proportional QLD/UGL foundation plus SOXL overlay."""
+    # Reuse the audited core validator and grid boundary.
     core.target_weights(soxl_weight)
     weight = min(max(float(soxl_weight), 0.0), core.MAX_SOXL_WEIGHT)
     remaining = 1.0 - weight
     result = {
-        LEVERAGED_INDEX: CORE_TQQQ_SHARE * remaining,
+        LEVERAGED_INDEX: CORE_QLD_SHARE * remaining,
         LEVERAGED_GOLD: CORE_UGL_SHARE * remaining,
         LEVERAGED_SEMICONDUCTOR: weight,
     }
@@ -218,7 +229,7 @@ def aggressive_target_weights(soxl_weight: float) -> dict[str, float]:
 def _risk_source_weights(soxl_weight: float) -> tuple[dict[str, float], float]:
     aggressive = aggressive_target_weights(soxl_weight)
     source_exposure = {
-        "nasdaq": 3.0 * aggressive[LEVERAGED_INDEX],
+        "nasdaq": 2.0 * aggressive[LEVERAGED_INDEX],
         "gold": 2.0 * aggressive[LEVERAGED_GOLD],
         "semiconductors": 3.0 * aggressive[LEVERAGED_SEMICONDUCTOR],
     }
@@ -272,19 +283,24 @@ def target_weights(
     ceiling = LIFECYCLE_EXPOSURE_CEILINGS[lifecycle_stage]
     if ceiling is None:
         raise RuntimeError("Non-sprint lifecycle stage has no exposure ceiling")
-    if ceiling >= 2.0:
-        fraction = (ceiling - 2.0) / (aggressive_exposure - 2.0)
+    effective_ceiling = min(float(ceiling), aggressive_exposure)
+    if effective_ceiling >= aggressive_exposure - 1e-12:
+        result = aggressive
+    elif effective_ceiling >= 2.0:
+        fraction = (effective_ceiling - 2.0) / (aggressive_exposure - 2.0)
         result = _blend_weights(aggressive, double, fraction)
-    elif ceiling >= 1.0:
-        result = _blend_weights(double, single, ceiling - 1.0)
+    elif effective_ceiling >= 1.0:
+        result = _blend_weights(double, single, effective_ceiling - 1.0)
     else:
         result = {
-            ticker: ceiling * weight for ticker, weight in single.items()
+            ticker: effective_ceiling * weight for ticker, weight in single.items()
         }
-        result[TREASURY_RESERVE] = 1.0 - ceiling
+        result[TREASURY_RESERVE] = 1.0 - effective_ceiling
     if not np.isclose(sum(result.values()), 1.0, atol=1e-12):
         raise RuntimeError("Lifecycle target weights do not sum to 1.0")
-    if not np.isclose(advertised_daily_exposure(result), ceiling, atol=1e-12):
+    if not np.isclose(
+        advertised_daily_exposure(result), effective_ceiling, atol=1e-12
+    ):
         raise RuntimeError("Lifecycle target exposure does not match its ceiling")
     return result
 
@@ -338,7 +354,7 @@ def strategy_manifest() -> dict[str, object]:
         },
         "allocation": {
             "core": {
-                "tqqq": CORE_TQQQ_SHARE,
+                "qld": CORE_QLD_SHARE,
                 "ugl": CORE_UGL_SHARE,
                 "application": "proportional_to_one_minus_soxl",
             },
@@ -363,7 +379,7 @@ def strategy_manifest() -> dict[str, object]:
                 "birth_date_override": "optional_INVESTOR_BIRTH_DATE",
                 "ratchet": "one_way_never_relever_after_stage_advance",
                 "mapping": {
-                    "nasdaq": [LEVERAGED_INDEX, VOLATILITY_INDEX, UNLEVERAGED_INDEX],
+                    "nasdaq": [LEVERAGED_INDEX, UNLEVERAGED_INDEX],
                     "gold": [LEVERAGED_GOLD, UNLEVERAGED_GOLD],
                     "semiconductors": [
                         LEVERAGED_SEMICONDUCTOR,
@@ -805,7 +821,7 @@ def calculate_implementation_fingerprint() -> str:
 
 STRATEGY_FINGERPRINT = calculate_strategy_fingerprint()
 EXPECTED_STRATEGY_FINGERPRINT = (
-    "93f2811533f67a18cc20e8120778567c8ebde2526bb48cc6ea024c8fc64be0d7"
+    "14c8025f463ec2ab582ec42348dbf269514f1a5c15b0434c1f991cf486a9eb94"
 )
 
 _configured_roth_amount = os.environ.get("ROTH_IRA_AMOUNT", "").strip()
@@ -1256,12 +1272,17 @@ def validate_configuration() -> None:
             if not np.isclose(sum(weights.values()), 1.0, atol=1e-12):
                 raise RuntimeError("Lifecycle allocation invariant failed")
             ceiling = LIFECYCLE_EXPOSURE_CEILINGS[stage]
-            if ceiling is not None and not np.isclose(
-                advertised_daily_exposure(weights),
-                ceiling,
-                atol=1e-12,
-            ):
-                raise RuntimeError("Lifecycle exposure invariant failed")
+            if ceiling is not None:
+                expected_exposure = min(
+                    strategic_daily_exposure(soxl_weight),
+                    float(ceiling),
+                )
+                if not np.isclose(
+                    advertised_daily_exposure(weights),
+                    expected_exposure,
+                    atol=1e-12,
+                ):
+                    raise RuntimeError("Lifecycle exposure invariant failed")
 
 
 def validate_state(state: PortfolioState) -> None:
