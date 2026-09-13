@@ -14,7 +14,6 @@ import hashlib
 import json
 import logging
 import os
-import shutil
 import smtplib
 import sys
 from dataclasses import asdict, dataclass, field, fields, replace
@@ -121,8 +120,8 @@ LIFECYCLE_ANCHOR_DATE = date(2026, 8, 14)
 LIFECYCLE_ANCHOR_AGE = 23.0
 
 STRATEGY_REVISION = "tqqq-upro40-dbmf20-zroz20-ugl20-sma200-annual-v3"
-STATE_VERSION = 17
-DECISION_AUDIT_SCHEMA_VERSION = 8
+STATE_VERSION = 18
+DECISION_AUDIT_SCHEMA_VERSION = 9
 APP_DIR = Path(__file__).resolve().parent
 STATE_FILE = APP_DIR / "roth_ira_state.json"
 LOG_FILE = APP_DIR / "roth_ira.log"
@@ -448,12 +447,24 @@ def validate_configuration() -> None:
         raise RuntimeError("Strategy fingerprint is internally inconsistent")
     if STRATEGY_FINGERPRINT != EXPECTED_STRATEGY_FINGERPRINT:
         raise RuntimeError("Decision boundaries changed without fingerprint review")
-    for active in (False, True):
-        weights = target_weights(active)
-        if not np.isclose(sum(weights.values()), 1.0, atol=1e-12):
-            raise RuntimeError("Allocation invariant failed")
-        if not np.isclose(advertised_daily_exposure(weights), core.MAX_ADVERTISED_DAILY_EXPOSURE):
-            raise RuntimeError("Exposure invariant failed")
+    for stage in LIFECYCLE_STAGES:
+        ceiling = LIFECYCLE_EXPOSURE_CEILINGS[stage]
+        for active in (False, True):
+            weights = target_weights(active, stage)
+            if not np.isclose(sum(weights.values()), 1.0, atol=1e-12):
+                raise RuntimeError("Allocation invariant failed")
+            exposure = advertised_daily_exposure(weights)
+            expected = core.MAX_ADVERTISED_DAILY_EXPOSURE
+            if ceiling is not None:
+                expected = min(expected, ceiling)
+            if not np.isclose(exposure, expected, atol=1e-12):
+                raise RuntimeError("Lifecycle exposure invariant failed")
+    value_stages = [stage for _, stage in LIFECYCLE_VALUE_THRESHOLDS_2026]
+    age_stages = [stage for _, stage in LIFECYCLE_AGE_THRESHOLDS]
+    if value_stages != sorted(value_stages, key=_lifecycle_rank):
+        raise RuntimeError("Lifecycle value stages are not monotonic")
+    if age_stages != sorted(age_stages, key=_lifecycle_rank):
+        raise RuntimeError("Lifecycle age stages are not monotonic")
 
 
 def _validate_weights(weights: object, name: str, *, require_total: bool) -> None:
@@ -492,7 +503,11 @@ def validate_state(state: PortfolioState) -> None:
     ):
         if not isinstance(getattr(state, name), bool):
             raise RuntimeError(f"{name} must be boolean")
-    if not isinstance(state.tqqq_bullish_streak, int) or isinstance(state.tqqq_bullish_streak, bool) or state.tqqq_bullish_streak < 0:
+    if (
+        not isinstance(state.tqqq_bullish_streak, int)
+        or isinstance(state.tqqq_bullish_streak, bool)
+        or state.tqqq_bullish_streak < 0
+    ):
         raise RuntimeError("tqqq_bullish_streak is invalid")
     for name in (
         "last_completed_annual_rebalance_year",
@@ -501,7 +516,10 @@ def validate_state(state: PortfolioState) -> None:
         value = getattr(state, name)
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             raise RuntimeError(f"{name} is invalid")
-    if state.lifecycle_stage not in LIFECYCLE_STAGES or state.executed_lifecycle_stage not in LIFECYCLE_STAGES:
+    if (
+        state.lifecycle_stage not in LIFECYCLE_STAGES
+        or state.executed_lifecycle_stage not in LIFECYCLE_STAGES
+    ):
         raise RuntimeError("Lifecycle state is invalid")
     _validate_weights(
         state.pending_recommendation_weights,
@@ -509,7 +527,17 @@ def validate_state(state: PortfolioState) -> None:
         require_total=bool(state.pending_recommendation_date),
     )
     if state.pending_recommendation_date:
-        _parse_date(state.pending_recommendation_date, "pending_recommendation_date")
+        pending_date = _parse_date(
+            state.pending_recommendation_date, "pending_recommendation_date"
+        )
+        superseded_date = _parse_date(
+            state.pending_recommendation_supersedes_date,
+            "pending_recommendation_supersedes_date",
+        )
+        if superseded_date and pending_date and superseded_date >= pending_date:
+            raise RuntimeError(
+                "pending_recommendation_supersedes_date must precede the pending date"
+            )
         if not _is_sha256(state.pending_recommendation_fingerprint):
             raise RuntimeError("Pending recommendation fingerprint is invalid")
         if state.pending_recommendation_lifecycle_stage not in LIFECYCLE_STAGES:
@@ -582,20 +610,33 @@ def validate_state(state: PortfolioState) -> None:
         "last_contribution_notice_date",
     ):
         _parse_date(getattr(state, name), name)
+    if state.last_updated:
+        if not isinstance(state.last_updated, str):
+            raise RuntimeError("last_updated must be a string")
+        try:
+            datetime.fromisoformat(state.last_updated)
+        except ValueError as exc:
+            raise RuntimeError("last_updated must be an ISO-8601 timestamp") from exc
     for name in ("last_processed_data_fingerprint", "last_delivered_decision_hash"):
         value = getattr(state, name)
         if value and not _is_sha256(value):
             raise RuntimeError(f"{name} is invalid")
 
 
-def _safe_mapping(value: object) -> dict[str, float]:
-    if not isinstance(value, dict):
+def _migrate_mapping(value: object, name: str) -> dict[str, float]:
+    """Validate migrated holdings without silently discarding account data."""
+    if value is None:
         return {}
-    result = {}
+    if not isinstance(value, dict):
+        raise RuntimeError(f"{name} must be a mapping")
+    result: dict[str, float] = {}
     for ticker, quantity in value.items():
-        name = str(ticker).upper()
-        if name in PORTFOLIO_COMPONENTS and _is_number(quantity):
-            result[name] = float(quantity)
+        symbol = str(ticker).upper()
+        if symbol not in PORTFOLIO_COMPONENTS:
+            raise RuntimeError(f"{name} contains unsupported holding {symbol}")
+        if not _is_number(quantity):
+            raise RuntimeError(f"{name} contains an invalid quantity for {symbol}")
+        result[symbol] = float(quantity)
     return result
 
 
@@ -603,8 +644,24 @@ def _migrate_state(payload: dict[str, object]) -> PortfolioState:
     version = payload.get("state_version")
     if not isinstance(version, int) or isinstance(version, bool) or not 2 <= version < STATE_VERSION:
         raise RuntimeError(f"Unsupported state version: {version!r}")
-    shares = _safe_mapping(payload.get("shares"))
-    pending = _safe_mapping(payload.get("pending_recommendation_weights"))
+    if version == 17:
+        allowed = {item.name for item in fields(PortfolioState)}
+        unknown = set(payload) - allowed
+        if unknown:
+            raise RuntimeError(
+                f"Portfolio state contains unknown fields: {sorted(unknown)}"
+            )
+        migrated = dict(payload)
+        migrated["state_version"] = STATE_VERSION
+        # Version 18 fingerprints normalized signal inputs rather than raw
+        # provider floats. Accept one same-date replay after this migration.
+        migrated["last_processed_data_fingerprint"] = ""
+        return PortfolioState(**migrated)
+    shares = _migrate_mapping(payload.get("shares"), "shares")
+    pending = _migrate_mapping(
+        payload.get("pending_recommendation_weights"),
+        "pending_recommendation_weights",
+    )
     prior_stage = payload.get("lifecycle_stage", LIFECYCLE_SPRINT)
     lifecycle = prior_stage if prior_stage in LIFECYCLE_STAGES else LIFECYCLE_SPRINT
     executed_stage = payload.get("executed_lifecycle_stage", lifecycle)
@@ -625,7 +682,7 @@ def _migrate_state(payload: dict[str, object]) -> PortfolioState:
     state = PortfolioState(
         shares=shares,
         cash_balance=float(payload.get("cash_balance", 0.0)),
-        target_weights=_safe_mapping(payload.get("target_weights")),
+        target_weights=_migrate_mapping(payload.get("target_weights"), "target_weights"),
         portfolio_value=float(payload.get("portfolio_value", 0.0)),
         strategy_initialized=False,
         tqqq_active=False,
@@ -640,10 +697,21 @@ def _migrate_state(payload: dict[str, object]) -> PortfolioState:
         ),
         pending_recommendation_date=pending_date,
         pending_recommendation_weights=pending,
-        pending_recommendation_tqqq_active=pending.get(GROWTH_EQUITY, 0.0) > pending.get(DEFENSIVE_EQUITY, 0.0),
+        pending_recommendation_tqqq_active=(
+            pending.get(GROWTH_EQUITY, 0.0)
+            > pending.get(DEFENSIVE_EQUITY, 0.0)
+        ),
         pending_recommendation_lifecycle_stage=pending_stage if pending_date else "",
-        pending_recommendation_notified=bool(payload.get("pending_recommendation_notified", False)) if pending_date else False,
-        pending_recommendation_supersedes_date=str(payload.get("pending_recommendation_supersedes_date", "")) if pending_date else "",
+        pending_recommendation_notified=(
+            bool(payload.get("pending_recommendation_notified", False))
+            if pending_date
+            else False
+        ),
+        pending_recommendation_supersedes_date=(
+            str(payload.get("pending_recommendation_supersedes_date", ""))
+            if pending_date
+            else ""
+        ),
         pending_recommendation_fingerprint=pending_fp,
         pending_recommendation_annual_year=int(
             payload.get("pending_recommendation_annual_year", 0)
@@ -658,7 +726,7 @@ def _migrate_state(payload: dict[str, object]) -> PortfolioState:
     return state
 
 
-def load_state(*, backup_legacy: bool = True) -> PortfolioState:
+def load_state() -> PortfolioState:
     if not STATE_FILE.exists():
         return PortfolioState()
     try:
@@ -675,9 +743,6 @@ def load_state(*, backup_legacy: bool = True) -> PortfolioState:
             raise RuntimeError(f"Portfolio state contains unknown fields: {sorted(unknown)}")
         state = PortfolioState(**payload)
     else:
-        if backup_legacy:
-            stamp = datetime.now(NEW_YORK).strftime("%Y%m%dT%H%M%S")
-            shutil.copy2(STATE_FILE, STATE_FILE.with_name(f"{STATE_FILE.stem}.v{version}.{stamp}.backup.json"))
         state = _migrate_state(payload)
         logger.info("Migrated state version %s to %s", version, STATE_VERSION)
     validate_state(state)
@@ -712,7 +777,13 @@ def expected_completed_session(now_new_york: datetime | None = None) -> pd.Times
         safe_close = calendar.session_close(today) + pd.Timedelta(minutes=MARKET_CLOSE_BUFFER_MINUTES)
         if opened <= now_utc < safe_close:
             raise RuntimeError("The latest daily bar is not final")
-    complete = [session for session in sessions if calendar.session_close(session) + pd.Timedelta(minutes=MARKET_CLOSE_BUFFER_MINUTES) <= now_utc]
+    complete = [
+        session
+        for session in sessions
+        if calendar.session_close(session)
+        + pd.Timedelta(minutes=MARKET_CLOSE_BUFFER_MINUTES)
+        <= now_utc
+    ]
     if not complete:
         raise RuntimeError("No completed XNYS session is available")
     return pd.Timestamp(complete[-1]).tz_localize(None).normalize()
@@ -722,7 +793,11 @@ def required_nyse_sessions(ending_session: pd.Timestamp, count: int) -> pd.Datet
     if count <= 0:
         raise ValueError("count must be positive")
     ending = pd.Timestamp(ending_session).normalize()
-    sessions = pd.DatetimeIndex(_nyse_calendar().sessions_in_range(ending - pd.Timedelta(days=max(30, count * 3)), ending))
+    sessions = pd.DatetimeIndex(
+        _nyse_calendar().sessions_in_range(
+            ending - pd.Timedelta(days=max(30, count * 3)), ending
+        )
+    )
     if sessions.tz is not None:
         sessions = sessions.tz_convert(None)
     if len(sessions) < count:
@@ -736,7 +811,11 @@ def _extract_yfinance_prices(data: pd.DataFrame, tickers: Iterable[str]) -> pd.D
         raise RuntimeError("yfinance returned no market data")
     try:
         if isinstance(data.columns, pd.MultiIndex):
-            prices = data["Close"].copy() if "Close" in data.columns.get_level_values(0) else data.xs("Close", axis=1, level=1).copy()
+            prices = (
+                data["Close"].copy()
+                if "Close" in data.columns.get_level_values(0)
+                else data.xs("Close", axis=1, level=1).copy()
+            )
         else:
             close = data["Close"]
             prices = close.to_frame(requested[0]) if isinstance(close, pd.Series) else pd.DataFrame(close)
@@ -769,7 +848,11 @@ def validate_session_continuity(index: pd.DatetimeIndex, expected: pd.Timestamp,
         raise RuntimeError("Market-data session continuity failed")
 
 
-def download_market_data(tickers: Iterable[str] = ALL_TICKERS, *, now_new_york: datetime | None = None) -> pd.DataFrame:
+def download_market_data(
+    tickers: Iterable[str] = ALL_TICKERS,
+    *,
+    now_new_york: datetime | None = None,
+) -> pd.DataFrame:
     import yfinance as yf
 
     expected = expected_completed_session(now_new_york)
@@ -797,11 +880,25 @@ def download_market_data(tickers: Iterable[str] = ALL_TICKERS, *, now_new_york: 
 def market_data_fingerprint(prices: pd.DataFrame) -> str:
     if len(prices) < REQUIRED_SIGNAL_ROWS:
         raise ValueError("Insufficient data for fingerprint")
-    return canonical_sha256({
-        "sessions": [pd.Timestamp(value).date().isoformat() for value in prices.index[-REQUIRED_SIGNAL_ROWS:]],
-        "qqq": [float(value) for value in prices[MARKET_INDEX].iloc[-REQUIRED_SIGNAL_ROWS:]],
-        "latest": {ticker: float(prices[ticker].iloc[-1]) for ticker in VALUATION_TICKERS},
-    })
+    qqq = pd.to_numeric(prices[MARKET_INDEX], errors="coerce")
+    close = float(qqq.iloc[-1])
+    sma_200 = float(qqq.iloc[-SMA_WINDOW:].mean())
+    sma_50 = float(qqq.iloc[-SHORT_TREND_WINDOW:].mean())
+    momentum_252 = float(close / qqq.iloc[-(MOMENTUM_WINDOW + 1)] - 1.0)
+    values = (close, sma_200, sma_50, momentum_252)
+    if not all(np.isfinite(value) for value in values):
+        raise ValueError("Signal inputs are invalid for fingerprinting")
+    return canonical_sha256(
+        {
+            "semantic_version": "normalized-signal-inputs-v2",
+            "session": pd.Timestamp(prices.index[-1]).date().isoformat(),
+            "qqq_close": round(close, 4),
+            "qqq_sma_200": round(sma_200, 4),
+            "qqq_sma_50": round(sma_50, 4),
+            "qqq_momentum_252": round(momentum_252, 6),
+            "trend_positive": close > sma_200,
+        }
+    )
 
 
 def _router_state(state: PortfolioState) -> core.EquityRouterState:
@@ -1174,15 +1271,28 @@ def build_rebalance_plan(
     annual_due = signal_year > state.last_completed_annual_rebalance_year
     strategy_changed = state.executed_strategy_fingerprint != STRATEGY_FINGERPRINT
     lifecycle_changed = state.executed_lifecycle_stage != decision.lifecycle_stage
-    router_changed = state.executed_tqqq_active != decision.router_state.tqqq_active
-    full = strategy_changed or lifecycle_changed or annual_due
+    active_ticker = (
+        GROWTH_EQUITY if decision.router_state.tqqq_active else DEFENSIVE_EQUITY
+    )
+    inactive_ticker = (
+        DEFENSIVE_EQUITY if decision.router_state.tqqq_active else GROWTH_EQUITY
+    )
+    equity_weight = sum(existing.get(ticker, 0.0) for ticker in EQUITY_TICKERS)
+    equity_missing = equity_weight <= 1e-12
+    router_misaligned = existing.get(inactive_ticker, 0.0) > 1e-12
+    router_changed = equity_missing or router_misaligned
+    full = strategy_changed or lifecycle_changed or annual_due or equity_missing
     due = full or router_changed
     if strategy_changed:
         reason = "STRATEGY_REVISION_TRANSITION"
     elif lifecycle_changed:
         reason = "LIFECYCLE_STAGE_ADVANCE"
-    elif router_changed:
+    elif equity_missing:
+        reason = "MISSING_EQUITY_POSITION"
+    elif decision.structural_change:
         reason = decision.transition_reason
+    elif router_misaligned:
+        reason = "EQUITY_ROUTER_REALIGNMENT"
     elif annual_due:
         reason = "ANNUAL_REBALANCE"
     else:
@@ -1192,11 +1302,6 @@ def build_rebalance_plan(
     else:
         execution = dict(existing)
         equity_weight = sum(execution.pop(ticker, 0.0) for ticker in EQUITY_TICKERS)
-        active_ticker = (
-            GROWTH_EQUITY
-            if decision.router_state.tqqq_active
-            else DEFENSIVE_EQUITY
-        )
         if equity_weight > 1e-12:
             execution[active_ticker] = equity_weight
     components = set(existing) | set(execution)
@@ -1292,11 +1397,11 @@ def preserve_pending_delivery_plan(
     )
 
 
-def run_strategy(roth_amount: float | None, *, backup_legacy_state: bool = True) -> StrategyRun:
+def run_strategy(roth_amount: float | None) -> StrategyRun:
     prices = download_market_data(ALL_TICKERS)
     signal_date = pd.Timestamp(prices.index[-1]).normalize()
     fingerprint = market_data_fingerprint(prices)
-    state = load_state(backup_legacy=backup_legacy_state)
+    state = load_state()
     validate_same_date_data_fingerprint(state, signal_date, fingerprint)
     value, planning = resolve_portfolio_value(roth_amount, state, prices)
     decision = calculate_strategy_decision(prices, state)
@@ -1444,7 +1549,11 @@ def prepare_notification_delivery(run: StrategyRun, notification: NotificationDe
         state.pending_recommendation_tqqq_active = run.decision.router_state.tqqq_active
         state.pending_recommendation_lifecycle_stage = run.decision.lifecycle_stage
         state.pending_recommendation_notified = False
-        state.pending_recommendation_supersedes_date = notification.previous_recommendation_date if notification.kind == "UPDATE" else ""
+        state.pending_recommendation_supersedes_date = (
+            notification.previous_recommendation_date
+            if notification.kind == "UPDATE"
+            else ""
+        )
         state.pending_recommendation_fingerprint = STRATEGY_FINGERPRINT
         state.pending_recommendation_annual_year = run.rebalance_plan.annual_rebalance_year
     elif notification.kind in {"RETRY", "UPDATE_RETRY"}:
@@ -1534,7 +1643,11 @@ def build_decision_audit(
     return payload
 
 
-def write_decision_audit(run: StrategyRun, notification: NotificationDecision, delivery_status: str) -> dict[str, object]:
+def write_decision_audit(
+    run: StrategyRun,
+    notification: NotificationDecision,
+    delivery_status: str,
+) -> dict[str, object]:
     payload = build_decision_audit(run, notification, delivery_status)
     temporary = DECISION_AUDIT_FILE.with_suffix(f"{DECISION_AUDIT_FILE.suffix}.tmp")
     temporary.write_text(json.dumps(payload, indent=2, allow_nan=False), encoding="utf-8")
@@ -1551,7 +1664,9 @@ def persist_notification_delivery(
     if not notification.should_send:
         raise ValueError("A NONE notification cannot be delivered")
     state = run.state
-    delivered_decision_hash = delivered_decision_hash or build_decision_audit(run, notification, "DELIVERED")["decision_hash"]
+    delivered_decision_hash = delivered_decision_hash or build_decision_audit(
+        run, notification, "DELIVERED"
+    )["decision_hash"]
     if not _is_sha256(delivered_decision_hash):
         raise ValueError("Delivered decision hash is invalid")
     if notification.kind in {"ACTION", "UPDATE", "RETRY", "UPDATE_RETRY"}:
@@ -1610,12 +1725,15 @@ def confirm_execution(shares: dict[str, float], cash: float, signal_date: str) -
         state.executed_strategy_fingerprint = state.pending_recommendation_fingerprint
         if state.pending_recommendation_annual_year:
             state.last_completed_annual_rebalance_year = state.pending_recommendation_annual_year
+        _clear_pending(state)
     else:
         state.target_weights = {}
-        state.executed_tqqq_active = shares.get(GROWTH_EQUITY, 0.0) > shares.get(DEFENSIVE_EQUITY, 0.0)
+        state.executed_tqqq_active = (
+            shares.get(GROWTH_EQUITY, 0.0) > 0
+            and shares.get(DEFENSIVE_EQUITY, 0.0) <= 0
+        )
         state.executed_lifecycle_stage = state.lifecycle_stage
         state.executed_strategy_fingerprint = ""
-    _clear_pending(state)
     save_state(state)
     return state
 
@@ -1626,6 +1744,10 @@ def sync_holdings(shares: dict[str, float], cash: float) -> PortfolioState:
         raise RuntimeError("Cannot sync while a recommendation is pending")
     state.shares = dict(shares)
     state.cash_balance = float(cash)
+    state.executed_tqqq_active = (
+        shares.get(GROWTH_EQUITY, 0.0) > 0
+        and shares.get(DEFENSIVE_EQUITY, 0.0) <= 0
+    )
     save_state(state)
     return state
 
@@ -1635,6 +1757,11 @@ def configure_contribution_plan(year: int, budget: float) -> PortfolioState:
         raise RuntimeError("Initialize or synchronize portfolio holdings first")
     if not isinstance(year, int) or isinstance(year, bool) or year < 2000:
         raise ValueError("Contribution year is invalid")
+    current_year = datetime.now(NEW_YORK).year
+    if year != current_year:
+        raise ValueError(
+            f"Contribution year must be the current New York year ({current_year})"
+        )
     if not _is_number(budget, positive=True):
         raise ValueError("Contribution budget must be positive and finite")
     state = load_state()
@@ -1694,6 +1821,22 @@ _LIFECYCLE_CEILING_LABEL = {
     stage: ("base target" if ceiling is None else f"{ceiling:.2f}x ceiling")
     for stage, ceiling in LIFECYCLE_EXPOSURE_CEILINGS.items()
 }
+_REASON_LABELS = {
+    "STRATEGY_REVISION_TRANSITION": "portfolio initialization",
+    "LIFECYCLE_STAGE_ADVANCE": "lifecycle risk reduction",
+    "MISSING_EQUITY_POSITION": "equity position missing",
+    "EQUITY_ROUTER_REALIGNMENT": "equity fund needs to be switched",
+    "TREND_SWITCH_TO_TQQQ": "bullish trend confirmed",
+    "TREND_SWITCH_TO_UPRO": "QQQ trend failed",
+    "ANNUAL_REBALANCE": "annual rebalance",
+    "ANNUAL_REVIEW": "annual review complete",
+    "CONFIRMED_TARGET_STATE": "confirmed holdings match",
+    "HOLD": "no change",
+    "CALENDAR_MILESTONE": "scheduled contribution",
+    "QQQ_PULLBACK_ABOVE_SMA200": "bull-market pullback",
+    "QQQ_DRAWDOWN_10": "10% QQQ drawdown",
+    "QQQ_DRAWDOWN_20_DEPLOY_REMAINDER": "20% QQQ drawdown",
+}
 
 
 def _visible_execution_rows(table: pd.DataFrame) -> pd.DataFrame:
@@ -1716,14 +1859,29 @@ def _dashboard_field(label: str, value: str) -> str:
     return f"{label:<14}{value}"
 
 
+def _reason_label(reason: str) -> str:
+    return _REASON_LABELS.get(reason, reason.replace("_", " ").lower())
+
+
+def _contribution_reason(plan: ContributionPlan) -> str:
+    return " + ".join(_reason_label(reason) for reason in plan.reasons)
+
+
 def build_dashboard(run: StrategyRun) -> str:
     decision = run.decision
     plan = run.rebalance_plan
-    diagnostics = run.execution_diagnostics
     active_fund = GROWTH_EQUITY if decision.router_state.tqqq_active else DEFENSIVE_EQUITY
+    active_weight = decision.target_weights.get(active_fund, 0.0)
     trend_gap = decision.qqq_close / decision.qqq_sma_200 - 1.0
     short_status = "above" if decision.qqq_close > decision.qqq_sma_50 else "below"
-    status = "ACTION REQUIRED" if plan.rebalance_due else "NO TRADES"
+    contribution_plan = run.contribution_plan
+    contribution_due = contribution_plan.notification_due
+    status = "ACTION REQUIRED" if plan.rebalance_due or contribution_due else "NO ACTION"
+    status_reason = (
+        _reason_label(plan.reason)
+        if plan.rebalance_due or not contribution_due
+        else _contribution_reason(contribution_plan)
+    )
 
     lines = [
         _dashboard_rule("="),
@@ -1731,18 +1889,46 @@ def build_dashboard(run: StrategyRun) -> str:
         _dashboard_rule("="),
         _dashboard_field("Signal close", str(run.signal_date.date())),
         _dashboard_field("Value", f"${run.portfolio_value:,.2f}"),
-        _dashboard_field("Status", f"{status}  ({plan.reason})"),
+        _dashboard_field("Status", status),
+        _dashboard_field("Reason", status_reason),
         "",
-        "DECISION",
+        "WHAT TO DO",
         _dashboard_rule(),
-        _dashboard_field("Equity", f"Hold {active_fund} in the 40% equity sleeve"),
+    ]
+    if contribution_due:
+        lines.append(
+            _dashboard_field("Deposit", f"${contribution_plan.due_amount:,.2f} now")
+        )
+    lines.append(
+        _dashboard_field(
+            "Portfolio",
+            "Place the orders below next session" if plan.rebalance_due else "No trades",
+        )
+    )
+
+    lines.extend([
+        "",
+        "TARGET",
+        _dashboard_rule(),
+        _dashboard_field("Equity", f"{active_fund} at {active_weight:.0%}"),
+        _dashboard_field(
+            "Allocation",
+            "  ".join(
+                f"{ticker} {weight:.0%}"
+                for ticker, weight in decision.target_weights.items()
+                if weight > 1e-12
+            ),
+        ),
+        "",
+        "SIGNAL",
+        _dashboard_rule(),
         _dashboard_field(
             "Trend",
             f"QQQ {trend_gap:+.1%} vs 200-day average "
             f"({'bullish' if decision.trend_positive else 'bearish'})",
         ),
         _dashboard_field(
-            "Health",
+            "Confirmation",
             f"{short_status} 50-day average  |  "
             f"12-month momentum {decision.qqq_momentum_252:+.1%}",
         ),
@@ -1751,7 +1937,7 @@ def build_dashboard(run: StrategyRun) -> str:
             f"{decision.lifecycle_stage} "
             f"({_LIFECYCLE_CEILING_LABEL.get(decision.lifecycle_stage, 'unknown')})",
         ),
-    ]
+    ])
     if len(decision.processed_signal_dates) > 1:
         lines.append(
             _dashboard_field(
@@ -1759,28 +1945,15 @@ def build_dashboard(run: StrategyRun) -> str:
             )
         )
 
-    lines.extend([
-        "",
-        "TARGET ALLOCATION",
-        _dashboard_rule(),
-        "  " + "   ".join(
-            f"{ticker} {weight:.0%}"
-            for ticker, weight in decision.target_weights.items()
-            if weight > 1e-12
-        ),
-    ])
-
-    contribution_plan = run.contribution_plan
     if contribution_plan.enabled:
         lines.extend([
             "",
-            "CONTRIBUTION PLAN",
+            "CONTRIBUTIONS",
             _dashboard_rule(),
-            _dashboard_field("Plan year", str(contribution_plan.year)),
             _dashboard_field(
-                "Notified",
+                str(contribution_plan.year),
                 f"${contribution_plan.released_amount:,.2f} of "
-                f"${contribution_plan.budget:,.2f}",
+                f"${contribution_plan.budget:,.2f} already notified",
             ),
         ])
         if contribution_plan.year != run.signal_date.year:
@@ -1791,16 +1964,16 @@ def build_dashboard(run: StrategyRun) -> str:
                     "QQQ drawdown", f"{contribution_plan.qqq_drawdown_63:.1%} from 63-session high"
                 ),
                 _dashboard_field(
-                    "SMA setup",
+                    "Setup",
                     "pullback above SMA200" if contribution_plan.bull_pullback else "no pullback trigger",
                 ),
             ])
         if contribution_plan.notification_due:
             lines.extend([
                 _dashboard_field(
-                    "Deposit now",
+                    "Why now",
                     f"${contribution_plan.due_amount:,.2f}  "
-                    f"({' + '.join(contribution_plan.reasons)})",
+                    f"({_contribution_reason(contribution_plan)})",
                 ),
                 f"{'Ticker':<10}{'Buy dollars':>16}{'Est. units':>18}",
                 _dashboard_rule(),
@@ -1810,58 +1983,28 @@ def build_dashboard(run: StrategyRun) -> str:
                     f"{ticker:<10}${dollars:>15,.2f}"
                     f"{contribution_plan.estimated_units[ticker]:>18,.4f}"
                 )
-            lines.extend([
-                "Deposit and execute at next-session prices. These quantities do not",
-                "become confirmed holdings until broker execution is synchronized.",
-            ])
 
     if plan.rebalance_due:
         trades = _visible_execution_rows(run.execution_table)
         trades = trades[trades["Action"] != "HOLD"]
         lines.extend([
             "",
-            f"TRADES  (estimated at {run.signal_date.date()} closing prices)",
+            f"PORTFOLIO ORDERS  ({run.signal_date.date()} close estimates)",
             _dashboard_rule(),
-            f"{'Ticker':<8}{'Price':>11}{'Target':>9}{'Est. units':>14}"
-            f"{'Delta':>14}{'Action':>9}",
+            f"{'Action':<8}{'Ticker':<8}{'Target':>8} {'Trade $':>13}{'Est. shares':>15}",
             _dashboard_rule(),
         ])
         for _, row in trades.iterrows():
             lines.append(
-                f"{row['Ticker']:<8}{row['Price']:>11,.2f}{row['TargetPct']:>9.0%}"
-                f"{row['EstimatedUnits']:>14,.4f}{row['DeltaUnits']:>14,.4f}"
-                f"{row['Action']:>9}"
+                f"{row['Action']:<8}{row['Ticker']:<8}{row['TargetPct']:>8.0%} "
+                f"${abs(row['DeltaValue']):>12,.2f}{abs(row['DeltaUnits']):>15,.4f}"
             )
-        costs = "  ".join(
-            f"{bps}bp ${amount:,.0f}"
-            for bps, amount in sorted(diagnostics.estimated_costs.items())
-        )
         lines.extend([
             _dashboard_rule(),
-            _dashboard_field(
-                "Turnover",
-                f"{plan.one_way_turnover:.1%} one-way  |  {plan.individual_orders} orders",
-            ),
-            _dashboard_field("Est. cost", costs),
-            _dashboard_field(
-                "Exposure",
-                f"{diagnostics.current_daily_exposure:.2f}x now "
-                f"-> {diagnostics.destination_daily_exposure:.2f}x after trades",
-            ),
-            "",
-            "Quantities are signal-close estimates. Recalculate from executable",
-            "prices during the next session, then confirm final holdings and CASH.",
+            "Recalculate shares at next-session prices, execute, then confirm holdings.",
         ])
 
-    lines.extend([
-        "",
-        "NOTES",
-        _dashboard_rule(),
-        "TQQQ and UPRO both target 3x daily returns. A switch changes the index",
-        "exposure, not the leverage multiplier. Advertised exposure is a nominal",
-        "sum of daily multipliers, not a risk or volatility forecast.",
-        _dashboard_rule("="),
-    ])
+    lines.append(_dashboard_rule("="))
     return "\n".join(lines)
 
 
@@ -1948,9 +2091,9 @@ NOTIFICATION_ACCENTS = {
 _ACTION_COLORS = {"BUY": "#15803d", "SELL": "#b91c1c"}
 
 _EMAIL_BASE = "font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif"
-_CELL = "padding:9px 12px;border-bottom:1px solid #e5e7eb;font-size:13px"
+_CELL = "padding:10px 12px;border-bottom:1px solid #e5e7eb;font-size:14px"
 _HEAD_CELL = (
-    "padding:9px 12px;border-bottom:2px solid #d1d5db;font-size:11px;"
+    "padding:9px 12px;border-bottom:2px solid #d1d5db;font-size:12px;"
     "letter-spacing:.06em;text-transform:uppercase;color:#6b7280;font-weight:600"
 )
 
@@ -1959,52 +2102,93 @@ def _email_metric(label: str, value: str) -> str:
     return (
         '<td style="padding:10px 14px;border:1px solid #e5e7eb;'
         'background:#f9fafb;vertical-align:top">'
-        f'<div style="font-size:10px;letter-spacing:.06em;text-transform:uppercase;'
+        f'<div style="font-size:12px;letter-spacing:.04em;text-transform:uppercase;'
         f'color:#6b7280">{label}</div>'
-        f'<div style="font-size:15px;color:#111827;padding-top:3px">{value}</div></td>'
+        f'<div style="font-size:16px;color:#111827;padding-top:4px">{value}</div></td>'
     )
 
 
 def build_email_html(run: StrategyRun, notification: NotificationDecision) -> str:
     decision = run.decision
     plan = run.rebalance_plan
-    diagnostics = run.execution_diagnostics
     visible = _visible_execution_rows(run.execution_table)
     active = GROWTH_EQUITY if decision.router_state.tqqq_active else DEFENSIVE_EQUITY
+    active_weight = decision.target_weights.get(active, 0.0)
     status = NOTIFICATION_STATUS_LABELS[notification.kind]
     accent = NOTIFICATION_ACCENTS[notification.kind]
 
-    rows = "".join(
+    target_rows = "".join(
         "<tr>"
-        f'<td style="{_CELL};font-weight:600;color:#111827">{row["Ticker"]}</td>'
-        f'<td style="{_CELL};text-align:right;color:#374151">${row["Price"]:,.2f}</td>'
-        f'<td style="{_CELL};text-align:right;color:#374151">{row["CurrentUnits"]:,.4f}</td>'
-        f'<td style="{_CELL};text-align:right;color:#374151">{row["TargetPct"]:.1%}</td>'
-        f'<td style="{_CELL};text-align:right;color:#374151">{row["EstimatedUnits"]:,.4f}</td>'
-        f'<td style="{_CELL};text-align:right;color:#374151">{row["DeltaUnits"]:+,.4f}</td>'
-        f'<td style="{_CELL};text-align:right;font-weight:600;'
-        f'color:{_ACTION_COLORS.get(row["Action"], "#6b7280")}">{row["Action"]}</td>'
+        f'<td style="{_CELL};font-weight:600;color:#111827">{ticker}</td>'
+        f'<td style="{_CELL};text-align:right;font-weight:600;color:#111827">'
+        f'{weight:.0%}</td>'
         "</tr>"
-        for _, row in visible.iterrows()
+        for ticker, weight in decision.target_weights.items()
+        if weight > 1e-12
     )
-    metrics = "".join([
-        _email_metric("Signal close", str(run.signal_date.date())),
-        _email_metric("Portfolio value", f"${run.portfolio_value:,.2f}"),
-        _email_metric("Equity sleeve", f"{active} &middot; 40%"),
-        _email_metric("Lifecycle", decision.lifecycle_stage),
-    ])
-    costs = " &middot; ".join(
-        f"{bps}bp ${amount:,.0f}" for bps, amount in sorted(diagnostics.estimated_costs.items())
+    order_rows = "".join(
+        "<tr>"
+        f'<td style="{_CELL};font-weight:700;'
+        f'color:{_ACTION_COLORS.get(row["Action"], "#111827")}">{row["Action"]}</td>'
+        f'<td style="{_CELL};font-weight:600;color:#111827">{row["Ticker"]}</td>'
+        f'<td style="{_CELL};text-align:right;color:#374151">{row["TargetPct"]:.0%}</td>'
+        f'<td style="{_CELL};text-align:right;color:#374151">'
+        f'${abs(row["DeltaValue"]):,.2f}</td>'
+        f'<td style="{_CELL};text-align:right;color:#374151">'
+        f'{abs(row["DeltaUnits"]):,.4f}</td>'
+        "</tr>"
+        for _, row in visible[visible["Action"] != "HOLD"].iterrows()
     )
-    footnote = (
-        f'<tr><td colspan="7" style="padding:10px 12px;font-size:12px;color:#6b7280;'
-        f'background:#f9fafb">Turnover {plan.one_way_turnover:.1%} one-way &middot; '
-        f"{plan.individual_orders} orders &middot; est. cost {costs} &middot; exposure "
-        f"{diagnostics.current_daily_exposure:.2f}x &rarr; "
-        f"{diagnostics.destination_daily_exposure:.2f}x</td></tr>"
-        if plan.rebalance_due
-        else ""
+    metrics = (
+        "<tr>"
+        + _email_metric("Signal close", str(run.signal_date.date()))
+        + _email_metric("Account value", f"${run.portfolio_value:,.2f}")
+        + "</tr><tr>"
+        + _email_metric("Equity selection", f"{active} at {active_weight:.0%}")
+        + _email_metric("Lifecycle", decision.lifecycle_stage)
+        + "</tr>"
     )
+
+    if notification.kind == "CANCELLATION":
+        action_text = "Do not execute the previous recommendation. It has been cancelled."
+    elif plan.rebalance_due and run.contribution_plan.notification_due:
+        action_text = (
+            f"1. Deposit ${run.contribution_plan.due_amount:,.2f}. "
+            "2. Place both the portfolio orders and contribution buys below "
+            "using next-session prices."
+        )
+    elif plan.rebalance_due:
+        action_text = "Place the portfolio orders below using next-session prices."
+    elif run.contribution_plan.notification_due:
+        action_text = (
+            f"Deposit ${run.contribution_plan.due_amount:,.2f} and place the "
+            "contribution buys below using next-session prices."
+        )
+    else:
+        action_text = "No portfolio trades are required."
+
+    orders_html = ""
+    if plan.rebalance_due:
+        orders_html = f"""
+<tr><td style="padding:4px 24px 18px">
+  <div style="font-size:17px;font-weight:700;color:#111827;padding-bottom:9px">
+    Portfolio orders</div>
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0"
+   style="border-collapse:collapse;border:1px solid #e5e7eb">
+    <tr style="background:#f9fafb">
+      <th style="{_HEAD_CELL};text-align:left">Action</th>
+      <th style="{_HEAD_CELL};text-align:left">Ticker</th>
+      <th style="{_HEAD_CELL};text-align:right">Target</th>
+      <th style="{_HEAD_CELL};text-align:right">Trade value</th>
+      <th style="{_HEAD_CELL};text-align:right">Est. shares</th>
+    </tr>{order_rows}
+  </table>
+  <div style="font-size:14px;color:#374151;padding-top:9px;line-height:1.5">
+    Share quantities use the signal close. Recalculate them at the price you can execute,
+    then confirm the completed holdings and remaining cash.
+  </div>
+</td></tr>"""
+
     contribution_html = ""
     if run.contribution_plan.notification_due:
         contribution_rows = "".join(
@@ -2017,10 +2201,10 @@ def build_email_html(run: StrategyRun, notification: NotificationDecision) -> st
         )
         contribution_html = f"""
 <tr><td style="padding:4px 24px 18px">
-  <div style="font-size:15px;font-weight:600;color:#1d4ed8;padding-bottom:8px">
-    Deposit ${run.contribution_plan.due_amount:,.2f} now</div>
-  <div style="font-size:12px;color:#4b5563;padding-bottom:8px">
-    {' + '.join(run.contribution_plan.reasons)} &middot; QQQ drawdown
+  <div style="font-size:17px;font-weight:700;color:#1d4ed8;padding-bottom:8px">
+    Contribution: ${run.contribution_plan.due_amount:,.2f}</div>
+  <div style="font-size:14px;color:#374151;padding-bottom:9px">
+    {_contribution_reason(run.contribution_plan)} &middot; QQQ drawdown
     {run.contribution_plan.qqq_drawdown_63:.1%} from its 63-session high</div>
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0"
    style="border-collapse:collapse;border:1px solid #e5e7eb">
@@ -2036,47 +2220,42 @@ def build_email_html(run: StrategyRun, notification: NotificationDecision) -> st
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0"
  style="max-width:680px;margin:0 auto;background:#ffffff;border:1px solid #e5e7eb">
 <tr><td style="padding:20px 24px;border-bottom:3px solid {accent}">
-  <div style="font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:#6b7280">
-    Roth IRA allocator &middot; {STRATEGY_REVISION}</div>
   <div style="font-size:21px;font-weight:600;color:{accent};padding-top:6px">{status}</div>
-  <div style="font-size:13px;color:#4b5563;padding-top:3px">
-    {plan.reason if plan.rebalance_due else notification.reason}</div>
+  <div style="font-size:15px;color:#374151;padding-top:5px">
+    {_reason_label(plan.reason if plan.rebalance_due else notification.reason)}</div>
 </td></tr>
-<tr><td style="padding:18px 24px 6px">
+<tr><td style="padding:18px 24px 8px">
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0"
-   style="border-collapse:collapse"><tr>{metrics}</tr></table>
+   style="border-collapse:collapse">{metrics}</table>
 </td></tr>
-<tr><td style="padding:14px 24px 4px">
-  <div style="font-size:13px;color:#374151">
-    QQQ is <strong>{decision.qqq_close / decision.qqq_sma_200 - 1:+.1%}</strong>
-    versus its 200-day average &middot; 12-month momentum
-    <strong>{decision.qqq_momentum_252:+.1%}</strong>
-  </div>
+<tr><td style="padding:8px 24px 18px">
+  <div style="padding:14px 16px;background:#fff7ed;border-left:4px solid {accent};
+   font-size:16px;color:#111827;line-height:1.55;font-weight:600">{action_text}</div>
 </td></tr>
-<tr><td style="padding:10px 24px 18px">
+<tr><td style="padding:0 24px 18px">
+  <div style="font-size:17px;font-weight:700;color:#111827;padding-bottom:9px">
+    Target allocation</div>
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0"
    style="border-collapse:collapse;border:1px solid #e5e7eb">
-  <tr style="background:#f9fafb">
-    <th style="{_HEAD_CELL};text-align:left">Ticker</th>
-    <th style="{_HEAD_CELL};text-align:right">Price</th>
-    <th style="{_HEAD_CELL};text-align:right">Current</th>
-    <th style="{_HEAD_CELL};text-align:right">Target</th>
-    <th style="{_HEAD_CELL};text-align:right">Est. units</th>
-    <th style="{_HEAD_CELL};text-align:right">Delta</th>
-    <th style="{_HEAD_CELL};text-align:right">Action</th>
-  </tr>{rows}{footnote}</table>
+    <tr style="background:#f9fafb">
+      <th style="{_HEAD_CELL};text-align:left">Holding</th>
+      <th style="{_HEAD_CELL};text-align:right">Weight</th>
+    </tr>{target_rows}
+  </table>
 </td></tr>
-{contribution_html}
-<tr><td style="padding:0 24px 22px">
-  <div style="padding:12px 14px;background:#f9fafb;border-left:3px solid #d1d5db;
-   font-size:12px;color:#4b5563;line-height:1.6">
-    Signal-close estimates only. Recalculate at executable prices next session, then
-    confirm complete post-trade holdings and CASH.<br>
-    TQQQ and UPRO both target 3x daily returns; a switch changes the index exposure,
-    not the leverage multiplier. Advertised exposure is a nominal sum of daily
-    multipliers, not a risk or volatility forecast.
+<tr><td style="padding:0 24px 18px">
+  <div style="font-size:17px;font-weight:700;color:#111827;padding-bottom:7px">
+    Why this signal</div>
+  <div style="font-size:15px;color:#374151;line-height:1.55">
+    QQQ is <strong>{decision.qqq_close / decision.qqq_sma_200 - 1:+.1%}</strong>
+    versus its 200-day average. It is
+    <strong>{'above' if decision.qqq_close > decision.qqq_sma_50 else 'below'}</strong>
+    its 50-day average, with 12-month momentum of
+    <strong>{decision.qqq_momentum_252:+.1%}</strong>.
   </div>
 </td></tr>
+{contribution_html}
+{orders_html}
 </table></body></html>"""
 
 
@@ -2243,7 +2422,7 @@ def main() -> None:
     if executed_shares is not None or executed_signal_date is not None:
         parser.error("Execution fields require --confirm-execution or --sync-holdings")
 
-    run = run_strategy(args.roth_amount, backup_legacy_state=not args.test)
+    run = run_strategy(args.roth_amount)
     dashboard = build_dashboard(run)
     print(dashboard)
     notification = decide_notification(run)

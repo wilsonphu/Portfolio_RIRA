@@ -6,7 +6,7 @@ import sys
 import tempfile
 import unittest
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -181,6 +181,47 @@ class HoldingsAndRebalanceTests(unittest.TestCase):
         self.assertFalse(plan.rebalance_due)
         self.assertEqual(plan.reason, "CONFIRMED_TARGET_STATE")
 
+    def test_all_cash_forces_full_allocation_from_confirmed_holdings(self):
+        state = portfolio.PortfolioState(
+            executed_tqqq_active=True,
+            executed_strategy_fingerprint=portfolio.STRATEGY_FINGERPRINT,
+            last_completed_annual_rebalance_year=2026,
+        )
+        plan = portfolio.build_rebalance_plan(
+            {"CASH": 1.0}, decision(True), state
+        )
+        self.assertTrue(plan.rebalance_due)
+        self.assertTrue(plan.full_transition)
+        self.assertEqual(plan.reason, "MISSING_EQUITY_POSITION")
+        self.assertEqual(
+            plan.execution_weights,
+            {**portfolio.target_weights(True), "CASH": 0.0},
+        )
+
+    def test_confirmed_equity_overrides_stale_executed_router_flag(self):
+        state = portfolio.PortfolioState(
+            executed_tqqq_active=False,
+            executed_strategy_fingerprint=portfolio.STRATEGY_FINGERPRINT,
+            last_completed_annual_rebalance_year=2026,
+        )
+        aligned = portfolio.target_weights(True)
+        plan = portfolio.build_rebalance_plan(aligned, decision(True), state)
+        self.assertFalse(plan.rebalance_due)
+        self.assertEqual(plan.reason, "HOLD")
+
+    def test_wrong_confirmed_equity_is_replaced_even_when_state_flag_matches(self):
+        state = portfolio.PortfolioState(
+            executed_tqqq_active=True,
+            executed_strategy_fingerprint=portfolio.STRATEGY_FINGERPRINT,
+            last_completed_annual_rebalance_year=2026,
+        )
+        current = {"UPRO": 0.40, "DBMF": 0.20, "ZROZ": 0.20, "UGL": 0.20}
+        plan = portfolio.build_rebalance_plan(current, decision(True), state)
+        self.assertTrue(plan.rebalance_due)
+        self.assertFalse(plan.full_transition)
+        self.assertEqual(plan.reason, "EQUITY_ROUTER_REALIGNMENT")
+        self.assertEqual(plan.execution_weights, portfolio.target_weights(True))
+
     def test_router_switch_preserves_non_equity_weights(self):
         state = portfolio.PortfolioState(
             executed_tqqq_active=True,
@@ -251,7 +292,7 @@ class StateTests(unittest.TestCase):
             "last_processed_signal_date": "2026-09-11",
         }
         self.state_path.write_text(json.dumps(payload), encoding="utf-8")
-        state = portfolio.load_state(backup_legacy=False)
+        state = portfolio.load_state()
         self.assertEqual(state.last_completed_annual_rebalance_year, 2026)
 
     def test_version_16_migration_adds_disabled_contribution_state(self):
@@ -262,21 +303,72 @@ class StateTests(unittest.TestCase):
             "portfolio_value": 100.0,
         }
         self.state_path.write_text(json.dumps(payload), encoding="utf-8")
-        state = portfolio.load_state(backup_legacy=False)
-        self.assertEqual(state.state_version, 17)
+        state = portfolio.load_state()
+        self.assertEqual(state.state_version, 18)
         self.assertEqual(state.contribution_plan_year, 0)
         self.assertEqual(state.contribution_budget, 0.0)
 
+    def test_version_17_migration_preserves_live_plan_and_clears_raw_fingerprint(self):
+        payload = {
+            **asdict(portfolio.PortfolioState()),
+            "state_version": 17,
+            "cash_balance": 14_000.0,
+            "portfolio_value": 14_000.0,
+            "contribution_plan_year": 2026,
+            "contribution_policy_revision": portfolio.contribution.POLICY_REVISION,
+            "contribution_budget": 6_400.0,
+            "contribution_released_amount": 5_760.0,
+            "last_processed_data_fingerprint": "1" * 64,
+        }
+        self.state_path.write_text(json.dumps(payload), encoding="utf-8")
+        state = portfolio.load_state()
+        self.assertEqual(state.state_version, 18)
+        self.assertEqual(state.cash_balance, 14_000.0)
+        self.assertEqual(state.contribution_budget, 6_400.0)
+        self.assertEqual(state.contribution_released_amount, 5_760.0)
+        self.assertEqual(state.last_processed_data_fingerprint, "")
+
     def test_configure_contributions_records_remaining_budget(self):
         portfolio.save_state(portfolio.PortfolioState(shares={"TQQQ": 1.0}))
-        state = portfolio.configure_contribution_plan(2026, 7_500.0)
-        self.assertEqual(state.contribution_plan_year, 2026)
+        current_year = datetime.now(ZoneInfo("America/New_York")).year
+        state = portfolio.configure_contribution_plan(current_year, 7_500.0)
+        self.assertEqual(state.contribution_plan_year, current_year)
         self.assertEqual(
             state.contribution_policy_revision,
             portfolio.contribution.POLICY_REVISION,
         )
         self.assertEqual(state.contribution_budget, 7_500.0)
         self.assertEqual(state.contribution_released_amount, 0.0)
+
+    def test_contribution_plan_rejects_inactive_year(self):
+        portfolio.save_state(portfolio.PortfolioState(shares={"TQQQ": 1.0}))
+        current_year = datetime.now(ZoneInfo("America/New_York")).year
+        with self.assertRaisesRegex(ValueError, "current New York year"):
+            portfolio.configure_contribution_plan(current_year - 1, 7_500.0)
+
+    def test_migration_rejects_unsupported_holdings_without_data_loss(self):
+        payload = {
+            "state_version": 16,
+            "shares": {"XYZ": 1.0},
+            "cash_balance": 10.0,
+            "portfolio_value": 100.0,
+        }
+        original = json.dumps(payload)
+        self.state_path.write_text(original, encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "unsupported holding XYZ"):
+            portfolio.load_state()
+        self.assertEqual(self.state_path.read_text(encoding="utf-8"), original)
+
+    def test_pending_superseded_date_must_be_older(self):
+        state = portfolio.PortfolioState(
+            pending_recommendation_date="2026-09-11",
+            pending_recommendation_weights=portfolio.target_weights(True),
+            pending_recommendation_lifecycle_stage=portfolio.LIFECYCLE_SPRINT,
+            pending_recommendation_supersedes_date="2026-09-11",
+            pending_recommendation_fingerprint=portfolio.STRATEGY_FINGERPRINT,
+        )
+        with self.assertRaisesRegex(RuntimeError, "must precede"):
+            portfolio.validate_state(state)
 
     def test_atomic_save_failure_preserves_original(self):
         self.state_path.write_text("original", encoding="utf-8")
@@ -301,6 +393,25 @@ class StateTests(unittest.TestCase):
         self.assertEqual(confirmed.cash_balance, 3.21)
         self.assertFalse(confirmed.pending_recommendation_date)
         self.assertEqual(confirmed.last_completed_annual_rebalance_year, 2026)
+
+    def test_older_fill_updates_holdings_without_clearing_newer_action(self):
+        state = portfolio.PortfolioState(
+            pending_recommendation_date="2026-09-11",
+            pending_recommendation_weights=portfolio.target_weights(True),
+            pending_recommendation_tqqq_active=True,
+            pending_recommendation_lifecycle_stage=portfolio.LIFECYCLE_SPRINT,
+            pending_recommendation_notified=True,
+            pending_recommendation_supersedes_date="2026-09-10",
+            pending_recommendation_fingerprint=portfolio.STRATEGY_FINGERPRINT,
+        )
+        portfolio.save_state(state)
+        confirmed = portfolio.confirm_execution(
+            {"UPRO": 10.0}, 5.0, "2026-09-10"
+        )
+        self.assertEqual(confirmed.shares, {"UPRO": 10.0})
+        self.assertEqual(confirmed.cash_balance, 5.0)
+        self.assertEqual(confirmed.pending_recommendation_date, "2026-09-11")
+        self.assertTrue(confirmed.pending_recommendation_notified)
 
 
 class NotificationTests(unittest.TestCase):
@@ -467,7 +578,7 @@ class DecisionAuditTests(unittest.TestCase):
         audit = portfolio.build_decision_audit(
             run, portfolio.NotificationDecision("ACTION", "NEW_RECOMMENDATION"), "STAGED"
         )
-        self.assertEqual(audit["schema_version"], 8)
+        self.assertEqual(audit["schema_version"], 9)
         lifecycle = audit["lifecycle"]
         self.assertEqual(lifecycle["stage"], run.decision.lifecycle_stage)
         self.assertEqual(lifecycle["value_stage"], run.decision.lifecycle_value_stage)
@@ -522,10 +633,12 @@ class RenderingTests(unittest.TestCase):
 
     def test_hold_dashboard_remains_compact_and_omits_trade_table(self):
         dashboard = portfolio.build_dashboard(run_fixture())
-        self.assertIn("NO TRADES", dashboard)
-        self.assertNotIn("TRADES  (estimated", dashboard)
+        self.assertIn("NO ACTION", dashboard)
+        self.assertIn("Portfolio     No trades", dashboard)
+        self.assertNotIn("PORTFOLIO ORDERS", dashboard)
+        self.assertNotIn("NOTES", dashboard)
 
-    def test_action_email_contains_trade_and_diagnostic_rows(self):
+    def test_action_email_has_clear_orders_without_small_footer(self):
         run = action_run_fixture()
         html = portfolio.build_email_html(
             run, portfolio.NotificationDecision("ACTION", "NEW_RECOMMENDATION")
@@ -533,7 +646,10 @@ class RenderingTests(unittest.TestCase):
         self.assertIn("ACTION REQUIRED", html)
         self.assertIn("TQQQ", html)
         self.assertIn("UPRO", html)
-        self.assertIn("Turnover 40.0% one-way", html)
+        self.assertIn("Portfolio orders", html)
+        self.assertIn("Place the portfolio orders", html)
+        self.assertNotIn("Advertised exposure", html)
+        self.assertNotIn("font-size:11px", html)
 
     def test_contribution_email_contains_deposit_allocation(self):
         run = run_fixture()
@@ -552,11 +668,28 @@ class RenderingTests(unittest.TestCase):
         )
         notice = portfolio.NotificationDecision("CONTRIBUTION", "QQQ_DRAWDOWN_10")
         html = portfolio.build_email_html(run, notice)
-        self.assertIn("Deposit $750.00 now", html)
-        self.assertIn("QQQ_DRAWDOWN_10", html)
+        self.assertIn("Deposit $750.00", html)
+        self.assertIn("10% QQQ drawdown", html)
 
 
 class DataAndCliTests(unittest.TestCase):
+    def test_signal_fingerprint_ignores_immaterial_provider_rounding(self):
+        first = price_frame()
+        second = first.copy()
+        second.loc[second.index[-100], portfolio.MARKET_INDEX] += 0.000001
+        self.assertEqual(
+            portfolio.market_data_fingerprint(first),
+            portfolio.market_data_fingerprint(second),
+        )
+
+    def test_signal_fingerprint_changes_with_the_trading_regime(self):
+        bullish = price_frame()
+        bearish = price_frame(bullish=False)
+        self.assertNotEqual(
+            portfolio.market_data_fingerprint(bullish),
+            portfolio.market_data_fingerprint(bearish),
+        )
+
     def test_missing_yfinance_ticker_is_rejected(self):
         index = pd.DatetimeIndex(["2026-09-11"])
         columns = pd.MultiIndex.from_product([["Close"], ["QQQ"]])

@@ -7,6 +7,11 @@ It does not place broker trades. It calculates next-session instructions,
 emails only when action is required, and values the account from confirmed
 shares and cash rather than an old target allocation.
 
+The dashboard leads with the required action, then shows the target, signal,
+contribution status, and only the orders that need to be placed. Detailed risk
+and turnover diagnostics remain in the structured audit artifact rather than
+cluttering the email.
+
 ## Production allocation
 
 The base target always contains:
@@ -63,7 +68,8 @@ python port12_cloud.py --configure-contributions --contribution-budget 7500 --co
 The GitHub workflow exposes the same `configure-contributions` operation. Use
 `disable-contributions` to turn the scheduler off. Configure a new remaining
 budget each tax year; the engine never assumes Roth eligibility or contribution
-room.
+room. A plan must be configured for the current New York calendar year because
+the scheduler cannot safely act on prior- or future-year contribution room.
 
 TQQQ and UPRO both target three times their index's **daily** return. The switch
 changes the equity engine from Nasdaq-100 to S&P 500 exposure; it does not
@@ -104,6 +110,11 @@ allocation drift waits for the annual rebalance.
 Other HOLD runs do not email. Identical pending instructions are suppressed. A
 material change replaces the pending action, a no-longer-needed action gets one
 cancellation, and failed SMTP delivery stays pending for retry.
+
+Confirmed holdings also determine whether the equity router is actually
+aligned. Missing equity exposure, the wrong routed fund, or both equity funds
+being present cannot be hidden by stale state metadata. Confirming a late fill
+from an older signal updates the holdings without erasing a newer pending action.
 
 ## Operating cycle
 
