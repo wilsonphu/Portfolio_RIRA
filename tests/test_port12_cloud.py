@@ -429,6 +429,30 @@ class NotificationTests(unittest.TestCase):
         run = replace(run, rebalance_plan=portfolio.RebalancePlan(portfolio.target_weights(True), True, True, "TEST", 0.1, 1))
         self.assertEqual(portfolio.decide_notification(run).kind, "NONE")
 
+    def test_explicit_resend_rearms_identical_pending_action(self):
+        run = run_fixture()
+        run.state.pending_recommendation_date = "2026-09-10"
+        run.state.pending_recommendation_weights = portfolio.target_weights(True)
+        run.state.pending_recommendation_tqqq_active = True
+        run.state.pending_recommendation_lifecycle_stage = portfolio.LIFECYCLE_SPRINT
+        run.state.pending_recommendation_notified = True
+        run.state.pending_recommendation_fingerprint = portfolio.STRATEGY_FINGERPRINT
+        run = replace(
+            run,
+            rebalance_plan=portfolio.RebalancePlan(
+                portfolio.target_weights(True), True, True, "TEST", 0.1, 1
+            ),
+        )
+
+        portfolio.request_notification_resend(run)
+
+        self.assertFalse(run.state.pending_recommendation_notified)
+        self.assertEqual(portfolio.decide_notification(run).kind, "RETRY")
+
+    def test_explicit_resend_requires_a_pending_action(self):
+        with self.assertRaisesRegex(RuntimeError, "no pending portfolio recommendation"):
+            portfolio.request_notification_resend(run_fixture())
+
     def test_cancellation_is_sent_once_then_cleared(self):
         run = run_fixture()
         run.state.pending_recommendation_date = "2026-09-10"

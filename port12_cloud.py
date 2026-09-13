@@ -1503,6 +1503,13 @@ def decide_notification(run: StrategyRun) -> NotificationDecision:
     return NotificationDecision("NONE", "HOLD")
 
 
+def request_notification_resend(run: StrategyRun) -> None:
+    """Explicitly re-arm one pending portfolio email without changing its target."""
+    if not run.state.pending_recommendation_date:
+        raise RuntimeError("There is no pending portfolio recommendation to resend")
+    run.state.pending_recommendation_notified = False
+
+
 def _clear_pending(state: PortfolioState) -> None:
     state.pending_recommendation_date = ""
     state.pending_recommendation_weights = {}
@@ -2330,6 +2337,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     mode.add_argument("--sync-holdings", action="store_true")
     mode.add_argument("--configure-contributions", action="store_true")
     mode.add_argument("--disable-contributions", action="store_true")
+    mode.add_argument("--resend-notification", action="store_true")
     parser.add_argument(
         "--test", action="store_true",
         help="Generate a report without state, email, audit, or log persistence",
@@ -2403,6 +2411,14 @@ def main() -> None:
     if args.contribution_budget is not None or args.contribution_year is not None:
         parser.error("Contribution inputs require --configure-contributions")
 
+    if args.resend_notification and (
+        args.test
+        or args.roth_amount is not None
+        or executed_shares is not None
+        or executed_signal_date is not None
+    ):
+        parser.error("--resend-notification cannot be combined with other inputs")
+
     if args.confirm_execution:
         if args.test or args.roth_amount is not None:
             parser.error("--confirm-execution cannot be combined with --test or --roth-amount")
@@ -2423,6 +2439,11 @@ def main() -> None:
         parser.error("Execution fields require --confirm-execution or --sync-holdings")
 
     run = run_strategy(args.roth_amount)
+    if args.resend_notification:
+        try:
+            request_notification_resend(run)
+        except RuntimeError as exc:
+            parser.error(str(exc))
     dashboard = build_dashboard(run)
     print(dashboard)
     notification = decide_notification(run)

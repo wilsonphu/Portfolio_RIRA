@@ -24,6 +24,7 @@ on:
           - sync-holdings
           - configure-contributions
           - disable-contributions
+          - resend-notification
       executed_signal_date:
         description: "Pending signal date (YYYY-MM-DD); required only for confirm-execution"
         required: false
@@ -319,19 +320,22 @@ jobs:
           GMAIL_ADDRESS: >-
             ${{
               (github.event_name == 'schedule' ||
-               inputs.run_mode == 'signal') &&
+               inputs.run_mode == 'signal' ||
+               inputs.run_mode == 'resend-notification') &&
               secrets.GMAIL_ADDRESS || ''
             }}
           GMAIL_APP_PASSWORD: >-
             ${{
               (github.event_name == 'schedule' ||
-               inputs.run_mode == 'signal') &&
+               inputs.run_mode == 'signal' ||
+               inputs.run_mode == 'resend-notification') &&
               secrets.GMAIL_APP_PASSWORD || ''
             }}
           RECEIVER_EMAIL: >-
             ${{
               (github.event_name == 'schedule' ||
-               inputs.run_mode == 'signal') &&
+               inputs.run_mode == 'signal' ||
+               inputs.run_mode == 'resend-notification') &&
               secrets.RECEIVER_EMAIL || ''
             }}
           ROTH_IRA_AMOUNT: >-
@@ -425,6 +429,16 @@ jobs:
                 exit 1
               fi
               engine_args+=(--disable-contributions)
+              ;;
+            resend-notification)
+              if has_non_whitespace "${executed_signal_date}" ||
+                 has_non_whitespace "${EXECUTED_SHARES_INPUT}" ||
+                 has_non_whitespace "${contribution_budget}" ||
+                 has_non_whitespace "${contribution_year}"; then
+                echo "::error::resend-notification does not accept additional inputs."
+                exit 1
+              fi
+              engine_args+=(--resend-notification)
               ;;
             *)
               echo "::error::Unsupported run mode: ${run_mode}"

@@ -110,6 +110,9 @@ allocation drift waits for the annual rebalance.
 Other HOLD runs do not email. Identical pending instructions are suppressed. A
 material change replaces the pending action, a no-longer-needed action gets one
 cancellation, and failed SMTP delivery stays pending for retry.
+Use the explicit `resend-notification` workflow operation when another copy of
+the current pending portfolio action is needed; ordinary scheduled runs remain
+quiet.
 
 Confirmed holdings also determine whether the equity router is actually
 aligned. Missing equity exposure, the wrong routed fund, or both equity funds
