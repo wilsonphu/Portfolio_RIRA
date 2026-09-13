@@ -133,7 +133,7 @@ LIFECYCLE_ANCHOR_AGE = 23.0
 
 STRATEGY_REVISION = "tqqq-upro40-dbmf20-zroz20-ugl20-sma200-annual-v2"
 STATE_VERSION = 16
-DECISION_AUDIT_SCHEMA_VERSION = 6
+DECISION_AUDIT_SCHEMA_VERSION = 7
 APP_DIR = Path(__file__).resolve().parent
 STATE_FILE = APP_DIR / "roth_ira_state.json"
 LOG_FILE = APP_DIR / "roth_ira.log"
@@ -936,6 +936,26 @@ def resolve_portfolio_value(
     return float(amount), planning
 
 
+def _one_way_turnover(
+    existing: dict[str, float], execution: dict[str, float], components: Iterable[str]
+) -> float:
+    """Half the sum of absolute weight changes, i.e. one-way turnover."""
+    return 0.5 * sum(
+        abs(execution.get(item, 0.0) - existing.get(item, 0.0)) for item in components
+    )
+
+
+def _individual_orders(
+    existing: dict[str, float], execution: dict[str, float], components: Iterable[str]
+) -> int:
+    """Count of non-cash securities whose weight changes materially."""
+    return sum(
+        item != CASH_ASSET
+        and abs(execution.get(item, 0.0) - existing.get(item, 0.0)) > 1e-9
+        for item in components
+    )
+
+
 def build_rebalance_plan(
     existing: dict[str, float],
     decision: StrategyDecision,
@@ -977,11 +997,8 @@ def build_rebalance_plan(
         if equity_weight > 1e-12:
             execution[active_ticker] = equity_weight
     components = set(existing) | set(execution)
-    one_way = 0.5 * sum(abs(execution.get(item, 0.0) - existing.get(item, 0.0)) for item in components) if due else 0.0
-    orders = sum(
-        item != CASH_ASSET and abs(execution.get(item, 0.0) - existing.get(item, 0.0)) > 1e-9
-        for item in components
-    ) if due else 0
+    one_way = _one_way_turnover(existing, execution, components) if due else 0.0
+    orders = _individual_orders(existing, execution, components) if due else 0
     if due and orders == 0 and one_way <= 1e-12:
         due, full, one_way = False, False, 0.0
         reason = "ANNUAL_REVIEW" if annual_due else "CONFIRMED_TARGET_STATE"
@@ -1015,9 +1032,16 @@ def calculate_execution_table(
         action = "HOLD"
         if actionable and abs(delta * price) > 0.005:
             action = "CASH AFTER TRADES" if ticker == CASH_ASSET else ("BUY" if delta > 0 else "SELL")
-        rows.append({"Ticker": ticker, "Price": price, "CurrentUnits": current, "TargetPct": weight,
-                     "EstimatedUnits": estimated, "DeltaUnits": delta if actionable else 0.0,
-                     "DeltaValue": delta * price if actionable else 0.0, "Action": action})
+        rows.append({
+            "Ticker": ticker,
+            "Price": price,
+            "CurrentUnits": current,
+            "TargetPct": weight,
+            "EstimatedUnits": estimated,
+            "DeltaUnits": delta if actionable else 0.0,
+            "DeltaValue": delta * price if actionable else 0.0,
+            "Action": action,
+        })
     return pd.DataFrame(rows)
 
 
@@ -1056,9 +1080,13 @@ def preserve_pending_delivery_plan(
         return plan
     retry = dict(state.pending_recommendation_weights)
     components = set(retry) | set(current)
-    one_way = 0.5 * sum(abs(retry.get(item, 0.0) - current.get(item, 0.0)) for item in components)
-    orders = sum(item != CASH_ASSET and abs(retry.get(item, 0.0) - current.get(item, 0.0)) > 1e-9 for item in components)
-    return replace(plan, execution_weights=retry, reason="PENDING_DELIVERY_RETRY", one_way_turnover=one_way, individual_orders=orders)
+    return replace(
+        plan,
+        execution_weights=retry,
+        reason="PENDING_DELIVERY_RETRY",
+        one_way_turnover=_one_way_turnover(current, retry, components),
+        individual_orders=_individual_orders(current, retry, components),
+    )
 
 
 def run_strategy(roth_amount: float | None, *, backup_legacy_state: bool = True) -> StrategyRun:
@@ -1076,10 +1104,28 @@ def run_strategy(roth_amount: float | None, *, backup_legacy_state: bool = True)
     plan = preserve_pending_delivery_plan(
         build_rebalance_plan(current, decision, planning), state, current
     )
-    table_target = plan.execution_weights if plan.rebalance_due else _with_cash(decision.target_weights)
-    table = calculate_execution_table(prices, table_target, value, planning, actionable=plan.rebalance_due)
-    diagnostics = calculate_execution_diagnostics(table, value, current, decision.target_weights, table_target)
-    return StrategyRun(prices, decision, state, planning, value, current, table, signal_date, fingerprint, plan, diagnostics)
+    table_target = (
+        plan.execution_weights if plan.rebalance_due else _with_cash(decision.target_weights)
+    )
+    table = calculate_execution_table(
+        prices, table_target, value, planning, actionable=plan.rebalance_due
+    )
+    diagnostics = calculate_execution_diagnostics(
+        table, value, current, decision.target_weights, table_target
+    )
+    return StrategyRun(
+        price_data=prices,
+        decision=decision,
+        state=state,
+        planning_state=planning,
+        portfolio_value=value,
+        current_weights=current,
+        execution_table=table,
+        signal_date=signal_date,
+        market_data_fingerprint=fingerprint,
+        rebalance_plan=plan,
+        execution_diagnostics=diagnostics,
+    )
 
 
 def _pending_matches(run: StrategyRun) -> bool:
@@ -1107,12 +1153,29 @@ def decide_notification(run: StrategyRun) -> NotificationDecision:
             return NotificationDecision("ACTION", "NEW_RECOMMENDATION")
         if _pending_matches(run):
             if state.pending_recommendation_notified:
-                return NotificationDecision("NONE", "IDENTICAL_PENDING_RECOMMENDATION", state.pending_recommendation_date)
+                return NotificationDecision(
+                    "NONE",
+                    "IDENTICAL_PENDING_RECOMMENDATION",
+                    state.pending_recommendation_date,
+                )
             kind = "UPDATE_RETRY" if state.pending_recommendation_supersedes_date else "RETRY"
-            return NotificationDecision(kind, "UNDELIVERED_PENDING_RECOMMENDATION", state.pending_recommendation_date, state.pending_recommendation_supersedes_date)
-        return NotificationDecision("UPDATE", "MATERIAL_RECOMMENDATION_UPDATE", state.pending_recommendation_supersedes_date or state.pending_recommendation_date)
+            return NotificationDecision(
+                kind,
+                "UNDELIVERED_PENDING_RECOMMENDATION",
+                state.pending_recommendation_date,
+                state.pending_recommendation_supersedes_date,
+            )
+        return NotificationDecision(
+            "UPDATE",
+            "MATERIAL_RECOMMENDATION_UPDATE",
+            state.pending_recommendation_supersedes_date or state.pending_recommendation_date,
+        )
     if state.pending_recommendation_date:
-        return NotificationDecision("CANCELLATION", "PENDING_ACTION_NO_LONGER_REQUIRED", state.pending_recommendation_supersedes_date or state.pending_recommendation_date)
+        return NotificationDecision(
+            "CANCELLATION",
+            "PENDING_ACTION_NO_LONGER_REQUIRED",
+            state.pending_recommendation_supersedes_date or state.pending_recommendation_date,
+        )
     if run.rebalance_plan.annual_rebalance_due:
         return NotificationDecision("ANNUAL_REVIEW", "ANNUAL_ALLOCATION_CONFIRMED")
     return NotificationDecision("NONE", "HOLD")
@@ -1181,6 +1244,7 @@ def build_decision_audit(
             "tqqq_active": run.decision.router_state.tqqq_active,
             "bullish_streak": run.decision.router_state.bullish_streak,
             "transition": run.decision.transition_reason,
+            "transition_path": list(run.decision.transition_path),
             "processed_dates": list(run.decision.processed_signal_dates),
             "qqq_sma_50": run.decision.qqq_sma_50,
             "qqq_momentum_252": run.decision.qqq_momentum_252,
@@ -1192,6 +1256,26 @@ def build_decision_audit(
             "execution_weights": run.rebalance_plan.execution_weights,
             "rebalance": asdict(run.rebalance_plan),
             "lifecycle_stage": run.decision.lifecycle_stage,
+        },
+        "lifecycle": {
+            "stage": run.decision.lifecycle_stage,
+            "reason": run.decision.lifecycle_reason,
+            "value_stage": run.decision.lifecycle_value_stage,
+            "age_stage": run.decision.lifecycle_age_stage,
+            "advanced": run.decision.lifecycle_stage_advanced,
+            "estimated_investor_age": run.decision.estimated_investor_age,
+        },
+        "exposure": {
+            "current": run.execution_diagnostics.current_daily_exposure,
+            "strategic": run.execution_diagnostics.strategic_daily_exposure,
+            "destination": run.execution_diagnostics.destination_daily_exposure,
+            "gross_security_trade_fraction": (
+                run.execution_diagnostics.gross_security_trade_fraction
+            ),
+            "estimated_costs_by_bps": {
+                str(bps): amount
+                for bps, amount in sorted(run.execution_diagnostics.estimated_costs.items())
+            },
         },
         "notification": asdict(notification),
         "delivery_status": delivery_status,
@@ -1296,57 +1380,134 @@ def log_decision(run: StrategyRun) -> None:
     )
 
 
+DASHBOARD_WIDTH = 74
+_LIFECYCLE_CEILING_LABEL = {
+    stage: ("base target" if ceiling is None else f"{ceiling:.2f}x ceiling")
+    for stage, ceiling in LIFECYCLE_EXPOSURE_CEILINGS.items()
+}
+
+
+def _visible_execution_rows(table: pd.DataFrame) -> pd.DataFrame:
+    """Rows worth showing: any non-cash ticker that is held or targeted."""
+    return table[
+        (table["Ticker"] != CASH_ASSET)
+        & (
+            (table["Action"] != "HOLD")
+            | (table["TargetPct"] > 1e-12)
+            | (table["CurrentUnits"] > 1e-12)
+        )
+    ]
+
+
+def _dashboard_rule(character: str = "-") -> str:
+    return character * DASHBOARD_WIDTH
+
+
+def _dashboard_field(label: str, value: str) -> str:
+    return f"{label:<14}{value}"
+
+
 def build_dashboard(run: StrategyRun) -> str:
     decision = run.decision
     plan = run.rebalance_plan
+    diagnostics = run.execution_diagnostics
     active_fund = GROWTH_EQUITY if decision.router_state.tqqq_active else DEFENSIVE_EQUITY
-    action_rows = run.execution_table[
-        (run.execution_table["Ticker"] != CASH_ASSET)
-        & (
-            (run.execution_table["Action"] != "HOLD")
-            | (run.execution_table["TargetPct"] > 1e-12)
-            | (run.execution_table["CurrentUnits"] > 1e-12)
-        )
-    ]
+    trend_gap = decision.qqq_close / decision.qqq_sma_200 - 1.0
     short_status = "above" if decision.qqq_close > decision.qqq_sma_50 else "below"
-    momentum_status = "positive" if decision.qqq_momentum_252 > 0 else "negative"
+    status = "ACTION REQUIRED" if plan.rebalance_due else "NO TRADES"
+
     lines = [
-        "ROTH IRA PORTFOLIO UPDATE",
-        f"As of {run.signal_date.date()} | Value ${run.portfolio_value:,.2f}",
+        _dashboard_rule("="),
+        "ROTH IRA PORTFOLIO UPDATE".center(DASHBOARD_WIDTH).rstrip(),
+        _dashboard_rule("="),
+        _dashboard_field("Signal close", str(run.signal_date.date())),
+        _dashboard_field("Value", f"${run.portfolio_value:,.2f}"),
+        _dashboard_field("Status", f"{status}  ({plan.reason})"),
         "",
-        f"DECISION: Hold {active_fund} in the 40% equity sleeve",
-        (
-            f"Primary trigger: QQQ is {decision.qqq_close / decision.qqq_sma_200 - 1:+.1%} "
-            f"versus its 200-day average"
+        "DECISION",
+        _dashboard_rule(),
+        _dashboard_field("Equity", f"Hold {active_fund} in the 40% equity sleeve"),
+        _dashboard_field(
+            "Trend",
+            f"QQQ {trend_gap:+.1%} vs 200-day average "
+            f"({'bullish' if decision.trend_positive else 'bearish'})",
         ),
-        (
-            f"Health checks: QQQ is {short_status} its 50-day average; "
-            f"12-month momentum is {momentum_status} ({decision.qqq_momentum_252:+.1%})"
+        _dashboard_field(
+            "Health",
+            f"{short_status} 50-day average  |  "
+            f"12-month momentum {decision.qqq_momentum_252:+.1%}",
         ),
-        f"Status: {'ACTION REQUIRED' if plan.rebalance_due else 'NO TRADES'} ({plan.reason})",
-        f"Lifecycle: {decision.lifecycle_stage}",
+        _dashboard_field(
+            "Lifecycle",
+            f"{decision.lifecycle_stage} "
+            f"({_LIFECYCLE_CEILING_LABEL.get(decision.lifecycle_stage, 'unknown')})",
+        ),
+    ]
+    if len(decision.processed_signal_dates) > 1:
+        lines.append(
+            _dashboard_field(
+                "Replay", f"{len(decision.processed_signal_dates)} closes processed in order"
+            )
+        )
+
+    lines.extend([
         "",
-        "TARGET",
-        " / ".join(
+        "TARGET ALLOCATION",
+        _dashboard_rule(),
+        "  " + "   ".join(
             f"{ticker} {weight:.0%}"
             for ticker, weight in decision.target_weights.items()
             if weight > 1e-12
         ),
-    ]
-    if len(decision.processed_signal_dates) > 1:
-        lines.append(f"Processed {len(decision.processed_signal_dates)} missed/new closes in order.")
+    ])
+
     if plan.rebalance_due:
-        lines.extend(["", "TRADES", f"{'Ticker':<8}{'Target':>10}{'Est. units':>15}{'Delta':>14}{'Action':>10}"])
-    for _, row in action_rows.iterrows():
-        if not plan.rebalance_due or row["Action"] == "HOLD":
-            continue
-        lines.append(
-            f"{row['Ticker']:<8}{row['TargetPct']:>9.0%}{row['EstimatedUnits']:>15,.4f}"
-            f"{row['DeltaUnits']:>14,.4f}{row['Action']:>10}"
+        trades = _visible_execution_rows(run.execution_table)
+        trades = trades[trades["Action"] != "HOLD"]
+        lines.extend([
+            "",
+            f"TRADES  (estimated at {run.signal_date.date()} closing prices)",
+            _dashboard_rule(),
+            f"{'Ticker':<8}{'Price':>11}{'Target':>9}{'Est. units':>14}"
+            f"{'Delta':>14}{'Action':>9}",
+            _dashboard_rule(),
+        ])
+        for _, row in trades.iterrows():
+            lines.append(
+                f"{row['Ticker']:<8}{row['Price']:>11,.2f}{row['TargetPct']:>9.0%}"
+                f"{row['EstimatedUnits']:>14,.4f}{row['DeltaUnits']:>14,.4f}"
+                f"{row['Action']:>9}"
+            )
+        costs = "  ".join(
+            f"{bps}bp ${amount:,.0f}"
+            for bps, amount in sorted(diagnostics.estimated_costs.items())
         )
-    if plan.rebalance_due:
-        lines.extend(["", "Quantities use closing prices; recalculate from executable prices before trading."])
-    lines.append("TQQQ and UPRO are both 3x daily funds; the switch changes the index, not the multiplier.")
+        lines.extend([
+            _dashboard_rule(),
+            _dashboard_field(
+                "Turnover",
+                f"{plan.one_way_turnover:.1%} one-way  |  {plan.individual_orders} orders",
+            ),
+            _dashboard_field("Est. cost", costs),
+            _dashboard_field(
+                "Exposure",
+                f"{diagnostics.current_daily_exposure:.2f}x now "
+                f"-> {diagnostics.destination_daily_exposure:.2f}x after trades",
+            ),
+            "",
+            "Quantities are signal-close estimates. Recalculate from executable",
+            "prices during the next session, then confirm final holdings and CASH.",
+        ])
+
+    lines.extend([
+        "",
+        "NOTES",
+        _dashboard_rule(),
+        "TQQQ and UPRO both target 3x daily returns. A switch changes the index",
+        "exposure, not the leverage multiplier. Advertised exposure is a nominal",
+        "sum of daily multipliers, not a risk or volatility forecast.",
+        _dashboard_rule("="),
+    ])
     return "\n".join(lines)
 
 
@@ -1403,44 +1564,127 @@ def notification_text_body(
     return prefix + dashboard
 
 
+NOTIFICATION_STATUS_LABELS = {
+    "ACTION": "ACTION REQUIRED",
+    "UPDATE": "UPDATED ACTION REQUIRED",
+    "RETRY": "ACTION DELIVERY RETRY",
+    "UPDATE_RETRY": "UPDATED ACTION DELIVERY RETRY",
+    "CANCELLATION": "PREVIOUS ACTION CANCELLED",
+    "ANNUAL_REVIEW": "ANNUAL REVIEW COMPLETE",
+}
+NOTIFICATION_ACCENTS = {
+    "ACTION": "#b45309",
+    "UPDATE": "#b45309",
+    "RETRY": "#b45309",
+    "UPDATE_RETRY": "#b45309",
+    "CANCELLATION": "#6b7280",
+    "ANNUAL_REVIEW": "#15803d",
+}
+_ACTION_COLORS = {"BUY": "#15803d", "SELL": "#b91c1c"}
+
+_EMAIL_BASE = "font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif"
+_CELL = "padding:9px 12px;border-bottom:1px solid #e5e7eb;font-size:13px"
+_HEAD_CELL = (
+    "padding:9px 12px;border-bottom:2px solid #d1d5db;font-size:11px;"
+    "letter-spacing:.06em;text-transform:uppercase;color:#6b7280;font-weight:600"
+)
+
+
+def _email_metric(label: str, value: str) -> str:
+    return (
+        '<td style="padding:10px 14px;border:1px solid #e5e7eb;'
+        'background:#f9fafb;vertical-align:top">'
+        f'<div style="font-size:10px;letter-spacing:.06em;text-transform:uppercase;'
+        f'color:#6b7280">{label}</div>'
+        f'<div style="font-size:15px;color:#111827;padding-top:3px">{value}</div></td>'
+    )
+
+
 def build_email_html(run: StrategyRun, notification: NotificationDecision) -> str:
-    visible = run.execution_table[
-        (run.execution_table["Ticker"] != CASH_ASSET)
-        & (
-            (run.execution_table["Action"] != "HOLD")
-            | (run.execution_table["TargetPct"] > 1e-12)
-            | (run.execution_table["CurrentUnits"] > 1e-12)
-        )
-    ]
+    decision = run.decision
+    plan = run.rebalance_plan
+    diagnostics = run.execution_diagnostics
+    visible = _visible_execution_rows(run.execution_table)
+    active = GROWTH_EQUITY if decision.router_state.tqqq_active else DEFENSIVE_EQUITY
+    status = NOTIFICATION_STATUS_LABELS[notification.kind]
+    accent = NOTIFICATION_ACCENTS[notification.kind]
+
     rows = "".join(
         "<tr>"
-        f"<td>{row['Ticker']}</td><td>${row['Price']:,.2f}</td>"
-        f"<td>{row['CurrentUnits']:,.4f}</td><td>{row['TargetPct']:.1%}</td>"
-        f"<td>{row['EstimatedUnits']:,.4f}</td><td>{row['DeltaUnits']:,.4f}</td>"
-        f"<td>{row['Action']}</td></tr>"
+        f'<td style="{_CELL};font-weight:600;color:#111827">{row["Ticker"]}</td>'
+        f'<td style="{_CELL};text-align:right;color:#374151">${row["Price"]:,.2f}</td>'
+        f'<td style="{_CELL};text-align:right;color:#374151">{row["CurrentUnits"]:,.4f}</td>'
+        f'<td style="{_CELL};text-align:right;color:#374151">{row["TargetPct"]:.1%}</td>'
+        f'<td style="{_CELL};text-align:right;color:#374151">{row["EstimatedUnits"]:,.4f}</td>'
+        f'<td style="{_CELL};text-align:right;color:#374151">{row["DeltaUnits"]:+,.4f}</td>'
+        f'<td style="{_CELL};text-align:right;font-weight:600;'
+        f'color:{_ACTION_COLORS.get(row["Action"], "#6b7280")}">{row["Action"]}</td>'
+        "</tr>"
         for _, row in visible.iterrows()
     )
-    status = {
-        "ACTION": "ACTION REQUIRED",
-        "UPDATE": "UPDATED ACTION REQUIRED",
-        "RETRY": "ACTION DELIVERY RETRY",
-        "UPDATE_RETRY": "UPDATED ACTION DELIVERY RETRY",
-        "CANCELLATION": "PREVIOUS ACTION CANCELLED",
-        "ANNUAL_REVIEW": "ANNUAL REVIEW COMPLETE",
-    }[notification.kind]
-    active = GROWTH_EQUITY if run.decision.router_state.tqqq_active else DEFENSIVE_EQUITY
-    return f"""<!doctype html><html><body style="font-family:Arial,sans-serif">
-<h2>ROTH IRA TQQQ / UPRO Router</h2>
-<h3>{status}: {run.rebalance_plan.reason}</h3>
-<p>Signal close {run.signal_date.date()} &middot; Portfolio ${run.portfolio_value:,.2f}
-&middot; 40% equity fund {active} &middot; Lifecycle {run.decision.lifecycle_stage}</p>
-<table style="border-collapse:collapse" cellpadding="7">
-<tr><th>Ticker</th><th>Price</th><th>Current</th><th>Target</th>
-<th>Est. units</th><th>Delta</th><th>Action</th></tr>{rows}</table>
-<p>Signal-close estimates only. Recalculate at executable prices next session,
-then confirm complete post-trade holdings and CASH.</p>
-<p>TQQQ and UPRO both target 3x daily returns; this switch changes the index exposure.</p>
-</body></html>"""
+    metrics = "".join([
+        _email_metric("Signal close", str(run.signal_date.date())),
+        _email_metric("Portfolio value", f"${run.portfolio_value:,.2f}"),
+        _email_metric("Equity sleeve", f"{active} &middot; 40%"),
+        _email_metric("Lifecycle", decision.lifecycle_stage),
+    ])
+    costs = " &middot; ".join(
+        f"{bps}bp ${amount:,.0f}" for bps, amount in sorted(diagnostics.estimated_costs.items())
+    )
+    footnote = (
+        f'<tr><td colspan="7" style="padding:10px 12px;font-size:12px;color:#6b7280;'
+        f'background:#f9fafb">Turnover {plan.one_way_turnover:.1%} one-way &middot; '
+        f"{plan.individual_orders} orders &middot; est. cost {costs} &middot; exposure "
+        f"{diagnostics.current_daily_exposure:.2f}x &rarr; "
+        f"{diagnostics.destination_daily_exposure:.2f}x</td></tr>"
+        if plan.rebalance_due
+        else ""
+    )
+    return f"""<!doctype html>
+<html><body style="margin:0;padding:24px 12px;background:#f3f4f6;{_EMAIL_BASE}">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0"
+ style="max-width:680px;margin:0 auto;background:#ffffff;border:1px solid #e5e7eb">
+<tr><td style="padding:20px 24px;border-bottom:3px solid {accent}">
+  <div style="font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:#6b7280">
+    Roth IRA allocator &middot; {STRATEGY_REVISION}</div>
+  <div style="font-size:21px;font-weight:600;color:{accent};padding-top:6px">{status}</div>
+  <div style="font-size:13px;color:#4b5563;padding-top:3px">{plan.reason}</div>
+</td></tr>
+<tr><td style="padding:18px 24px 6px">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0"
+   style="border-collapse:collapse"><tr>{metrics}</tr></table>
+</td></tr>
+<tr><td style="padding:14px 24px 4px">
+  <div style="font-size:13px;color:#374151">
+    QQQ is <strong>{decision.qqq_close / decision.qqq_sma_200 - 1:+.1%}</strong>
+    versus its 200-day average &middot; 12-month momentum
+    <strong>{decision.qqq_momentum_252:+.1%}</strong>
+  </div>
+</td></tr>
+<tr><td style="padding:10px 24px 18px">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0"
+   style="border-collapse:collapse;border:1px solid #e5e7eb">
+  <tr style="background:#f9fafb">
+    <th style="{_HEAD_CELL};text-align:left">Ticker</th>
+    <th style="{_HEAD_CELL};text-align:right">Price</th>
+    <th style="{_HEAD_CELL};text-align:right">Current</th>
+    <th style="{_HEAD_CELL};text-align:right">Target</th>
+    <th style="{_HEAD_CELL};text-align:right">Est. units</th>
+    <th style="{_HEAD_CELL};text-align:right">Delta</th>
+    <th style="{_HEAD_CELL};text-align:right">Action</th>
+  </tr>{rows}{footnote}</table>
+</td></tr>
+<tr><td style="padding:0 24px 22px">
+  <div style="padding:12px 14px;background:#f9fafb;border-left:3px solid #d1d5db;
+   font-size:12px;color:#4b5563;line-height:1.6">
+    Signal-close estimates only. Recalculate at executable prices next session, then
+    confirm complete post-trade holdings and CASH.<br>
+    TQQQ and UPRO both target 3x daily returns; a switch changes the index exposure,
+    not the leverage multiplier. Advertised exposure is a nominal sum of daily
+    multipliers, not a risk or volatility forecast.
+  </div>
+</td></tr>
+</table></body></html>"""
 
 
 def send_email(subject: str, text_body: str, html_body: str) -> None:

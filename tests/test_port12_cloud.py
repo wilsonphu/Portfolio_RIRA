@@ -72,6 +72,34 @@ def run_fixture() -> portfolio.StrategyRun:
     )
 
 
+def action_run_fixture() -> portfolio.StrategyRun:
+    """A coherent TQQQ-to-UPRO action, including its executable trade rows."""
+    run = run_fixture()
+    routed = decision(False)
+    plan = portfolio.build_rebalance_plan(run.current_weights, routed, run.state)
+    table = portfolio.calculate_execution_table(
+        run.price_data,
+        plan.execution_weights,
+        run.portfolio_value,
+        run.state,
+        actionable=True,
+    )
+    diagnostics = portfolio.calculate_execution_diagnostics(
+        table,
+        run.portfolio_value,
+        run.current_weights,
+        routed.target_weights,
+        plan.execution_weights,
+    )
+    return replace(
+        run,
+        decision=routed,
+        execution_table=table,
+        rebalance_plan=plan,
+        execution_diagnostics=diagnostics,
+    )
+
+
 class StrategyTests(unittest.TestCase):
     def test_configuration_and_fingerprint_are_stable(self):
         portfolio.validate_configuration()
@@ -334,8 +362,7 @@ class NotificationTests(unittest.TestCase):
         self.assertEqual(run.state.pending_recommendation_supersedes_date, "2026-09-10")
 
     def test_smtp_failure_retains_pending_action_and_confirmed_shares(self):
-        run = run_fixture()
-        run = replace(run, rebalance_plan=portfolio.RebalancePlan(portfolio.target_weights(True), True, True, "TEST_ACTION", 0.1, 1))
+        run = action_run_fixture()
         with tempfile.TemporaryDirectory() as directory:
             state_path = Path(directory) / "state.json"
             audit_path = Path(directory) / "audit.json"
@@ -353,6 +380,69 @@ class NotificationTests(unittest.TestCase):
             self.assertEqual(restored["shares"], run.state.shares)
             self.assertEqual(restored["pending_recommendation_date"], "2026-09-11")
             self.assertFalse(restored["pending_recommendation_notified"])
+
+
+class DecisionAuditTests(unittest.TestCase):
+    def test_audit_records_lifecycle_rationale(self):
+        run = run_fixture()
+        audit = portfolio.build_decision_audit(
+            run, portfolio.NotificationDecision("ACTION", "NEW_RECOMMENDATION"), "STAGED"
+        )
+        self.assertEqual(audit["schema_version"], 7)
+        lifecycle = audit["lifecycle"]
+        self.assertEqual(lifecycle["stage"], run.decision.lifecycle_stage)
+        self.assertEqual(lifecycle["value_stage"], run.decision.lifecycle_value_stage)
+        self.assertEqual(lifecycle["age_stage"], run.decision.lifecycle_age_stage)
+        self.assertEqual(lifecycle["advanced"], run.decision.lifecycle_stage_advanced)
+
+    def test_audit_records_exposure_diagnostics(self):
+        run = run_fixture()
+        audit = portfolio.build_decision_audit(
+            run, portfolio.NotificationDecision("ACTION", "NEW_RECOMMENDATION"), "STAGED"
+        )
+        exposure = audit["exposure"]
+        self.assertEqual(
+            exposure["strategic"], run.execution_diagnostics.strategic_daily_exposure
+        )
+        self.assertEqual(
+            exposure["destination"], run.execution_diagnostics.destination_daily_exposure
+        )
+        self.assertEqual(
+            sorted(exposure["estimated_costs_by_bps"]),
+            sorted(str(bps) for bps in portfolio.TRANSACTION_COST_SCENARIOS_BPS),
+        )
+
+    def test_audit_payload_is_canonically_hashable(self):
+        run = run_fixture()
+        notice = portfolio.NotificationDecision("ACTION", "NEW_RECOMMENDATION")
+        first = portfolio.build_decision_audit(run, notice, "STAGED")
+        second = portfolio.build_decision_audit(run, notice, "STAGED")
+        self.assertEqual(first["decision_hash"], second["decision_hash"])
+        self.assertEqual(len(first["decision_hash"]), 64)
+
+
+class RenderingTests(unittest.TestCase):
+    def test_action_dashboard_lists_both_sides_of_router_switch(self):
+        dashboard = portfolio.build_dashboard(action_run_fixture())
+        self.assertIn("TQQQ", dashboard)
+        self.assertIn("SELL", dashboard)
+        self.assertIn("UPRO", dashboard)
+        self.assertIn("BUY", dashboard)
+
+    def test_hold_dashboard_remains_compact_and_omits_trade_table(self):
+        dashboard = portfolio.build_dashboard(run_fixture())
+        self.assertIn("NO TRADES", dashboard)
+        self.assertNotIn("TRADES  (estimated", dashboard)
+
+    def test_action_email_contains_trade_and_diagnostic_rows(self):
+        run = action_run_fixture()
+        html = portfolio.build_email_html(
+            run, portfolio.NotificationDecision("ACTION", "NEW_RECOMMENDATION")
+        )
+        self.assertIn("ACTION REQUIRED", html)
+        self.assertIn("TQQQ", html)
+        self.assertIn("UPRO", html)
+        self.assertIn("Turnover 40.0% one-way", html)
 
 
 class DataAndCliTests(unittest.TestCase):
