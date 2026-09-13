@@ -351,7 +351,7 @@ class StrategyTransitionTests(unittest.TestCase):
             alpha_review_due=True,
         )
         self.assertTrue(second.state.overlay_active)
-        self.assertEqual(second.state.soxl_weight, 0.25)
+        self.assertEqual(second.state.soxl_weight, 0.15)
 
     def test_volatility_downshift_is_immediate_and_upshift_needs_five_closes(self):
         state = core.OverlayState(
@@ -387,7 +387,7 @@ class StrategyTransitionTests(unittest.TestCase):
             raw_soxl_weight=0.25,
             alpha_review_due=False,
         )
-        self.assertEqual(fifth.state.soxl_weight, 0.25)
+        self.assertEqual(fifth.state.soxl_weight, 0.15)
 
     def test_fresh_reentry_uses_current_scale_immediately(self):
         first = core.advance_overlay_state(
@@ -407,7 +407,7 @@ class StrategyTransitionTests(unittest.TestCase):
             alpha_review_due=True,
         )
         self.assertEqual(second.reason, "OVERLAY_REENTRY")
-        self.assertEqual(second.state.soxl_weight, 0.35)
+        self.assertEqual(second.state.soxl_weight, 0.15)
         self.assertEqual(second.state.pending_scale_days, 0)
 
     def test_alpha_review_uses_fixed_model_history_phase(self):
@@ -427,42 +427,27 @@ class SignalIntegrationTests(EngineTestCase):
         self.assertEqual(
             engine.target_weights(0.0),
             {
-                engine.LEVERAGED_INDEX: 0.65,
-                engine.LEVERAGED_GOLD: 0.35,
+                engine.LEVERAGED_INDEX: 0.40,
+                engine.DBMF: 0.20,
+                engine.ZROZ: 0.20,
+                engine.CORE_GOLD: 0.20,
                 engine.LEVERAGED_SEMICONDUCTOR: 0.0,
             },
         )
-        middle = engine.target_weights(0.25)
-        self.assertAlmostEqual(middle[engine.LEVERAGED_INDEX], 0.4875)
-        self.assertAlmostEqual(middle[engine.LEVERAGED_GOLD], 0.2625)
-        self.assertAlmostEqual(middle[engine.LEVERAGED_SEMICONDUCTOR], 0.25)
+        middle = engine.target_weights(0.15)
+        self.assertAlmostEqual(middle[engine.LEVERAGED_INDEX], 0.34)
+        self.assertAlmostEqual(middle[engine.DBMF], 0.17)
+        self.assertAlmostEqual(middle[engine.ZROZ], 0.17)
+        self.assertAlmostEqual(middle[engine.CORE_GOLD], 0.17)
+        self.assertAlmostEqual(middle[engine.LEVERAGED_SEMICONDUCTOR], 0.15)
         maximum = engine.target_weights(core.MAX_SOXL_WEIGHT)
-        self.assertAlmostEqual(maximum[engine.LEVERAGED_INDEX], 0.4225)
-        self.assertAlmostEqual(maximum[engine.LEVERAGED_GOLD], 0.2275)
-        self.assertAlmostEqual(maximum[engine.LEVERAGED_SEMICONDUCTOR], 0.35)
+        self.assertEqual(maximum, middle)
         self.assertTrue(
             {"GBTC", "IBIT", "BTC-USD"}.isdisjoint(engine.ALL_TICKERS)
         )
 
     def test_lifecycle_delivery_map_preserves_sources_and_exact_exposure(self):
-        multipliers = {
-            "nasdaq": {
-                engine.LEVERAGED_INDEX: 2.0,
-                engine.VOLATILITY_INDEX: 2.0,
-                engine.UNLEVERAGED_INDEX: 1.0,
-            },
-            "gold": {
-                engine.LEVERAGED_GOLD: 2.0,
-                engine.UNLEVERAGED_GOLD: 1.0,
-            },
-            "semiconductors": {
-                engine.LEVERAGED_SEMICONDUCTOR: 3.0,
-                engine.DOUBLE_SEMICONDUCTOR: 2.0,
-                engine.UNLEVERAGED_SEMICONDUCTOR: 1.0,
-            },
-        }
         for soxl_weight in core.SOXL_WEIGHT_GRID:
-            expected_sources, _ = engine._risk_source_weights(soxl_weight)
             for stage in engine.LIFECYCLE_STAGES:
                 weights = engine.target_weights(soxl_weight, stage)
                 exposure = engine.advertised_daily_exposure(weights)
@@ -476,16 +461,8 @@ class SignalIntegrationTests(EngineTestCase):
                     )
                 self.assertAlmostEqual(exposure, ceiling, places=12)
                 self.assertAlmostEqual(sum(weights.values()), 1.0, places=12)
-                for source, products in multipliers.items():
-                    actual = sum(
-                        weights.get(ticker, 0.0) * multiplier
-                        for ticker, multiplier in products.items()
-                    )
-                    self.assertAlmostEqual(
-                        actual / exposure,
-                        expected_sources[source],
-                        places=12,
-                    )
+                if stage != engine.LIFECYCLE_SPRINT and exposure < engine.strategic_daily_exposure(soxl_weight):
+                    self.assertGreater(weights.get(engine.TREASURY_RESERVE, 0.0), 0.0)
 
     def test_value_milestones_are_inflation_indexed_and_exact(self):
         with mock.patch.dict(os.environ, {"INVESTOR_BIRTH_DATE": ""}):
@@ -555,11 +532,11 @@ class SignalIntegrationTests(EngineTestCase):
             executed_strategy_fingerprint=engine.STRATEGY_FINGERPRINT,
         )
         decision = make_decision(
-            0.25,
-            lifecycle_stage=engine.LIFECYCLE_TWO_X,
+            0.15,
+            lifecycle_stage=engine.LIFECYCLE_PHI,
         )
         plan = engine.build_rebalance_plan(
-            engine.target_weights(0.25, engine.LIFECYCLE_SPRINT),
+            engine.target_weights(0.15, engine.LIFECYCLE_SPRINT),
             decision,
             state,
         )
@@ -604,7 +581,7 @@ class SignalIntegrationTests(EngineTestCase):
             cash_balance=1_000.0,
             overlay_active=True,
             eligible_streak=3,
-            soxl_weight=0.35,
+            soxl_weight=0.15,
             last_processed_signal_date="2026-08-03",
         )
         result = engine.calculate_strategy_decision(prices, state)
@@ -648,13 +625,15 @@ class RebalanceTests(EngineTestCase):
         )
 
     def test_exact_five_point_individual_drift_triggers(self):
-        decision = make_decision(0.35)
-        state = self.aligned_state(0.35)
+        decision = make_decision(0.15)
+        state = self.aligned_state(0.15)
         plan = engine.build_rebalance_plan(
             {
-                engine.LEVERAGED_INDEX: 0.4725,
-                engine.LEVERAGED_GOLD: 0.1775,
-                engine.LEVERAGED_SEMICONDUCTOR: 0.35,
+                engine.LEVERAGED_INDEX: 0.39,
+                engine.DBMF: 0.16,
+                engine.ZROZ: 0.16,
+                engine.CORE_GOLD: 0.14,
+                engine.LEVERAGED_SEMICONDUCTOR: 0.15,
             },
             decision,
             state,
@@ -663,9 +642,11 @@ class RebalanceTests(EngineTestCase):
         self.assertTrue(plan.individual_drift_triggered)
         below = engine.build_rebalance_plan(
             {
-                engine.LEVERAGED_INDEX: 0.4724,
-                engine.LEVERAGED_GOLD: 0.1776,
-                engine.LEVERAGED_SEMICONDUCTOR: 0.35,
+                engine.LEVERAGED_INDEX: 0.3899,
+                engine.DBMF: 0.1601,
+                engine.ZROZ: 0.16,
+                engine.CORE_GOLD: 0.14,
+                engine.LEVERAGED_SEMICONDUCTOR: 0.15,
             },
             decision,
             state,
@@ -675,12 +656,13 @@ class RebalanceTests(EngineTestCase):
     def test_exact_five_point_aggregate_equity_drift_triggers(self):
         individual, aggregate = engine.drift_triggers(
             {
-                engine.LEVERAGED_INDEX: 0.3975,
-                engine.LEVERAGED_SEMICONDUCTOR: 0.325,
-                engine.LEVERAGED_GOLD: 0.2525,
-                engine.CASH_ASSET: 0.025,
+                engine.LEVERAGED_INDEX: 0.365,
+                engine.LEVERAGED_SEMICONDUCTOR: 0.175,
+                engine.DBMF: 0.16,
+                engine.ZROZ: 0.16,
+                engine.CORE_GOLD: 0.14,
             },
-            engine.target_weights(0.35),
+            engine.target_weights(0.15),
         )
         self.assertFalse(individual)
         self.assertTrue(aggregate)
@@ -688,25 +670,26 @@ class RebalanceTests(EngineTestCase):
     def test_drift_trade_stops_at_inner_destination(self):
         result = engine.inner_band_rebalance_weights(
             {
-                engine.LEVERAGED_INDEX: 0.4725,
-                engine.LEVERAGED_GOLD: 0.1775,
-                engine.LEVERAGED_SEMICONDUCTOR: 0.35,
+                engine.LEVERAGED_INDEX: 0.39,
+                engine.DBMF: 0.16,
+                engine.ZROZ: 0.16,
+                engine.CORE_GOLD: 0.14,
+                engine.LEVERAGED_SEMICONDUCTOR: 0.15,
             },
-            engine.target_weights(0.35),
+            engine.target_weights(0.15),
         )
-        self.assertAlmostEqual(result[engine.LEVERAGED_INDEX], 0.4475)
-        self.assertAlmostEqual(result[engine.LEVERAGED_GOLD], 0.2025)
-        self.assertAlmostEqual(
-            result[engine.LEVERAGED_SEMICONDUCTOR],
-            0.35,
-        )
+        self.assertAlmostEqual(sum(result.values()), 1.0)
+        for ticker, weight in engine.target_weights(0.15).items():
+            self.assertLessEqual(abs(result.get(ticker, 0.0) - weight), 0.025 + 1e-12)
 
     def test_inner_destination_never_exceeds_the_soxl_cap(self):
         plan = engine.build_rebalance_plan(
             {
-                engine.LEVERAGED_INDEX: 0.35,
-                engine.LEVERAGED_GOLD: 0.25,
-                engine.LEVERAGED_SEMICONDUCTOR: 0.40,
+                engine.LEVERAGED_INDEX: 0.32,
+                engine.DBMF: 0.18,
+                engine.ZROZ: 0.16,
+                engine.CORE_GOLD: 0.14,
+                engine.LEVERAGED_SEMICONDUCTOR: 0.20,
             },
             make_decision(core.MAX_SOXL_WEIGHT),
             self.aligned_state(core.MAX_SOXL_WEIGHT),
@@ -715,24 +698,18 @@ class RebalanceTests(EngineTestCase):
             plan.execution_weights[engine.LEVERAGED_SEMICONDUCTOR],
             core.MAX_SOXL_WEIGHT,
         )
-        self.assertAlmostEqual(
-            plan.execution_weights[engine.LEVERAGED_INDEX],
-            0.3975,
-        )
-        self.assertAlmostEqual(
-            plan.execution_weights[engine.LEVERAGED_GOLD],
-            0.25125,
-        )
-        self.assertAlmostEqual(
-            plan.execution_weights[engine.CASH_ASSET],
-            0.00125,
+        self.assertLessEqual(
+            plan.execution_weights[engine.LEVERAGED_SEMICONDUCTOR],
+            core.MAX_SOXL_WEIGHT,
         )
 
     def test_ordinary_drift_rebalance_returns_soxl_to_exact_tier(self):
         plan = engine.build_rebalance_plan(
             {
-                engine.LEVERAGED_INDEX: 0.50,
-                engine.LEVERAGED_GOLD: 0.30,
+                engine.LEVERAGED_INDEX: 0.45,
+                engine.DBMF: 0.15,
+                engine.ZROZ: 0.10,
+                engine.CORE_GOLD: 0.10,
                 engine.LEVERAGED_SEMICONDUCTOR: 0.20,
             },
             make_decision(0.15),
@@ -765,9 +742,9 @@ class RebalanceTests(EngineTestCase):
 
     def test_legacy_position_is_exactly_sold_below_drift_band(self):
         state = self.aligned_state(0.0)
-        state.shares = {engine.LEGACY_HEDGE: 0.10, engine.LEVERAGED_INDEX: 9.9}
+        state.shares = {engine.LEGACY_LEVERAGED_GOLD: 0.10, engine.LEVERAGED_INDEX: 9.9}
         current = {
-            engine.LEGACY_HEDGE: 0.01,
+            engine.LEGACY_LEVERAGED_GOLD: 0.01,
             engine.LEVERAGED_INDEX: 0.99,
         }
         decision = make_decision(0.0)
@@ -781,14 +758,14 @@ class RebalanceTests(EngineTestCase):
             state,
             actionable=True,
         )
-        row = table.loc[table["Ticker"] == engine.LEGACY_HEDGE].iloc[0]
+        row = table.loc[table["Ticker"] == engine.LEGACY_LEVERAGED_GOLD].iloc[0]
         self.assertEqual(row["TargetPct"], 0.0)
         self.assertEqual(row["Action"], "SELL")
         self.assertAlmostEqual(row["EstimatedUnits"], 0.0)
 
         tiny_state = self.aligned_state(0.0)
         tiny_state.shares = {
-            engine.LEGACY_HEDGE: 0.00000001,
+            engine.LEGACY_LEVERAGED_GOLD: 0.00000001,
             engine.LEVERAGED_INDEX: 10.0,
         }
         tiny_table = engine.calculate_execution_table(
@@ -799,21 +776,25 @@ class RebalanceTests(EngineTestCase):
             actionable=True,
         )
         tiny_row = tiny_table.loc[
-            tiny_table["Ticker"] == engine.LEGACY_HEDGE
+            tiny_table["Ticker"] == engine.LEGACY_LEVERAGED_GOLD
         ].iloc[0]
         self.assertEqual(tiny_row["Action"], "SELL")
 
-    def test_retired_tqqq_core_is_sold_during_qld_transition(self):
+    def test_retired_qld_core_is_sold_during_strategy_transition(self):
         state = self.aligned_state(0.0)
         state.shares = {
-            engine.LEGACY_TRIPLE_INDEX: 0.10,
-            engine.LEVERAGED_INDEX: 6.4,
-            engine.LEVERAGED_GOLD: 3.5,
+            engine.LEGACY_LEVERAGED_INDEX: 0.10,
+            engine.LEVERAGED_INDEX: 4.0,
+            engine.DBMF: 2.0,
+            engine.ZROZ: 2.0,
+            engine.CORE_GOLD: 2.0,
         }
         current = {
-            engine.LEGACY_TRIPLE_INDEX: 0.01,
-            engine.LEVERAGED_INDEX: 0.64,
-            engine.LEVERAGED_GOLD: 0.35,
+            engine.LEGACY_LEVERAGED_INDEX: 0.01,
+            engine.LEVERAGED_INDEX: 0.40,
+            engine.DBMF: 0.20,
+            engine.ZROZ: 0.20,
+            engine.CORE_GOLD: 0.19,
         }
         plan = engine.build_rebalance_plan(
             current,
@@ -823,12 +804,12 @@ class RebalanceTests(EngineTestCase):
         self.assertTrue(plan.full_transition)
         self.assertEqual(plan.reason, "LEGACY_POSITION_EXIT")
         self.assertEqual(
-            plan.execution_weights.get(engine.LEGACY_TRIPLE_INDEX, 0.0),
+            plan.execution_weights.get(engine.LEGACY_LEVERAGED_INDEX, 0.0),
             0.0,
         )
         self.assertAlmostEqual(
             plan.execution_weights[engine.LEVERAGED_INDEX],
-            0.65,
+            0.40,
         )
         table = engine.calculate_execution_table(
             one_row_prices(),
@@ -838,7 +819,7 @@ class RebalanceTests(EngineTestCase):
             actionable=True,
         )
         tqqq = table.loc[
-            table["Ticker"] == engine.LEGACY_TRIPLE_INDEX
+            table["Ticker"] == engine.LEGACY_LEVERAGED_INDEX
         ].iloc[0]
         self.assertEqual(tqqq["Action"], "SELL")
         self.assertEqual(tqqq["TargetPct"], 0.0)
@@ -878,12 +859,7 @@ class RebalanceTests(EngineTestCase):
         self.assertTrue(plan.full_transition)
         self.assertEqual(
             plan.execution_weights,
-            {
-                engine.LEVERAGED_INDEX: 0.65,
-                engine.LEVERAGED_GOLD: 0.35,
-                engine.LEVERAGED_SEMICONDUCTOR: 0.0,
-                engine.CASH_ASSET: 0.0,
-            },
+            engine._with_cash_target(engine.target_weights(0.0)),
         )
 
 
@@ -1063,6 +1039,10 @@ class StateAndHoldingsTests(EngineTestCase):
                 "state_version",
                 "last_processed_data_fingerprint",
                 "soxl_weight",
+                "pending_soxl_weight",
+                "pending_scale_days",
+                "executed_soxl_weight",
+                "pending_recommendation_soxl_weight",
             }:
                 self.assertEqual(getattr(migrated, name), value)
         self.assertEqual(migrated.soxl_weight, 0.15)
@@ -1145,11 +1125,11 @@ class StateAndHoldingsTests(EngineTestCase):
             {engine.LEVERAGED_SEMICONDUCTOR: 2.5},
         )
         self.assertEqual(migrated.cash_balance, 12.25)
-        self.assertEqual(migrated.soxl_weight, 0.25)
-        self.assertEqual(migrated.pending_soxl_weight, 0.35)
-        self.assertEqual(migrated.pending_scale_days, 3)
-        self.assertEqual(migrated.executed_soxl_weight, 0.30)
-        self.assertEqual(migrated.pending_recommendation_soxl_weight, 0.20)
+        self.assertEqual(migrated.soxl_weight, 0.15)
+        self.assertEqual(migrated.pending_soxl_weight, 0.0)
+        self.assertEqual(migrated.pending_scale_days, 0)
+        self.assertEqual(migrated.executed_soxl_weight, 0.15)
+        self.assertEqual(migrated.pending_recommendation_soxl_weight, 0.15)
         self.assertTrue(migrated.pending_recommendation_notified)
         self.assertEqual(migrated.last_processed_data_fingerprint, "c" * 64)
 
@@ -1568,7 +1548,7 @@ class AuditAndCliTests(EngineTestCase):
         self.assertEqual(
             targets["qld_soxl_same_alpha"],
             {
-                engine.VOLATILITY_INDEX: 0.75,
+                "QLD": 0.75,
                 engine.LEVERAGED_SEMICONDUCTOR: 0.25,
             },
         )

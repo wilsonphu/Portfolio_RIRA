@@ -218,19 +218,14 @@ class VarianceModelTests(unittest.TestCase):
 
 class VolatilitySizingTests(unittest.TestCase):
     def test_soxl_allocations_are_only_the_four_frozen_tiers(self):
-        self.assertEqual(alpha.SOXL_WEIGHT_GRID, (0.0, 0.15, 0.25, 0.35))
+        self.assertEqual(alpha.SOXL_WEIGHT_GRID, (0.0, 0.15))
         self.assertEqual(alpha.floor_soxl_tier(0.20), 0.15)
-        self.assertEqual(alpha.floor_soxl_tier(0.30), 0.25)
+        self.assertEqual(alpha.floor_soxl_tier(0.30), 0.15)
         with self.assertRaisesRegex(ValueError, "strategic tier"):
             alpha.target_weights(0.20)
 
     def test_each_soxl_tier_is_reachable_from_the_volatility_budget(self):
-        cases = (
-            (0.50, 1.00, 0.0),
-            (0.30, 1.50, 0.15),
-            (0.40, 1.00, 0.25),
-            (0.30, 0.60, 0.35),
-        )
+        cases = ((0.50, 1.00, 0.0), (0.30, 1.50, 0.15))
         for qld_volatility, soxl_volatility, expected in cases:
             with self.subTest(expected=expected):
                 selected, _ = alpha.choose_soxl_weight(
@@ -259,7 +254,7 @@ class VolatilitySizingTests(unittest.TestCase):
             1.0,
             budget=0.50,
         )
-        self.assertEqual(weight, 0.35)
+        self.assertEqual(weight, 0.15)
         self.assertAlmostEqual(volatility, 0.50, places=12)
         self.assertAlmostEqual(
             alpha.advertised_daily_exposure(weight),
@@ -276,7 +271,10 @@ class VolatilitySizingTests(unittest.TestCase):
         )
         self.assertEqual(weight, 0.0)
         self.assertAlmostEqual(volatility, 0.60, places=12)
-        self.assertEqual(alpha.target_weights(weight), {"QLD": 1.0, "SOXL": 0.0})
+        self.assertEqual(
+            alpha.target_weights(weight),
+            {"TQQQ": 0.40, "DBMF": 0.20, "ZROZ": 0.20, "GLD": 0.20, "SOXL": 0.0},
+        )
 
     def test_intermediate_grid_weight_is_largest_feasible(self):
         weight, volatility = alpha.choose_soxl_weight(
@@ -338,7 +336,7 @@ class OverlayTransitionTests(unittest.TestCase):
             signal_date=pd.Timestamp("2026-08-03"),
             trend_positive=True,
             residual_positive=True,
-            raw_soxl_weight=0.25,
+            raw_soxl_weight=0.15,
             alpha_review_due=False,
         )
         self.assertFalse(first.state.overlay_active)
@@ -349,11 +347,11 @@ class OverlayTransitionTests(unittest.TestCase):
             signal_date=pd.Timestamp("2026-08-04"),
             trend_positive=True,
             residual_positive=True,
-            raw_soxl_weight=0.25,
+            raw_soxl_weight=0.15,
             alpha_review_due=True,
         )
         self.assertTrue(second.state.overlay_active)
-        self.assertEqual(second.state.soxl_weight, 0.25)
+        self.assertEqual(second.state.soxl_weight, 0.15)
         self.assertEqual(second.reason, "OVERLAY_REENTRY")
 
         duplicate = alpha.advance_overlay_state(
@@ -361,7 +359,7 @@ class OverlayTransitionTests(unittest.TestCase):
             signal_date=pd.Timestamp("2026-08-04"),
             trend_positive=True,
             residual_positive=True,
-            raw_soxl_weight=0.35,
+            raw_soxl_weight=0.15,
             alpha_review_due=True,
         )
         self.assertEqual(duplicate.state, second.state)
@@ -371,7 +369,7 @@ class OverlayTransitionTests(unittest.TestCase):
         active = alpha.OverlayState(
             overlay_active=True,
             eligible_streak=10,
-            soxl_weight=0.35,
+            soxl_weight=0.15,
             soxl_weight_date="2026-08-01",
             last_processed_signal_date="2026-08-03",
         )
@@ -380,18 +378,18 @@ class OverlayTransitionTests(unittest.TestCase):
             signal_date=pd.Timestamp("2026-08-04"),
             trend_positive=True,
             residual_positive=True,
-            raw_soxl_weight=0.25,
+            raw_soxl_weight=0.15,
             alpha_review_due=False,
         )
-        self.assertEqual(downshift.state.soxl_weight, 0.25)
-        self.assertEqual(downshift.reason, "VOLATILITY_DOWNSHIFT")
+        self.assertEqual(downshift.state.soxl_weight, 0.15)
+        self.assertEqual(downshift.reason, "HOLD")
 
         exited = alpha.advance_overlay_state(
             downshift.state,
             signal_date=pd.Timestamp("2026-08-05"),
             trend_positive=False,
             residual_positive=True,
-            raw_soxl_weight=0.35,
+            raw_soxl_weight=0.15,
             alpha_review_due=False,
         )
         self.assertFalse(exited.state.overlay_active)
@@ -405,40 +403,23 @@ class OverlayTransitionTests(unittest.TestCase):
             soxl_weight=0.15,
             last_processed_signal_date="2026-08-02",
         )
-        for offset, date_text in enumerate(
-            ("2026-08-03", "2026-08-04", "2026-08-05", "2026-08-06"),
-            start=1,
-        ):
-            transition = alpha.advance_overlay_state(
-                state,
-                signal_date=pd.Timestamp(date_text),
-                trend_positive=True,
-                residual_positive=True,
-                raw_soxl_weight=0.35,
-                alpha_review_due=False,
-            )
-            state = transition.state
-            self.assertEqual(state.soxl_weight, 0.15)
-            self.assertEqual(state.pending_scale_days, offset)
-            self.assertEqual(transition.reason, "VOLATILITY_UPSHIFT_PENDING")
-
-        fifth = alpha.advance_overlay_state(
+        transition = alpha.advance_overlay_state(
             state,
-            signal_date=pd.Timestamp("2026-08-07"),
+            signal_date=pd.Timestamp("2026-08-03"),
             trend_positive=True,
             residual_positive=True,
-            raw_soxl_weight=0.35,
+            raw_soxl_weight=0.15,
             alpha_review_due=False,
         )
-        self.assertEqual(fifth.state.soxl_weight, 0.35)
-        self.assertEqual(fifth.state.pending_scale_days, 0)
-        self.assertEqual(fifth.reason, "VOLATILITY_UPSHIFT")
+        self.assertEqual(transition.state.soxl_weight, 0.15)
+        self.assertEqual(transition.state.pending_scale_days, 0)
+        self.assertEqual(transition.reason, "HOLD")
 
     def test_residual_exit_waits_for_alpha_review(self):
         active = alpha.OverlayState(
             overlay_active=True,
             eligible_streak=4,
-            soxl_weight=0.25,
+            soxl_weight=0.15,
             last_processed_signal_date="2026-08-03",
         )
         held = alpha.advance_overlay_state(
@@ -446,7 +427,7 @@ class OverlayTransitionTests(unittest.TestCase):
             signal_date=pd.Timestamp("2026-08-04"),
             trend_positive=True,
             residual_positive=False,
-            raw_soxl_weight=0.25,
+            raw_soxl_weight=0.15,
             alpha_review_due=False,
         )
         self.assertTrue(held.state.overlay_active)
@@ -455,7 +436,7 @@ class OverlayTransitionTests(unittest.TestCase):
             signal_date=pd.Timestamp("2026-08-05"),
             trend_positive=True,
             residual_positive=False,
-            raw_soxl_weight=0.25,
+            raw_soxl_weight=0.15,
             alpha_review_due=True,
         )
         self.assertFalse(reviewed.state.overlay_active)
@@ -477,7 +458,7 @@ class OverlayTransitionTests(unittest.TestCase):
                         signal_date=pd.Timestamp("2026-08-03"),
                         trend_positive=trend,
                         residual_positive=residual,
-                        raw_soxl_weight=0.35,
+                        raw_soxl_weight=0.15,
                         alpha_review_due=True,
                     )
         with self.assertRaisesRegex(ValueError, "alpha_review_due"):
@@ -486,7 +467,7 @@ class OverlayTransitionTests(unittest.TestCase):
                 signal_date=pd.Timestamp("2026-08-03"),
                 trend_positive=True,
                 residual_positive=True,
-                raw_soxl_weight=0.35,
+                raw_soxl_weight=0.15,
                 alpha_review_due=np.nan,
             )
 

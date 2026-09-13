@@ -1,4 +1,4 @@
-"""Pure quantitative primitives for the QLD-core/SOXL-overlay strategy.
+"""Pure quantitative primitives for the TQQQ diversified/SOXL-overlay strategy.
 
 This module has no filesystem, network, email, environment-variable, or
 production-state side effects.  It is intentionally shared by research and
@@ -19,13 +19,17 @@ import pandas as pd
 
 QQQ = "QQQ"
 SMH = "SMH"
+TQQQ = "TQQQ"
 QLD = "QLD"
 SOXL = "SOXL"
+DBMF = "DBMF"
+ZROZ = "ZROZ"
+GLD = "GLD"
 CASH = "CASH"
 
 # Bump this value only after reviewing a decision-semantic change. Source-file
 # bytes belong in implementation lineage, not in the live allocation identity.
-DECISION_SEMANTIC_REVISION = "qld-soxl-tiered-core-v2"
+DECISION_SEMANTIC_REVISION = "tqqq40-dbmf20-zroz20-gld20-soxl15-v1"
 MODEL_HISTORY_START = "2010-03-11"
 
 SMA_WINDOW = 200
@@ -43,9 +47,10 @@ VARIANCE_MIN_TRAINING = 756
 RIDGE_ALPHA = 10.0
 
 VOLATILITY_BUDGET = 0.55
-SOXL_WEIGHT_GRID = (0.0, 0.15, 0.25, 0.35)
-MAX_SOXL_WEIGHT = 0.35
-MAX_ADVERTISED_DAILY_EXPOSURE = 2.35
+SOXL_WEIGHT_GRID = (0.0, 0.15)
+MAX_SOXL_WEIGHT = 0.15
+MAX_ADVERTISED_DAILY_EXPOSURE = 1.98
+LEGACY_MAX_SOXL_WEIGHT = 0.35
 
 _EPSILON = 1e-12
 _WEIGHT_TOLERANCE = 1e-12
@@ -101,6 +106,9 @@ class VarianceForecast:
 class PortfolioVolatility:
     """Volatility inputs used to select the incremental SOXL weight."""
 
+    # ``qld`` is retained as a serialized compatibility field name for older
+    # state/audit payloads.  In the live revision it contains the TQQQ
+    # volatility forecast.
     qld: VarianceForecast
     soxl: VarianceForecast
     correlation_21: float | None
@@ -168,11 +176,11 @@ def _strict_bool(value: object, name: str) -> bool:
 
 
 def advertised_daily_exposure(soxl_weight: float) -> float:
-    """Return advertised daily exposure for QLD=(1-w), SOXL=w."""
+    """Return advertised exposure for the 40/20/20/20 base plus SOXL."""
     weight = float(soxl_weight)
     if not np.isfinite(weight) or weight < 0 or weight > MAX_SOXL_WEIGHT + _EPSILON:
         raise ValueError("SOXL weight is outside the strategic range")
-    return 2.0 * (1.0 - weight) + 3.0 * weight
+    return 1.8 * (1.0 - weight) + 3.0 * weight
 
 
 def calculate_residual_signal(
@@ -546,7 +554,7 @@ def choose_soxl_weight(
     limit = _finite_positive(budget, "Volatility budget")
     candidates = tuple(float(item) for item in grid)
     if not candidates or any(
-        not np.isfinite(item) or item < 0 or item > MAX_SOXL_WEIGHT + _EPSILON
+        not np.isfinite(item) or item < 0 or item > LEGACY_MAX_SOXL_WEIGHT + _EPSILON
         for item in candidates
     ):
         raise ValueError("SOXL weight grid is invalid")
@@ -598,7 +606,7 @@ def floor_soxl_tier(value: float) -> float:
     if (
         not np.isfinite(numeric)
         or numeric < -_WEIGHT_TOLERANCE
-        or numeric > MAX_SOXL_WEIGHT + _WEIGHT_TOLERANCE
+        or numeric > LEGACY_MAX_SOXL_WEIGHT + _WEIGHT_TOLERANCE
     ):
         raise ValueError("SOXL weight is outside the strategic range")
     bounded = min(max(numeric, 0.0), MAX_SOXL_WEIGHT)
@@ -615,10 +623,15 @@ def calculate_portfolio_volatility(
     budget: float = VOLATILITY_BUDGET,
     min_samples: int = VARIANCE_MIN_TRAINING,
 ) -> PortfolioVolatility:
-    """Forecast QLD/SOXL risk and return the largest permitted SOXL weight."""
-    clean = _as_clean_close_frame(price_data, (QLD, SOXL))
+    """Forecast the active leveraged-index/SOXL pair.
+
+    The production strategy uses TQQQ.  QLD remains accepted as a compatibility
+    input for historical unit tests and legacy research replays.
+    """
+    index_ticker = TQQQ if TQQQ in price_data.columns else QLD
+    clean = _as_clean_close_frame(price_data, (index_ticker, SOXL))
     qld = forecast_daily_bar_volatility(
-        clean[QLD],
+        clean[index_ticker],
         min_samples=min_samples,
     )
     soxl = forecast_daily_bar_volatility(
@@ -627,12 +640,12 @@ def calculate_portfolio_volatility(
     )
     returns = np.log(clean).diff().dropna()
     correlation_21 = float(
-        returns.iloc[-VARIANCE_MONTH_WINDOW:][QLD].corr(
+        returns.iloc[-VARIANCE_MONTH_WINDOW:][index_ticker].corr(
             returns.iloc[-VARIANCE_MONTH_WINDOW:][SOXL]
         )
     )
     correlation_63 = float(
-        returns.iloc[-VARIANCE_QUARTER_WINDOW:][QLD].corr(
+        returns.iloc[-VARIANCE_QUARTER_WINDOW:][index_ticker].corr(
             returns.iloc[-VARIANCE_QUARTER_WINDOW:][SOXL]
         )
     )
@@ -662,11 +675,18 @@ def calculate_portfolio_volatility(
 
 
 def target_weights(soxl_weight: float) -> dict[str, float]:
-    """Return exact strategic QLD/SOXL weights."""
+    """Return exact strategic TQQQ/DBMF/ZROZ/GLD/SOXL weights."""
     weight = float(soxl_weight)
     if not is_soxl_tier(weight):
         raise ValueError("SOXL target weight is not a strategic tier")
-    return {QLD: 1.0 - weight, SOXL: weight}
+    remaining = 1.0 - weight
+    return {
+        TQQQ: 0.40 * remaining,
+        DBMF: 0.20 * remaining,
+        ZROZ: 0.20 * remaining,
+        GLD: 0.20 * remaining,
+        SOXL: weight,
+    }
 
 
 def advance_overlay_state(
@@ -696,9 +716,10 @@ def advance_overlay_state(
             )
     if reentry_closes < 1 or upshift_closes < 1:
         raise ValueError("Confirmation counts must be positive")
-    raw_weight = float(raw_soxl_weight)
-    if not is_soxl_tier(raw_weight):
-        raise ValueError("Raw SOXL weight is not a strategic tier")
+    # Historical v6 states could carry 25% or 35% latent tiers.  They are
+    # deliberately floored to the current single 15% production tier rather
+    # than being allowed to re-enter at a retired exposure.
+    raw_weight = floor_soxl_tier(float(raw_soxl_weight))
 
     trend = _strict_bool(trend_positive, "trend_positive")
     residual = _strict_bool(residual_positive, "residual_positive")

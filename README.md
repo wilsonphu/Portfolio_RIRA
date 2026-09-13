@@ -1,138 +1,100 @@
 # Roth IRA production allocator
 
-This repository contains one production system: a stateful, notification-only
-QLD/UGL foundation with a bounded SOXL overlay and a permanent lifecycle
-deleveraging ratchet. It does not connect to a broker or place trades
-automatically.
+This repository contains one stateful, notification-only Roth IRA allocator.
+The current production revision is `tqqq40-dbmf20-zroz20-gld20-soxl15-v1`.
+It does not connect to a broker or place trades automatically: it calculates a
+next-session plan, emails only when a decision requires action, and treats
+confirmed broker shares and cash as the source of truth.
 
-## Strategy
+## Current strategy
 
-At strategic SOXL weight `s`, the portfolio target is:
+At the current SOXL tier `s`, the sprint target is:
 
 ```text
-QLD  = 65% * (1 - s)
-UGL  = 35% * (1 - s)
+TQQQ = 40% * (1 - s)
+DBMF = 20% * (1 - s)
+ZROZ = 20% * (1 - s)
+GLD  = 20% * (1 - s)
 SOXL = s
 ```
 
-`s` is restricted to four deliberate tiers: `0%`, `15%`, `25%`, or `35%`.
-The SOXL sleeve requires both:
+`s` has only two production values: `0%` and `15%`. The 15% SOXL tier is
+admitted only when both of these completed-close conditions are satisfied:
 
-- QQQ strictly above its completed-close 200-session SMA; and
-- positive 63-session residual momentum from a separated-window SMH-on-QQQ
-  OLS model.
+- QQQ is strictly above its 200-session SMA; and
+- 63-session residual momentum for the separated-window SMH-on-QQQ OLS model
+  is positive.
 
-The residual signal is the alpha gate. The 200-session trend rule is retained
-as a defensive SOXL exit fuse, not as a standalone return claim. The sleeve is
-sized with the causal QLD/SOXL HAR-style volatility forecast and a 55% overlay
-admission budget. The budget chooses among the frozen tiers; it is not a
-promise that subsequently realized portfolio volatility will remain below
-55%.
+The causal HAR-style volatility forecast and its 55% overlay budget decide
+whether the 15% tier fits. This is a risk-sizing gate, not a promise that
+realized volatility will remain below 55%. Trend failure exits SOXL
+immediately; re-entry requires two distinct eligible closes. The current
+revision deliberately has no SMA-based TQQQ-to-QLD/QQQ de-leveraging rule yet;
+that is a separate risk-management design discussion.
 
-Trend failure exits SOXL immediately. Residual exits occur on the fixed
-21-session review clock. Re-entry requires two distinct eligible closes;
-volatility reductions are immediate and increases require five completed
-sessions. If 15% does not fit, SOXL remains at 0%.
+The maximum advertised daily exposure is 1.80x with no SOXL and 1.98x when the
+15% tier is active. The core sleeves are intentionally simple and fixed; the
+only tactical sleeve in this first revision is the single SOXL tier.
 
-## Automatic lifecycle ratchet
+## Lifecycle reserve policy
 
-Portfolio value and investor age independently impose a maximum delivery
-leverage. The safer of the two rules wins. Once a stage advances, it never
-moves backward after a drawdown.
+The existing one-way lifecycle ratchet remains enabled. Account value and age
+independently impose an exposure ceiling, and the safer ceiling wins. Until a
+future revision specifies product-level SMA deleveraging, a lifecycle ceiling
+is implemented by scaling the current TQQQ/DBMF/ZROZ/GLD/SOXL target
+proportionally into `SGOV`. A stage never re-levers after it advances.
 
-| Stage | 2026-dollar value gate | Age gate | Advertised daily exposure |
+| Stage | 2026-dollar value gate | Age gate | Ceiling |
 |---|---:|---:|---:|
-| `SPRINT` | below $250,000 | below 45 | current 2.00x-2.35x |
-| `GLIDE_225` | $250,000 | 45 | 2.25x |
-| `TWO_X` | $500,000 | 50 | 2.00x |
+| `SPRINT` | below $250,000 | below 45 | current target (1.80x–1.98x) |
+| `GLIDE_225` | $250,000 | 45 | 2.25x maximum |
+| `TWO_X` | $500,000 | 50 | 2.00x maximum |
 | `PHI` | $1,000,000 | 55 | 1.618x |
 | `ONE_THREE` | $2,000,000 | 59.5 | 1.30x |
 | `ONE_X` | $5,000,000 | 65 | 1.00x |
 | `RETIREMENT` | age only | 70 | 0.75x plus 25% SGOV |
 
-Value gates are indexed at 2.5% annually from August 14, 2026, so they retain
-roughly constant purchasing power. The default age estimate starts at age 23
-on that date. Set the optional `INVESTOR_BIRTH_DATE` repository secret in
-`YYYY-MM-DD` format for exact age boundaries.
+The value gates are indexed at 2.5% annually from August 14, 2026. Set the
+optional `INVESTOR_BIRTH_DATE` repository secret (`YYYY-MM-DD`) for exact age
+boundaries; otherwise the dated age-23 anchor is used.
 
-The alpha model still determines the Nasdaq/gold/semiconductor source mix. The
-lifecycle layer changes only how that exposure is delivered:
+## Rebalancing and notifications
 
-- Nasdaq: QLD to QQQM.
-- Gold: UGL to a UGL/GLDM blend to GLDM.
-- Semiconductors: SOXL to USD to SMH.
-- Retirement reserve: SGOV.
+The engine rebalances only for a structural change, a five-percentage-point
+individual drift, or a five-point aggregate equity drift. Risk-off SOXL exits
+and lifecycle transitions bypass the drift band. Ordinary HOLD runs are
+silent. Email is sent only for a new action, a material update, a one-time
+cancellation, or a delivery retry. Duplicate pending recommendations are
+suppressed.
 
-Between integer exposure levels the engine blends adjacent products to remain
-at or below the stage ceiling. A stage does not add exposure when the current
-target is already below its ceiling. Lifecycle transitions are structural
-actions, bypass the drift band, and generate one email with the complete
-destination portfolio.
-
-The strategy is deployed by investor authorization. Historical backtests do
-not prove that its return advantage will persist. Before the first lifecycle
-milestone, a loss of half the portfolio remains plausible.
-
-## Portfolio state and notifications
-
-Confirmed broker shares and cash—not calculated target weights—are the sole
-source of truth. The engine rebalances only for a structural change, a
-five-percentage-point individual drift, or a five-point aggregate equity
-drift. The active semiconductor delivery sleeve returns to the exact latent
-SOXL tier; other positions normally trade back to the inner 2.5-point band.
-
-Ordinary HOLD runs are silent. Email is sent only for a new action, a material
-update, a one-time cancellation, or a delivery retry. Every unseen completed
-NYSE session is replayed after an outage, and the immutable signal ledger is
-hash-chained and anchored in state.
+Legacy QLD/UGL/TECL/other positions remain priceable during migration so that
+the first run can sell them explicitly; they are not strategic targets in this
+revision. No state, balances, addresses, or credentials belong in Git.
 
 ## Production workflow
 
 The GitHub Actions workflow runs after completed NYSE closes. When an action
 email arrives:
 
-1. Recalculate the quantities using executable next-session prices.
+1. Recalculate quantities using executable next-session prices.
 2. Execute the trades manually at the broker.
 3. Run the workflow with `run_mode: confirm-execution`.
-4. Supply the email's signal date and every final holding as
-   `TICKER=SHARES`, including `CASH=...`.
+4. Supply the email's signal date and every final holding as `TICKER=SHARES`,
+   including `CASH=...`.
 
-Use `run_mode: sync-holdings` only for a contribution, withdrawal, dividend,
-or broker correction when no recommendation is pending. Always supply the
-complete account.
-
-### First initialization
-
-For a genuinely new all-cash account with no saved state:
-
-- dispatch `run_mode: signal`;
-- set `initialize_portfolio: true`; and
-- create the `ROTH_IRA_AMOUNT` repository secret.
-
-For an already-invested account, initialize with `sync-holdings` and complete
-broker holdings. Never use `ROTH_IRA_AMOUNT` to replace existing state.
-
-### Repository secrets
-
-- `ROTH_IRA_AMOUNT`: first-run cash only.
-- `GMAIL_ADDRESS`: notification sender.
-- `GMAIL_APP_PASSWORD`: Gmail app password.
-- `RECEIVER_EMAIL`: notification recipient.
-- `INVESTOR_BIRTH_DATE`: optional exact birth date in `YYYY-MM-DD`; otherwise
-  the dated age-23 anchor is used.
-
-State, holdings, balances, addresses, and credentials must never be committed.
-Production state is restored from and saved to the `roth-ira-state` workflow
-artifact.
+Use `run_mode: sync-holdings` for a contribution, withdrawal, dividend, or
+broker correction when no recommendation is pending. For a genuinely new
+all-cash account, use `run_mode: signal`, `initialize_portfolio: true`, and
+set the `ROTH_IRA_AMOUNT` secret. Do not use that secret to replace existing
+broker holdings.
 
 ## Research governance
 
-The production runner records non-trading comparison targets in its
-hash-chained shadow ledger. These controls can measure drift-band sensitivity
-and SPY/SSO core substitutions, but they cannot alter live holdings, orders,
-state transitions, or notifications. A variant must pass the frozen rules in
-`STRATEGY_DEVELOPMENT_PROTOCOL.md` before promotion. Research reports and raw
-outputs stay outside the production repository.
+The runner records non-trading comparison targets in a hash-chained shadow
+ledger. Historical QLD/UGL and other variants remain research or migration
+artifacts; they cannot alter production holdings, orders, notifications, or
+the live strategy fingerprint. A future TQQQ deleveraging rule must be tested
+as a new frozen revision before promotion.
 
 ## Local validation
 

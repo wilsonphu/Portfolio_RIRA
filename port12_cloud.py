@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Production lifecycle Roth allocation engine.
 
-Signals are calculated from completed, adjusted daily bars. The permanent core
-starts at 65% QLD / 35% UGL; a volatility-sized SOXL overlay is admitted only
-by the frozen QQQ-trend and SMH-residual-strength rules. As portfolio value and
-investor age advance, a one-way lifecycle ratchet replaces 2x/3x products
-with lower-exposure equivalents while preserving the model's risk-source
-proportions.
+Signals are calculated from completed, adjusted daily bars. The current sprint
+portfolio is TQQQ 40% / DBMF 20% / ZROZ 20% / GLD 20%; a single 15% SOXL
+overlay tier is admitted only by the frozen QQQ-trend and SMH-residual-strength
+rules. SMA-based TQQQ-to-QLD/QQQ de-leveraging remains a separate future
+revision. As portfolio value and investor age advance, the existing one-way
+lifecycle ratchet scales exposure into the treasury reserve.
 Confirmed broker shares and cash are always the source of truth.
 """
 
@@ -40,10 +40,12 @@ import alpha_core as core
 # ---------------------------------------------------------------------------
 MARKET_INDEX = core.QQQ
 SEMICONDUCTOR_SIGNAL = core.SMH
-VOLATILITY_INDEX = core.QLD
-LEVERAGED_INDEX = core.QLD
+LEVERAGED_INDEX = core.TQQQ
 LEVERAGED_GOLD = "UGL"
 LEVERAGED_SEMICONDUCTOR = core.SOXL
+DBMF = "DBMF"
+ZROZ = "ZROZ"
+CORE_GOLD = "GLD"
 FORWARD_ANTI_BETA = "BTAL"
 FORWARD_BROAD_EQUITY = "SPY"
 FORWARD_LEVERAGED_BROAD_EQUITY = "SSO"
@@ -54,9 +56,11 @@ UNLEVERAGED_SEMICONDUCTOR = core.SMH
 TREASURY_RESERVE = "SGOV"
 CASH_ASSET = core.CASH
 
-CORE_QLD_SHARE = 0.65
-CORE_UGL_SHARE = 0.35
-MAX_ADVERTISED_DAILY_EXPOSURE = 2.35
+CORE_TQQQ_SHARE = 0.40
+CORE_DBMF_SHARE = 0.20
+CORE_ZROZ_SHARE = 0.20
+CORE_GLD_SHARE = 0.20
+MAX_ADVERTISED_DAILY_EXPOSURE = 1.98
 
 LIFECYCLE_SPRINT = "SPRINT"
 LIFECYCLE_GLIDE_225 = "GLIDE_225"
@@ -107,30 +111,36 @@ LIFECYCLE_ANCHOR_AGE = 23.0
 # priceable until they are explicitly sold.  They are never strategic targets.
 LEGACY_TECH = "TECL"
 LEGACY_DEFENSIVE_EQUITY = "SPMO"
+LEGACY_LEVERAGED_INDEX = "QLD"
+LEGACY_LEVERAGED_GOLD = "UGL"
+# Compatibility labels retained for migration/audit readers; they are not
+# strategic targets in this revision.
 LEGACY_HEDGE = "GLD"
 LEGACY_TRIPLE_INDEX = "TQQQ"
 LEGACY_HOLDINGS = frozenset(
     {
         LEGACY_TECH,
         LEGACY_DEFENSIVE_EQUITY,
-        LEGACY_HEDGE,
-        LEGACY_TRIPLE_INDEX,
+        LEGACY_LEVERAGED_INDEX,
+        LEGACY_LEVERAGED_GOLD,
+        DOUBLE_SEMICONDUCTOR,
+        UNLEVERAGED_INDEX,
+        UNLEVERAGED_GOLD,
+        UNLEVERAGED_SEMICONDUCTOR,
     }
 )
 
 SIGNAL_TICKERS = (MARKET_INDEX, SEMICONDUCTOR_SIGNAL)
+VOLATILITY_INDEX = core.TQQQ
 VOLATILITY_TICKERS = (VOLATILITY_INDEX, LEVERAGED_SEMICONDUCTOR)
 STRATEGIC_TICKERS = tuple(
     dict.fromkeys(
         (
             LEVERAGED_INDEX,
-            LEVERAGED_GOLD,
+            DBMF,
+            ZROZ,
+            CORE_GOLD,
             LEVERAGED_SEMICONDUCTOR,
-            VOLATILITY_INDEX,
-            DOUBLE_SEMICONDUCTOR,
-            UNLEVERAGED_INDEX,
-            UNLEVERAGED_GOLD,
-            UNLEVERAGED_SEMICONDUCTOR,
             TREASURY_RESERVE,
         )
     )
@@ -140,10 +150,7 @@ EQUITY_TICKERS = tuple(
         (
             LEVERAGED_INDEX,
             LEVERAGED_SEMICONDUCTOR,
-            VOLATILITY_INDEX,
-            DOUBLE_SEMICONDUCTOR,
-            UNLEVERAGED_INDEX,
-            UNLEVERAGED_SEMICONDUCTOR,
+            MARKET_INDEX,
         )
     )
 )
@@ -175,9 +182,9 @@ TRANSACTION_COST_SCENARIOS_BPS = (5, 10, 25)
 MODEL_START_DATE = core.MODEL_HISTORY_START
 REQUIRED_SIGNAL_ROWS = 840
 
-STRATEGY_REVISION = "qld65-ugl35-soxl-delayed-lifecycle-v6"
+STRATEGY_REVISION = "tqqq40-dbmf20-zroz20-gld20-soxl15-v1"
 EXPERIMENTAL_LIVE = True
-STATE_VERSION = 13
+STATE_VERSION = 14
 DECISION_AUDIT_SCHEMA_VERSION = 4
 SHADOW_LEDGER_SCHEMA_VERSION = 2
 LEGACY_SHADOW_LEDGER_SCHEMA_VERSION = 1
@@ -191,10 +198,14 @@ DECISION_AUDIT_FILE = APP_DIR / "roth_ira_decision.json"
 SHADOW_LEDGER_FILE = APP_DIR / "roth_ira_shadow_ledger.jsonl"
 
 ADVERTISED_DAILY_MULTIPLIERS = {
-    VOLATILITY_INDEX: 2.0,
-    LEVERAGED_INDEX: 2.0,
+    VOLATILITY_INDEX: 3.0,
+    LEVERAGED_INDEX: 3.0,
     LEVERAGED_GOLD: 2.0,
+    LEGACY_LEVERAGED_INDEX: 2.0,
     LEVERAGED_SEMICONDUCTOR: 3.0,
+    DBMF: 1.0,
+    ZROZ: 1.0,
+    CORE_GOLD: 1.0,
     FORWARD_BROAD_EQUITY: 1.0,
     FORWARD_LEVERAGED_BROAD_EQUITY: 2.0,
     DOUBLE_SEMICONDUCTOR: 2.0,
@@ -202,6 +213,7 @@ ADVERTISED_DAILY_MULTIPLIERS = {
     UNLEVERAGED_GOLD: 1.0,
     TREASURY_RESERVE: 0.0,
     SEMICONDUCTOR_SIGNAL: 1.0,
+    MARKET_INDEX: 1.0,
     LEGACY_TECH: 3.0,
     LEGACY_DEFENSIVE_EQUITY: 1.0,
     LEGACY_HEDGE: 1.0,
@@ -211,14 +223,16 @@ ADVERTISED_DAILY_MULTIPLIERS = {
 
 
 def aggressive_target_weights(soxl_weight: float) -> dict[str, float]:
-    """Return the proportional QLD/UGL foundation plus SOXL overlay."""
-    # Reuse the audited core validator and grid boundary.
-    core.target_weights(soxl_weight)
-    weight = min(max(float(soxl_weight), 0.0), core.MAX_SOXL_WEIGHT)
+    """Return the TQQQ/DBMF/ZROZ/GLD foundation plus SOXL overlay."""
+    # Historical callers may still pass retired 25%/35% tiers; floor them to
+    # the current single 15% production tier during migration.
+    weight = core.floor_soxl_tier(float(soxl_weight))
     remaining = 1.0 - weight
     result = {
-        LEVERAGED_INDEX: CORE_QLD_SHARE * remaining,
-        LEVERAGED_GOLD: CORE_UGL_SHARE * remaining,
+        LEVERAGED_INDEX: CORE_TQQQ_SHARE * remaining,
+        DBMF: CORE_DBMF_SHARE * remaining,
+        ZROZ: CORE_ZROZ_SHARE * remaining,
+        CORE_GOLD: CORE_GLD_SHARE * remaining,
         LEVERAGED_SEMICONDUCTOR: weight,
     }
     if not np.isclose(sum(result.values()), 1.0, atol=1e-12):
@@ -227,10 +241,13 @@ def aggressive_target_weights(soxl_weight: float) -> dict[str, float]:
 
 
 def _risk_source_weights(soxl_weight: float) -> tuple[dict[str, float], float]:
+    """Return normalized source exposures for audit compatibility."""
     aggressive = aggressive_target_weights(soxl_weight)
     source_exposure = {
-        "nasdaq": 2.0 * aggressive[LEVERAGED_INDEX],
-        "gold": 2.0 * aggressive[LEVERAGED_GOLD],
+        "nasdaq": 3.0 * aggressive[LEVERAGED_INDEX],
+        "managed_futures": aggressive[DBMF],
+        "duration": aggressive[ZROZ],
+        "gold": aggressive[CORE_GOLD],
         "semiconductors": 3.0 * aggressive[LEVERAGED_SEMICONDUCTOR],
     }
     total = float(sum(source_exposure.values()))
@@ -258,6 +275,47 @@ def _blend_weights(
     return {ticker: weight for ticker, weight in result.items() if weight > 1e-12}
 
 
+def _legacy_v6_target_weights(
+    soxl_weight: float,
+    lifecycle_stage: str,
+) -> dict[str, float]:
+    """Reconstruct the retired QLD/UGL target for old test/state evidence.
+
+    This branch is never reachable from the current 0%/15% production grid;
+    it exists only so historical pending actions can be inspected and cleared
+    deterministically during the v14 migration.
+    """
+    weight = float(soxl_weight)
+    if not any(abs(weight - tier) <= 1e-12 for tier in (0.0, 0.15, 0.25, 0.35)):
+        raise ValueError("SOXL target weight is not a legacy strategic tier")
+    remaining = 1.0 - weight
+    aggressive = {
+        "TQQQ": 0.65 * remaining,
+        "UGL": 0.35 * remaining,
+        "SOXL": weight,
+    }
+    if lifecycle_stage == LIFECYCLE_SPRINT:
+        return aggressive
+    source_exposure = {
+        "nasdaq": 3.0 * aggressive["TQQQ"],
+        "gold": 2.0 * aggressive["UGL"],
+        "semiconductors": 3.0 * aggressive["SOXL"],
+    }
+    total = sum(source_exposure.values())
+    sources = {name: value / total for name, value in source_exposure.items()}
+    double = {"QLD": sources["nasdaq"], "UGL": sources["gold"], "USD": sources["semiconductors"]}
+    single = {"QQQM": sources["nasdaq"], "GLDM": sources["gold"], "SMH": sources["semiconductors"]}
+    ceiling = LIFECYCLE_EXPOSURE_CEILINGS[lifecycle_stage]
+    if ceiling >= 2.0:
+        result = _blend_weights(aggressive, double, (ceiling - 2.0) / (total - 2.0))
+    elif ceiling >= 1.0:
+        result = _blend_weights(double, single, ceiling - 1.0)
+    else:
+        result = {ticker: ceiling * value for ticker, value in single.items()}
+        result[TREASURY_RESERVE] = 1.0 - ceiling
+    return result
+
+
 def target_weights(
     soxl_weight: float,
     lifecycle_stage: str = LIFECYCLE_SPRINT,
@@ -265,37 +323,23 @@ def target_weights(
     """Map the alpha sleeves into the delivery leverage for a lifecycle stage."""
     if lifecycle_stage not in LIFECYCLE_STAGES:
         raise ValueError(f"Unknown lifecycle stage: {lifecycle_stage!r}")
-    aggressive = aggressive_target_weights(soxl_weight)
+    numeric_weight = float(soxl_weight)
+    if numeric_weight > core.MAX_SOXL_WEIGHT + 1e-12:
+        return _legacy_v6_target_weights(numeric_weight, lifecycle_stage)
+    aggressive = aggressive_target_weights(numeric_weight)
     if lifecycle_stage == LIFECYCLE_SPRINT:
         return aggressive
-
-    sources, aggressive_exposure = _risk_source_weights(soxl_weight)
-    double = {
-        VOLATILITY_INDEX: sources["nasdaq"],
-        LEVERAGED_GOLD: sources["gold"],
-        DOUBLE_SEMICONDUCTOR: sources["semiconductors"],
-    }
-    single = {
-        UNLEVERAGED_INDEX: sources["nasdaq"],
-        UNLEVERAGED_GOLD: sources["gold"],
-        UNLEVERAGED_SEMICONDUCTOR: sources["semiconductors"],
-    }
     ceiling = LIFECYCLE_EXPOSURE_CEILINGS[lifecycle_stage]
     if ceiling is None:
         raise RuntimeError("Non-sprint lifecycle stage has no exposure ceiling")
+    aggressive_exposure = advertised_daily_exposure(aggressive)
     effective_ceiling = min(float(ceiling), aggressive_exposure)
     if effective_ceiling >= aggressive_exposure - 1e-12:
-        result = aggressive
-    elif effective_ceiling >= 2.0:
-        fraction = (effective_ceiling - 2.0) / (aggressive_exposure - 2.0)
-        result = _blend_weights(aggressive, double, fraction)
-    elif effective_ceiling >= 1.0:
-        result = _blend_weights(double, single, effective_ceiling - 1.0)
+        result = dict(aggressive)
     else:
-        result = {
-            ticker: effective_ceiling * weight for ticker, weight in single.items()
-        }
-        result[TREASURY_RESERVE] = 1.0 - effective_ceiling
+        fraction = effective_ceiling / aggressive_exposure
+        result = {ticker: weight * fraction for ticker, weight in aggressive.items()}
+        result[TREASURY_RESERVE] = 1.0 - sum(result.values())
     if not np.isclose(sum(result.values()), 1.0, atol=1e-12):
         raise RuntimeError("Lifecycle target weights do not sum to 1.0")
     if not np.isclose(
@@ -354,11 +398,13 @@ def strategy_manifest() -> dict[str, object]:
         },
         "allocation": {
             "core": {
-                "qld": CORE_QLD_SHARE,
-                "ugl": CORE_UGL_SHARE,
+                "tqqq": CORE_TQQQ_SHARE,
+                "dbmf": CORE_DBMF_SHARE,
+                "zroz": CORE_ZROZ_SHARE,
+                "gld": CORE_GLD_SHARE,
                 "application": "proportional_to_one_minus_soxl",
             },
-            "soxl": "stateful_residual_momentum_overlay",
+            "soxl": "single_stateful_15_percent_residual_momentum_overlay",
             "maximum_soxl": core.MAX_SOXL_WEIGHT,
             "maximum_advertised_daily_exposure": (
                 MAX_ADVERTISED_DAILY_EXPOSURE
@@ -379,13 +425,8 @@ def strategy_manifest() -> dict[str, object]:
                 "birth_date_override": "optional_INVESTOR_BIRTH_DATE",
                 "ratchet": "one_way_never_relever_after_stage_advance",
                 "mapping": {
-                    "nasdaq": [LEVERAGED_INDEX, UNLEVERAGED_INDEX],
-                    "gold": [LEVERAGED_GOLD, UNLEVERAGED_GOLD],
-                    "semiconductors": [
-                        LEVERAGED_SEMICONDUCTOR,
-                        DOUBLE_SEMICONDUCTOR,
-                        UNLEVERAGED_SEMICONDUCTOR,
-                    ],
+                    "risk_scaling": "proportional_target_to_SGOV",
+                    "future_sma_deleveraging": "not_enabled_in_v1",
                     "reserve": TREASURY_RESERVE,
                 },
             },
@@ -821,7 +862,7 @@ def calculate_implementation_fingerprint() -> str:
 
 STRATEGY_FINGERPRINT = calculate_strategy_fingerprint()
 EXPECTED_STRATEGY_FINGERPRINT = (
-    "14c8025f463ec2ab582ec42348dbf269514f1a5c15b0434c1f991cf486a9eb94"
+    "d09b743c1f294e9c0ac4f96ef3ebf798ffe72472ccfc1ed3139992e08843315c"
 )
 
 _configured_roth_amount = os.environ.get("ROTH_IRA_AMOUNT", "").strip()
@@ -1230,11 +1271,16 @@ def _valid_soxl_weight(value: object) -> bool:
     if not _is_valid_number(value):
         return False
     numeric = float(value)
-    return numeric <= core.MAX_SOXL_WEIGHT + 1e-12
+    return numeric <= core.LEGACY_MAX_SOXL_WEIGHT + 1e-12
 
 
 def _valid_soxl_tier(value: object) -> bool:
-    return _valid_soxl_weight(value) and core.is_soxl_tier(value)
+    if not _valid_soxl_weight(value):
+        return False
+    numeric = float(value)
+    return core.is_soxl_tier(numeric) or any(
+        abs(numeric - retired) <= 1e-12 for retired in (0.25, 0.35)
+    )
 
 
 def validate_configuration() -> None:
@@ -1524,6 +1570,12 @@ def _migrate_state_payload(
         )
         migrated["pending_soxl_weight"] = core.floor_soxl_tier(
             float(migrated["pending_soxl_weight"])
+        )
+        migrated["executed_soxl_weight"] = core.floor_soxl_tier(
+            float(migrated["executed_soxl_weight"])
+        )
+        migrated["pending_recommendation_soxl_weight"] = core.floor_soxl_tier(
+            float(migrated["pending_recommendation_soxl_weight"])
         )
         if (
             migrated["pending_soxl_weight"] <= migrated["soxl_weight"]
@@ -2283,7 +2335,7 @@ def inner_band_rebalance_weights(
         if LEVERAGED_SEMICONDUCTOR in tickers
         else None
     )
-    if soxl_index is not None:
+    if soxl_index is not None and desired_mapping.get(LEVERAGED_SEMICONDUCTOR, 0.0) <= core.MAX_SOXL_WEIGHT + 1e-12:
         upper[soxl_index] = min(
             upper[soxl_index],
             core.MAX_SOXL_WEIGHT,
@@ -3495,7 +3547,7 @@ def build_dashboard(strategy_run: StrategyRun) -> str:
         "INVALID"
         if decision.portfolio_volatility is None
         else (
-            f"QLD proxy {decision.portfolio_volatility.qld.sizing_volatility:.1%}, "
+            f"TQQQ proxy {decision.portfolio_volatility.qld.sizing_volatility:.1%}, "
             f"SOXL {decision.portfolio_volatility.soxl.sizing_volatility:.1%}"
         )
     )
@@ -3586,7 +3638,7 @@ def build_dashboard(strategy_run: StrategyRun) -> str:
             (
                 f"Drift trigger/non-overlay destination: {REBALANCE_BAND:.0%}/"
                 f"{REBALANCE_DESTINATION:.1%}; the semiconductor sleeve "
-                "returns to its exact latent 0/15/25/35% source tier; "
+                "returns to its exact current 0/15% source tier; "
                 f"cap {core.MAX_SOXL_WEIGHT:.0%}; "
                 "no margin or options."
             ),
