@@ -87,12 +87,12 @@ jobs:
           fi
 
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -404,7 +404,7 @@ jobs:
               inputs.validate_only == true) &&
             hashFiles('roth_ira_state.json') != ''
           }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: roth-ira-state
           path: roth_ira_state.json
@@ -414,7 +414,7 @@ jobs:
 
       - name: Upload run log
         if: ${{ always() && hashFiles('roth_ira.log') != '' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: roth-ira-log-${{ github.run_id }}
           path: roth_ira.log
@@ -423,7 +423,7 @@ jobs:
 
       - name: Upload structured decision audit
         if: ${{ always() && hashFiles('roth_ira_decision.json') != '' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: roth-ira-decision-${{ github.run_id }}
           path: roth_ira_decision.json
