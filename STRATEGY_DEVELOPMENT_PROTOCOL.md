@@ -2,7 +2,8 @@
 
 ## Live decision boundary
 
-Production is frozen as `tqqq-upro40-dbmf20-zroz20-ugl20-sma200-v1`:
+Production is frozen as
+`tqqq-upro40-dbmf20-zroz20-ugl20-sma200-annual-v2`:
 
 ```text
 Bull-confirmed: 40% TQQQ / 20% DBMF / 20% ZROZ / 20% UGL
@@ -14,6 +15,10 @@ The QQQ close is bullish only when it is strictly above its trailing
 requires two distinct bullish completed closes. Signals observed after a close
 are intended for the next executable session. No SOXL tier, residual-momentum
 overlay, or alternative ETF can affect production.
+
+The first completed NYSE signal in each calendar year forces an exact target
+rebalance. QQQ's 50-session average and 252-session momentum are displayed as
+supporting health checks only.
 
 This is an index router, not a leverage-reduction rule: TQQQ and UPRO both
 target 3x daily returns. The portfolio's base advertised exposure is 2.00x.
@@ -33,12 +38,20 @@ rebalancing was retained for the fixed sleeves, while a switch traded only the
 | Permanent TQQQ | 29.22% | -40.33% |
 | QQQ SMA200 TQQQ/UPRO router | 26.00% | -35.97% |
 | 5% SMA band router | 27.48% | -41.09% |
+| SMA/Donchian/VWMA 2-of-3, annual | 21.61% | -36.75% |
+| SMA plus short-filter confirmation, annual | 20.72% | -36.68% |
 
 The simple SMA rule was selected because it reduced the permanent-TQQQ
 drawdown in this sample without adding a second fitted threshold. A proposed
 Nasdaq-versus-S&P relative-strength condition was rejected. These figures are
 not a forecast and do not establish statistical proof; DBMF's live history is
 too short for a full-cycle inference.
+
+The former SMH-on-QQQ OLS residual and HAR-style volatility forecast were
+designed exclusively to admit and size SOXL. They were retired with that sleeve
+rather than repurposed without evidence. Tests of the short-trend filter set
+produced 76–86 equity switches versus 16 for SMA200 and materially reduced net
+growth at the same 25-basis-point cost assumption.
 
 ## Rules for future changes
 

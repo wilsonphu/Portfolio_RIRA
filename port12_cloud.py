@@ -78,7 +78,9 @@ ADVERTISED_DAILY_MULTIPLIERS = {
 }
 
 SMA_WINDOW = core.SMA_WINDOW
-REQUIRED_SIGNAL_ROWS = SMA_WINDOW + 1
+SHORT_TREND_WINDOW = 50
+MOMENTUM_WINDOW = 252
+REQUIRED_SIGNAL_ROWS = MOMENTUM_WINDOW + core.BULLISH_ENTRY_CLOSES
 MODEL_START_DATE = core.MODEL_HISTORY_START
 REBALANCE_BAND = 0.05
 REBALANCE_DESTINATION = 0.025
@@ -131,9 +133,9 @@ LIFECYCLE_INFLATION_RATE = 0.025
 LIFECYCLE_ANCHOR_DATE = date(2026, 8, 14)
 LIFECYCLE_ANCHOR_AGE = 23.0
 
-STRATEGY_REVISION = "tqqq-upro40-dbmf20-zroz20-ugl20-sma200-v1"
-STATE_VERSION = 15
-DECISION_AUDIT_SCHEMA_VERSION = 5
+STRATEGY_REVISION = "tqqq-upro40-dbmf20-zroz20-ugl20-sma200-annual-v2"
+STATE_VERSION = 16
+DECISION_AUDIT_SCHEMA_VERSION = 6
 APP_DIR = Path(__file__).resolve().parent
 STATE_FILE = APP_DIR / "roth_ira_state.json"
 LOG_FILE = APP_DIR / "roth_ira.log"
@@ -157,6 +159,11 @@ def strategy_manifest() -> dict[str, object]:
             "tqqq_entry_closes": core.BULLISH_ENTRY_CLOSES,
             "upro_entry": "immediate_on_failed_trend",
             "same_date": "idempotent",
+            "supporting_health_checks": {
+                "qqq_sma_sessions": SHORT_TREND_WINDOW,
+                "qqq_momentum_sessions": MOMENTUM_WINDOW,
+                "effect": "dashboard_only",
+            },
         },
         "allocation": {
             "equity_weight": core.EQUITY_WEIGHT,
@@ -188,6 +195,7 @@ def strategy_manifest() -> dict[str, object]:
             "inner_destination": REBALANCE_DESTINATION,
             "structural_switch": "exact_target",
             "holdings_source": "confirmed_shares_and_cash",
+            "annual_rebalance": "first_completed_XNYS_signal_each_calendar_year",
         },
     }
 
@@ -197,7 +205,7 @@ def calculate_strategy_fingerprint(manifest: dict[str, object] | None = None) ->
 
 
 STRATEGY_FINGERPRINT = calculate_strategy_fingerprint()
-EXPECTED_STRATEGY_FINGERPRINT = "c5b105419ff3212209a8117a376a6ac96026d595e508687bb18e8b0755b477d9"
+EXPECTED_STRATEGY_FINGERPRINT = "d446dad503a16f5803e92590c634558ad1adb05e374ad05eba44a887e9e91fb8"
 
 
 @dataclass(frozen=True)
@@ -209,6 +217,8 @@ class StrategyDecision:
     trend_positive: bool
     qqq_close: float
     qqq_sma_200: float
+    qqq_sma_50: float
+    qqq_momentum_252: float
     processed_signal_dates: tuple[str, ...] = ()
     transition_path: tuple[str, ...] = ()
     lifecycle_stage: str = LIFECYCLE_SPRINT
@@ -239,6 +249,8 @@ class RebalancePlan:
     individual_orders: int
     individual_drift_triggered: bool = False
     aggregate_equity_drift_triggered: bool = False
+    annual_rebalance_due: bool = False
+    annual_rebalance_year: int = 0
 
 
 @dataclass(frozen=True)
@@ -281,6 +293,7 @@ class PortfolioState:
     executed_tqqq_active: bool = False
     executed_lifecycle_stage: str = LIFECYCLE_SPRINT
     executed_strategy_fingerprint: str = ""
+    last_completed_annual_rebalance_year: int = 0
 
     pending_recommendation_date: str = ""
     pending_recommendation_weights: dict[str, float] = field(default_factory=dict)
@@ -289,6 +302,7 @@ class PortfolioState:
     pending_recommendation_notified: bool = False
     pending_recommendation_supersedes_date: str = ""
     pending_recommendation_fingerprint: str = ""
+    pending_recommendation_annual_year: int = 0
 
     last_processed_data_fingerprint: str = ""
     last_delivered_decision_hash: str = ""
@@ -444,6 +458,13 @@ def validate_state(state: PortfolioState) -> None:
             raise RuntimeError(f"{name} must be boolean")
     if not isinstance(state.tqqq_bullish_streak, int) or isinstance(state.tqqq_bullish_streak, bool) or state.tqqq_bullish_streak < 0:
         raise RuntimeError("tqqq_bullish_streak is invalid")
+    for name in (
+        "last_completed_annual_rebalance_year",
+        "pending_recommendation_annual_year",
+    ):
+        value = getattr(state, name)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise RuntimeError(f"{name} is invalid")
     if state.lifecycle_stage not in LIFECYCLE_STAGES or state.executed_lifecycle_stage not in LIFECYCLE_STAGES:
         raise RuntimeError("Lifecycle state is invalid")
     _validate_weights(
@@ -459,7 +480,8 @@ def validate_state(state: PortfolioState) -> None:
             raise RuntimeError("Pending lifecycle stage is invalid")
     elif any((state.pending_recommendation_weights, state.pending_recommendation_notified,
               state.pending_recommendation_supersedes_date, state.pending_recommendation_fingerprint,
-              state.pending_recommendation_lifecycle_stage)):
+              state.pending_recommendation_lifecycle_stage,
+              state.pending_recommendation_annual_year)):
         raise RuntimeError("Pending recommendation state is inconsistent")
     for name in ("tqqq_switch_date", "last_processed_signal_date", "lifecycle_stage_date", "last_delivered_signal_date"):
         _parse_date(getattr(state, name), name)
@@ -498,6 +520,11 @@ def _migrate_state(payload: dict[str, object]) -> PortfolioState:
     pending_fp = str(payload.get("pending_recommendation_fingerprint", "")) if pending_date else ""
     if pending_date and not _is_sha256(pending_fp):
         pending_fp = "0" * 64
+    last_signal = str(payload.get("last_processed_signal_date", ""))
+    try:
+        default_annual_year = date.fromisoformat(last_signal).year if last_signal else 0
+    except ValueError:
+        default_annual_year = 0
     state = PortfolioState(
         shares=shares,
         cash_balance=float(payload.get("cash_balance", 0.0)),
@@ -511,6 +538,9 @@ def _migrate_state(payload: dict[str, object]) -> PortfolioState:
         executed_tqqq_active=shares.get(GROWTH_EQUITY, 0.0) > 0 and shares.get(DEFENSIVE_EQUITY, 0.0) <= 0,
         executed_lifecycle_stage=executed_stage,
         executed_strategy_fingerprint=str(payload.get("executed_strategy_fingerprint", "")),
+        last_completed_annual_rebalance_year=int(
+            payload.get("last_completed_annual_rebalance_year", default_annual_year)
+        ),
         pending_recommendation_date=pending_date,
         pending_recommendation_weights=pending,
         pending_recommendation_tqqq_active=pending.get(GROWTH_EQUITY, 0.0) > pending.get(DEFENSIVE_EQUITY, 0.0),
@@ -518,6 +548,9 @@ def _migrate_state(payload: dict[str, object]) -> PortfolioState:
         pending_recommendation_notified=bool(payload.get("pending_recommendation_notified", False)) if pending_date else False,
         pending_recommendation_supersedes_date=str(payload.get("pending_recommendation_supersedes_date", "")) if pending_date else "",
         pending_recommendation_fingerprint=pending_fp,
+        pending_recommendation_annual_year=int(
+            payload.get("pending_recommendation_annual_year", 0)
+        ) if pending_date else 0,
         last_delivered_decision_hash=str(payload.get("last_delivered_decision_hash", "")),
         last_delivered_signal_date=str(payload.get("last_delivered_signal_date", "")),
         last_delivered_notification_kind=str(payload.get("last_delivered_notification_kind", "")),
@@ -696,7 +729,14 @@ def _latest_decision(prices: pd.DataFrame, state: PortfolioState) -> StrategyDec
     qqq = pd.to_numeric(prices[MARKET_INDEX], errors="coerce")
     close = float(qqq.iloc[-1])
     average = float(qqq.iloc[-SMA_WINDOW:].mean())
-    if not np.isfinite(close) or not np.isfinite(average) or close <= 0 or average <= 0:
+    short_average = float(qqq.iloc[-SHORT_TREND_WINDOW:].mean())
+    momentum = float(close / qqq.iloc[-(MOMENTUM_WINDOW + 1)] - 1.0)
+    if (
+        not all(np.isfinite(value) for value in (close, average, short_average, momentum))
+        or close <= 0
+        or average <= 0
+        or short_average <= 0
+    ):
         raise RuntimeError("QQQ trend inputs are invalid")
     trend = close > average
     transition = core.advance_equity_router(
@@ -710,6 +750,8 @@ def _latest_decision(prices: pd.DataFrame, state: PortfolioState) -> StrategyDec
         trend_positive=trend,
         qqq_close=close,
         qqq_sma_200=average,
+        qqq_sma_50=short_average,
+        qqq_momentum_252=momentum,
     )
 
 
@@ -732,7 +774,7 @@ def calculate_strategy_decision(prices: pd.DataFrame, state: PortfolioState) -> 
     changed = False
     for session in sessions:
         history = prices.loc[:session]
-        if len(history) < SMA_WINDOW:
+        if len(history) < MOMENTUM_WINDOW + 1:
             raise RuntimeError("Insufficient history for router replay")
         decision = _latest_decision(history, working)
         _apply_router(working, decision.router_state)
@@ -969,12 +1011,16 @@ def build_rebalance_plan(
     rebalance_destination: float = REBALANCE_DESTINATION,
 ) -> RebalancePlan:
     target = _with_cash(decision.target_weights)
+    signal_year = date.fromisoformat(
+        decision.router_state.last_processed_signal_date
+    ).year
+    annual_due = signal_year > state.last_completed_annual_rebalance_year
     strategy_changed = state.executed_strategy_fingerprint != STRATEGY_FINGERPRINT
     lifecycle_changed = state.executed_lifecycle_stage != decision.lifecycle_stage
     router_changed = state.executed_tqqq_active != decision.router_state.tqqq_active
     legacy_exit = any(existing.get(ticker, 0.0) > 1e-12 for ticker in LEGACY_HOLDINGS)
     individual, aggregate = drift_triggers(existing, target, band=rebalance_band)
-    full = strategy_changed or lifecycle_changed or router_changed or legacy_exit
+    full = strategy_changed or lifecycle_changed or router_changed or legacy_exit or annual_due
     due = full or individual or aggregate
     if strategy_changed:
         reason = "STRATEGY_REVISION_TRANSITION"
@@ -984,6 +1030,8 @@ def build_rebalance_plan(
         reason = "LIFECYCLE_STAGE_ADVANCE"
     elif router_changed:
         reason = decision.transition_reason
+    elif annual_due:
+        reason = "ANNUAL_REBALANCE"
     elif individual:
         reason = "INDIVIDUAL_DRIFT_BAND"
     elif aggregate:
@@ -1000,8 +1048,20 @@ def build_rebalance_plan(
         for item in components
     ) if due else 0
     if due and orders == 0 and one_way <= 1e-12:
-        due, full, reason, one_way = False, False, "CONFIRMED_TARGET_STATE", 0.0
-    return RebalancePlan(execution, due, full, reason, float(one_way), int(orders), individual, aggregate)
+        due, full, one_way = False, False, 0.0
+        reason = "ANNUAL_REVIEW" if annual_due else "CONFIRMED_TARGET_STATE"
+    return RebalancePlan(
+        execution,
+        due,
+        full,
+        reason,
+        float(one_way),
+        int(orders),
+        individual,
+        aggregate,
+        annual_due,
+        signal_year if annual_due else 0,
+    )
 
 
 def calculate_execution_table(
@@ -1096,6 +1156,8 @@ def _pending_matches(run: StrategyRun) -> bool:
         and state.pending_recommendation_fingerprint == STRATEGY_FINGERPRINT
         and state.pending_recommendation_tqqq_active == run.decision.router_state.tqqq_active
         and state.pending_recommendation_lifecycle_stage == run.decision.lifecycle_stage
+        and state.pending_recommendation_annual_year
+        == run.rebalance_plan.annual_rebalance_year
         and _weights_close(
             state.pending_recommendation_weights,
             run.rebalance_plan.execution_weights,
@@ -1118,6 +1180,8 @@ def decide_notification(run: StrategyRun) -> NotificationDecision:
         return NotificationDecision("UPDATE", "MATERIAL_RECOMMENDATION_UPDATE", state.pending_recommendation_supersedes_date or state.pending_recommendation_date)
     if state.pending_recommendation_date:
         return NotificationDecision("CANCELLATION", "PENDING_ACTION_NO_LONGER_REQUIRED", state.pending_recommendation_supersedes_date or state.pending_recommendation_date)
+    if run.rebalance_plan.annual_rebalance_due:
+        return NotificationDecision("ANNUAL_REVIEW", "ANNUAL_ALLOCATION_CONFIRMED")
     return NotificationDecision("NONE", "HOLD")
 
 
@@ -1129,6 +1193,7 @@ def _clear_pending(state: PortfolioState) -> None:
     state.pending_recommendation_notified = False
     state.pending_recommendation_supersedes_date = ""
     state.pending_recommendation_fingerprint = ""
+    state.pending_recommendation_annual_year = 0
 
 
 def persist_signal_run(run: StrategyRun) -> None:
@@ -1159,11 +1224,12 @@ def prepare_notification_delivery(run: StrategyRun, notification: NotificationDe
         state.pending_recommendation_notified = False
         state.pending_recommendation_supersedes_date = notification.previous_recommendation_date if notification.kind == "UPDATE" else ""
         state.pending_recommendation_fingerprint = STRATEGY_FINGERPRINT
+        state.pending_recommendation_annual_year = run.rebalance_plan.annual_rebalance_year
     elif notification.kind in {"RETRY", "UPDATE_RETRY"}:
         if not state.pending_recommendation_date:
             raise RuntimeError("Cannot retry a missing recommendation")
         state.pending_recommendation_notified = False
-    elif notification.kind != "CANCELLATION":
+    elif notification.kind not in {"CANCELLATION", "ANNUAL_REVIEW"}:
         raise ValueError("Unsupported notification kind")
 
 
@@ -1183,6 +1249,8 @@ def build_decision_audit(
             "bullish_streak": run.decision.router_state.bullish_streak,
             "transition": run.decision.transition_reason,
             "processed_dates": list(run.decision.processed_signal_dates),
+            "qqq_sma_50": run.decision.qqq_sma_50,
+            "qqq_momentum_252": run.decision.qqq_momentum_252,
         },
         "portfolio": {
             "value": run.portfolio_value,
@@ -1226,6 +1294,8 @@ def persist_notification_delivery(
         state.pending_recommendation_supersedes_date = ""
     elif notification.kind == "CANCELLATION":
         _clear_pending(state)
+    elif notification.kind == "ANNUAL_REVIEW":
+        state.last_completed_annual_rebalance_year = run.rebalance_plan.annual_rebalance_year
     state.last_delivered_decision_hash = str(delivered_decision_hash)
     state.last_delivered_signal_date = run.signal_date.date().isoformat()
     state.last_delivered_notification_kind = notification.kind
@@ -1254,6 +1324,8 @@ def confirm_execution(shares: dict[str, float], cash: float, signal_date: str) -
         state.executed_tqqq_active = state.pending_recommendation_tqqq_active
         state.executed_lifecycle_stage = state.pending_recommendation_lifecycle_stage
         state.executed_strategy_fingerprint = state.pending_recommendation_fingerprint
+        if state.pending_recommendation_annual_year:
+            state.last_completed_annual_rebalance_year = state.pending_recommendation_annual_year
     else:
         state.target_weights = {}
         state.executed_tqqq_active = shares.get(GROWTH_EQUITY, 0.0) > shares.get(DEFENSIVE_EQUITY, 0.0)
@@ -1294,71 +1366,54 @@ def log_decision(run: StrategyRun) -> None:
 def build_dashboard(run: StrategyRun) -> str:
     decision = run.decision
     plan = run.rebalance_plan
-    diagnostics = run.execution_diagnostics
     active_fund = GROWTH_EQUITY if decision.router_state.tqqq_active else DEFENSIVE_EQUITY
+    action_rows = run.execution_table[
+        (run.execution_table["Ticker"] != CASH_ASSET)
+        & (
+            (run.execution_table["Action"] != "HOLD")
+            | (run.execution_table["TargetPct"] > 1e-12)
+            | (run.execution_table["CurrentUnits"] > 1e-12)
+        )
+    ]
+    short_status = "above" if decision.qqq_close > decision.qqq_sma_50 else "below"
+    momentum_status = "positive" if decision.qqq_momentum_252 > 0 else "negative"
     lines = [
-        "=" * 108,
-        "ROTH IRA - TQQQ / UPRO EQUITY ROUTER",
-        "=" * 108,
-        f"Signal close: {run.signal_date.date()} | Portfolio value: ${run.portfolio_value:,.2f}",
+        "ROTH IRA PORTFOLIO UPDATE",
+        f"As of {run.signal_date.date()} | Value ${run.portfolio_value:,.2f}",
+        "",
+        f"DECISION: Hold {active_fund} in the 40% equity sleeve",
         (
-            f"QQQ trend: {'POSITIVE' if decision.trend_positive else 'NEGATIVE'} "
-            f"({decision.qqq_close / decision.qqq_sma_200 - 1:+.2%} vs SMA200) | "
-            f"40% equity fund: {active_fund} | bullish streak: "
-            f"{decision.router_state.bullish_streak}/{core.BULLISH_ENTRY_CLOSES}"
+            f"Primary trigger: QQQ is {decision.qqq_close / decision.qqq_sma_200 - 1:+.1%} "
+            f"versus its 200-day average"
         ),
         (
-            f"Lifecycle: {decision.lifecycle_stage} ({decision.lifecycle_reason}) | "
-            f"estimated age {decision.estimated_investor_age:.1f} | "
-            f"value/age gates {decision.lifecycle_value_stage}/{decision.lifecycle_age_stage}"
+            f"Health checks: QQQ is {short_status} its 50-day average; "
+            f"12-month momentum is {momentum_status} ({decision.qqq_momentum_252:+.1%})"
         ),
-        (
-            f"Transition: {decision.transition_reason} | "
-            f"Rebalance: {'YES' if plan.rebalance_due else 'NO'} | "
-            f"Reason: {plan.reason} | One-way turnover: {plan.one_way_turnover:.1%}"
+        f"Status: {'ACTION REQUIRED' if plan.rebalance_due else 'NO TRADES'} ({plan.reason})",
+        f"Lifecycle: {decision.lifecycle_stage}",
+        "",
+        "TARGET",
+        " / ".join(
+            f"{ticker} {weight:.0%}"
+            for ticker, weight in decision.target_weights.items()
+            if weight > 1e-12
         ),
-        (
-            f"Advertised daily exposure: current {diagnostics.current_daily_exposure:.2f}x, "
-            f"strategic {diagnostics.strategic_daily_exposure:.2f}x, "
-            f"destination {diagnostics.destination_daily_exposure:.2f}x"
-        ),
-        "Cost sensitivity: "
-        + " / ".join(
-            f"{bps}bp ${diagnostics.estimated_costs[bps]:,.2f}"
-            for bps in TRANSACTION_COST_SCENARIOS_BPS
-        ),
-        f"Strategy {STRATEGY_REVISION} ({STRATEGY_FINGERPRINT[:12]}) | Data {run.market_data_fingerprint[:12]}",
-        "-" * 108,
-        (
-            f"{'Ticker':<8}{'Price':>12}{'Current':>14}{'Target':>11}"
-            f"{'Est. units':>15}{'Delta':>14}{'Est. trade':>16}{'Action':>13}"
-        ),
-        "-" * 108,
     ]
     if len(decision.processed_signal_dates) > 1:
-        lines.insert(
-            5,
-            f"Catch-up replay: {len(decision.processed_signal_dates)} completed sessions | "
-            f"path {' -> '.join(decision.transition_path[-10:])}",
-        )
-    for _, row in run.execution_table.iterrows():
+        lines.append(f"Processed {len(decision.processed_signal_dates)} missed/new closes in order.")
+    if plan.rebalance_due:
+        lines.extend(["", "TRADES", f"{'Ticker':<8}{'Target':>10}{'Est. units':>15}{'Delta':>14}{'Action':>10}"])
+    for _, row in action_rows.iterrows():
+        if not plan.rebalance_due or row["Action"] == "HOLD":
+            continue
         lines.append(
-            f"{row['Ticker']:<8}${row['Price']:>11,.2f}{row['CurrentUnits']:>14,.4f}"
-            f"{row['TargetPct']:>10.1%}{row['EstimatedUnits']:>15,.4f}"
-            f"{row['DeltaUnits']:>14,.4f}${row['DeltaValue']:>15,.2f}{row['Action']:>13}"
+            f"{row['Ticker']:<8}{row['TargetPct']:>9.0%}{row['EstimatedUnits']:>15,.4f}"
+            f"{row['DeltaUnits']:>14,.4f}{row['Action']:>10}"
         )
-    lines.extend(
-        [
-            "-" * 108,
-            "Signal-close quantities are estimates. Recalculate at executable next-session prices, then confirm holdings.",
-            (
-                "TQQQ and UPRO both target 3x daily returns. This router changes Nasdaq/S&P exposure; "
-                "it does not reduce the leverage multiplier."
-            ),
-            f"Drift trigger/destination: {REBALANCE_BAND:.0%}/{REBALANCE_DESTINATION:.1%}; no margin or options.",
-            "=" * 108,
-        ]
-    )
+    if plan.rebalance_due:
+        lines.extend(["", "Quantities use closing prices; recalculate from executable prices before trading."])
+    lines.append("TQQQ and UPRO are both 3x daily funds; the switch changes the index, not the multiplier.")
     return "\n".join(lines)
 
 
@@ -1369,6 +1424,7 @@ def notification_subject(run: StrategyRun, notification: NotificationDecision) -
         "RETRY": "Action Required (Retry)",
         "UPDATE_RETRY": "Action Updated (Retry)",
         "CANCELLATION": "Action Cancelled",
+        "ANNUAL_REVIEW": "Annual Review",
     }.get(notification.kind)
     if label is None:
         raise ValueError("A NONE notification has no subject")
@@ -1407,19 +1463,29 @@ def notification_text_body(
         )
     elif notification.kind == "ACTION":
         prefix = "A portfolio update is required.\n\n"
+    elif notification.kind == "ANNUAL_REVIEW":
+        prefix = "Your annual allocation review is complete; no trades are required.\n\n"
     else:
         raise ValueError("A NONE notification has no body")
     return prefix + dashboard
 
 
 def build_email_html(run: StrategyRun, notification: NotificationDecision) -> str:
+    visible = run.execution_table[
+        (run.execution_table["Ticker"] != CASH_ASSET)
+        & (
+            (run.execution_table["Action"] != "HOLD")
+            | (run.execution_table["TargetPct"] > 1e-12)
+            | (run.execution_table["CurrentUnits"] > 1e-12)
+        )
+    ]
     rows = "".join(
         "<tr>"
         f"<td>{row['Ticker']}</td><td>${row['Price']:,.2f}</td>"
         f"<td>{row['CurrentUnits']:,.4f}</td><td>{row['TargetPct']:.1%}</td>"
         f"<td>{row['EstimatedUnits']:,.4f}</td><td>{row['DeltaUnits']:,.4f}</td>"
         f"<td>{row['Action']}</td></tr>"
-        for _, row in run.execution_table.iterrows()
+        for _, row in visible.iterrows()
     )
     status = {
         "ACTION": "ACTION REQUIRED",
@@ -1427,6 +1493,7 @@ def build_email_html(run: StrategyRun, notification: NotificationDecision) -> st
         "RETRY": "ACTION DELIVERY RETRY",
         "UPDATE_RETRY": "UPDATED ACTION DELIVERY RETRY",
         "CANCELLATION": "PREVIOUS ACTION CANCELLED",
+        "ANNUAL_REVIEW": "ANNUAL REVIEW COMPLETE",
     }[notification.kind]
     active = GROWTH_EQUITY if run.decision.router_state.tqqq_active else DEFENSIVE_EQUITY
     return f"""<!doctype html><html><body style="font-family:Arial,sans-serif">

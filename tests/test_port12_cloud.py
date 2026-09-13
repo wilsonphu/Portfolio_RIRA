@@ -18,7 +18,7 @@ import pandas as pd
 import port12_cloud as portfolio
 
 
-def price_frame(*, bullish: bool = True, periods: int = 220) -> pd.DataFrame:
+def price_frame(*, bullish: bool = True, periods: int = 280) -> pd.DataFrame:
     index = pd.bdate_range("2025-11-03", periods=periods)
     frame = pd.DataFrame(100.0, index=index, columns=portfolio.ALL_TICKERS)
     if bullish:
@@ -43,6 +43,8 @@ def decision(active: bool) -> portfolio.StrategyDecision:
         trend_positive=active,
         qqq_close=110.0 if active else 90.0,
         qqq_sma_200=100.0,
+        qqq_sma_50=102.0,
+        qqq_momentum_252=0.10,
         lifecycle_stage=portfolio.LIFECYCLE_SPRINT,
     )
 
@@ -58,6 +60,7 @@ def run_fixture() -> portfolio.StrategyRun:
         last_processed_signal_date="2026-09-11",
         executed_tqqq_active=True,
         executed_strategy_fingerprint=portfolio.STRATEGY_FINGERPRINT,
+        last_completed_annual_rebalance_year=2026,
     )
     current = portfolio.target_weights(True)
     plan = portfolio.RebalancePlan(current, False, False, "HOLD", 0.0, 0)
@@ -160,6 +163,7 @@ class HoldingsAndRebalanceTests(unittest.TestCase):
         state = portfolio.PortfolioState(
             executed_tqqq_active=True,
             executed_strategy_fingerprint=portfolio.STRATEGY_FINGERPRINT,
+            last_completed_annual_rebalance_year=2026,
             shares={"TQQQ": 39.0, "SOXL": 1.0, "DBMF": 20.0, "ZROZ": 20.0, "UGL": 20.0},
         )
         existing = {"TQQQ": 0.39, "SOXL": 0.01, "DBMF": 0.2, "ZROZ": 0.2, "UGL": 0.2}
@@ -170,7 +174,10 @@ class HoldingsAndRebalanceTests(unittest.TestCase):
         self.assertEqual(table.set_index("Ticker").loc["SOXL", "Action"], "SELL")
 
     def test_exact_holdings_confirm_new_strategy_without_trade(self):
-        state = portfolio.PortfolioState(executed_tqqq_active=True)
+        state = portfolio.PortfolioState(
+            executed_tqqq_active=True,
+            last_completed_annual_rebalance_year=2026,
+        )
         current = portfolio.target_weights(True)
         plan = portfolio.build_rebalance_plan(current, decision(True), state)
         self.assertFalse(plan.rebalance_due)
@@ -181,6 +188,32 @@ class HoldingsAndRebalanceTests(unittest.TestCase):
         result = portfolio.inner_band_rebalance_weights(current, portfolio.target_weights(True))
         for ticker, target in portfolio.target_weights(True).items():
             self.assertLessEqual(abs(result.get(ticker, 0) - target), 0.025 + 1e-9)
+
+    def test_new_calendar_year_forces_exact_rebalance(self):
+        state = portfolio.PortfolioState(
+            executed_tqqq_active=True,
+            executed_strategy_fingerprint=portfolio.STRATEGY_FINGERPRINT,
+            last_completed_annual_rebalance_year=2025,
+        )
+        current = {"TQQQ": 0.39, "DBMF": 0.21, "ZROZ": 0.20, "UGL": 0.20}
+        plan = portfolio.build_rebalance_plan(current, decision(True), state)
+        self.assertTrue(plan.rebalance_due)
+        self.assertTrue(plan.annual_rebalance_due)
+        self.assertEqual(plan.annual_rebalance_year, 2026)
+        self.assertEqual(plan.execution_weights, {**portfolio.target_weights(True), "CASH": 0.0})
+
+    def test_exact_new_year_allocation_sends_one_review(self):
+        run = run_fixture()
+        run.state.last_completed_annual_rebalance_year = 2025
+        plan = portfolio.build_rebalance_plan(run.current_weights, run.decision, run.state)
+        run = replace(run, rebalance_plan=plan)
+        self.assertFalse(plan.rebalance_due)
+        self.assertEqual(plan.reason, "ANNUAL_REVIEW")
+        notice = portfolio.decide_notification(run)
+        self.assertEqual(notice.kind, "ANNUAL_REVIEW")
+        with patch.object(portfolio, "save_state"):
+            portfolio.persist_notification_delivery(run, notice, delivered_decision_hash="3" * 64)
+        self.assertEqual(run.state.last_completed_annual_rebalance_year, 2026)
 
 
 class StateTests(unittest.TestCase):
@@ -212,6 +245,18 @@ class StateTests(unittest.TestCase):
         self.assertEqual(state.pending_recommendation_date, "2026-09-10")
         self.assertFalse(state.strategy_initialized)
 
+    def test_version_15_migration_defers_annual_rebalance_until_next_year(self):
+        payload = {
+            "state_version": 15,
+            "shares": {"TQQQ": 1.0},
+            "cash_balance": 0.0,
+            "portfolio_value": 100.0,
+            "last_processed_signal_date": "2026-09-11",
+        }
+        self.state_path.write_text(json.dumps(payload), encoding="utf-8")
+        state = portfolio.load_state(backup_legacy=False)
+        self.assertEqual(state.last_completed_annual_rebalance_year, 2026)
+
     def test_atomic_save_failure_preserves_original(self):
         self.state_path.write_text("original", encoding="utf-8")
         with patch.object(portfolio.os, "replace", side_effect=OSError("disk")):
@@ -227,12 +272,14 @@ class StateTests(unittest.TestCase):
             pending_recommendation_lifecycle_stage=portfolio.LIFECYCLE_SPRINT,
             pending_recommendation_notified=True,
             pending_recommendation_fingerprint=portfolio.STRATEGY_FINGERPRINT,
+            pending_recommendation_annual_year=2026,
         )
         portfolio.save_state(state)
         confirmed = portfolio.confirm_execution({"TQQQ": 12.25}, 3.21, "2026-09-11")
         self.assertEqual(confirmed.shares, {"TQQQ": 12.25})
         self.assertEqual(confirmed.cash_balance, 3.21)
         self.assertFalse(confirmed.pending_recommendation_date)
+        self.assertEqual(confirmed.last_completed_annual_rebalance_year, 2026)
 
 
 class NotificationTests(unittest.TestCase):

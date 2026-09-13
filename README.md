@@ -1,7 +1,8 @@
 # Roth IRA production allocator
 
 This repository contains one stateful, notification-only Roth IRA allocator.
-The production revision is `tqqq-upro40-dbmf20-zroz20-ugl20-sma200-v1`.
+The production revision is
+`tqqq-upro40-dbmf20-zroz20-ugl20-sma200-annual-v2`.
 It does not place broker trades. It calculates next-session instructions,
 emails only when action is required, and values the account from confirmed
 shares and cash rather than an old target allocation.
@@ -23,6 +24,13 @@ The 40% equity sleeve uses one completed-close QQQ trend rule:
 - Switch immediately to `UPRO` after one QQQ close at or below its 200-session SMA.
 - A duplicate run for the same close cannot advance the bullish count.
 - Missed completed sessions are replayed in order.
+
+The compact dashboard also reports QQQ versus its 50-session average and its
+252-session momentum. These are supporting health checks, not extra trade
+triggers. Tests found that attaching the former short-horizon filters to this
+router sharply increased whipsaw and reduced net growth. The former SMH
+residual and HAR-volatility signals were SOXL admission and sizing controls;
+they have no valid production role after removal of the SOXL sleeve.
 
 TQQQ and UPRO both target three times their index's **daily** return. The switch
 changes the equity engine from Nasdaq-100 to S&P 500 exposure; it does not
@@ -55,13 +63,17 @@ Value gates rise 2.5% annually from August 14, 2026. Set the optional
 
 ## Rebalancing and email
 
-The engine issues an action for a TQQQ/UPRO switch, a lifecycle transition, an
+On the first completed NYSE signal of each calendar year, the engine performs
+an exact annual rebalance. If the portfolio is already exact, it sends one
+annual-review email and records the completed year without requesting a trade.
+
+The engine also issues an action for a TQQQ/UPRO switch, a lifecycle transition, an
 individual position drift of at least five percentage points, aggregate equity
 drift of at least five points, or an obsolete holding that must be sold. An
 ordinary drift rebalance trades only far enough to return inside a 2.5-point
 band. Structural transitions use the exact target.
 
-HOLD runs do not email. Identical pending instructions are suppressed. A
+Other HOLD runs do not email. Identical pending instructions are suppressed. A
 material change replaces the pending action, a no-longer-needed action gets one
 cancellation, and failed SMTP delivery stays pending for retry.
 
