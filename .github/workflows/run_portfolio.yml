@@ -22,6 +22,8 @@ on:
           - signal
           - confirm-execution
           - sync-holdings
+          - configure-contributions
+          - disable-contributions
       executed_signal_date:
         description: "Pending signal date (YYYY-MM-DD); required only for confirm-execution"
         required: false
@@ -29,6 +31,16 @@ on:
         type: string
       executed_shares:
         description: "Complete holdings as space-separated TICKER=SHARES values, including CASH"
+        required: false
+        default: ""
+        type: string
+      contribution_budget:
+        description: "Remaining Roth contribution dollars to schedule for the selected year"
+        required: false
+        default: ""
+        type: string
+      contribution_year:
+        description: "Contribution tax year; defaults to the current New York year"
         required: false
         default: ""
         type: string
@@ -115,7 +127,8 @@ jobs:
           set -euo pipefail
           python -m py_compile \
             port12_cloud.py \
-            alpha_core.py
+            alpha_core.py \
+            contribution_core.py
           python -m unittest discover -s tests -v
 
           python - <<'PY'
@@ -300,6 +313,8 @@ jobs:
           DISPATCH_RUN_MODE: ${{ inputs.run_mode }}
           EXECUTED_SIGNAL_DATE_INPUT: ${{ inputs.executed_signal_date }}
           EXECUTED_SHARES_INPUT: ${{ inputs.executed_shares }}
+          CONTRIBUTION_BUDGET_INPUT: ${{ inputs.contribution_budget }}
+          CONTRIBUTION_YEAR_INPUT: ${{ inputs.contribution_year }}
           INVESTOR_BIRTH_DATE: ${{ secrets.INVESTOR_BIRTH_DATE }}
           GMAIL_ADDRESS: >-
             ${{
@@ -340,6 +355,8 @@ jobs:
           }
 
           executed_signal_date="${EXECUTED_SIGNAL_DATE_INPUT}"
+          contribution_budget="${CONTRIBUTION_BUDGET_INPUT}"
+          contribution_year="${CONTRIBUTION_YEAR_INPUT}"
           normalized_shares="${EXECUTED_SHARES_INPUT//$'\r'/ }"
           normalized_shares="${normalized_shares//$'\n'/ }"
           executed_share_entries=()
@@ -349,8 +366,10 @@ jobs:
           case "${run_mode}" in
             signal)
               if has_non_whitespace "${executed_signal_date}" ||
-                 has_non_whitespace "${EXECUTED_SHARES_INPUT}"; then
-                echo "::error::Execution inputs are valid only for confirm-execution or sync-holdings."
+                 has_non_whitespace "${EXECUTED_SHARES_INPUT}" ||
+                 has_non_whitespace "${contribution_budget}" ||
+                 has_non_whitespace "${contribution_year}"; then
+                echo "::error::Signal mode does not accept execution or contribution configuration inputs."
                 exit 1
               fi
               ;;
@@ -381,6 +400,31 @@ jobs:
               fi
               engine_args+=(--sync-holdings --executed-shares)
               engine_args+=("${executed_share_entries[@]}")
+              ;;
+            configure-contributions)
+              if has_non_whitespace "${executed_signal_date}" ||
+                 has_non_whitespace "${EXECUTED_SHARES_INPUT}"; then
+                echo "::error::Contribution configuration does not accept execution inputs."
+                exit 1
+              fi
+              if ! has_non_whitespace "${contribution_budget}"; then
+                echo "::error::configure-contributions requires contribution_budget."
+                exit 1
+              fi
+              engine_args+=(--configure-contributions --contribution-budget "${contribution_budget}")
+              if has_non_whitespace "${contribution_year}"; then
+                engine_args+=(--contribution-year "${contribution_year}")
+              fi
+              ;;
+            disable-contributions)
+              if has_non_whitespace "${executed_signal_date}" ||
+                 has_non_whitespace "${EXECUTED_SHARES_INPUT}" ||
+                 has_non_whitespace "${contribution_budget}" ||
+                 has_non_whitespace "${contribution_year}"; then
+                echo "::error::disable-contributions does not accept additional inputs."
+                exit 1
+              fi
+              engine_args+=(--disable-contributions)
               ;;
             *)
               echo "::error::Unsupported run mode: ${run_mode}"

@@ -29,6 +29,7 @@ import numpy as np
 import pandas as pd
 
 import alpha_core as core
+import contribution_core as contribution
 
 
 # Configuration and universe
@@ -132,8 +133,8 @@ LIFECYCLE_ANCHOR_DATE = date(2026, 8, 14)
 LIFECYCLE_ANCHOR_AGE = 23.0
 
 STRATEGY_REVISION = "tqqq-upro40-dbmf20-zroz20-ugl20-sma200-annual-v2"
-STATE_VERSION = 16
-DECISION_AUDIT_SCHEMA_VERSION = 7
+STATE_VERSION = 17
+DECISION_AUDIT_SCHEMA_VERSION = 8
 APP_DIR = Path(__file__).resolve().parent
 STATE_FILE = APP_DIR / "roth_ira_state.json"
 LOG_FILE = APP_DIR / "roth_ira.log"
@@ -269,6 +270,31 @@ class ExecutionDiagnostics:
     estimated_costs: dict[int, float]
 
 
+@dataclass(frozen=True)
+class ContributionPlan:
+    enabled: bool = False
+    year: int = 0
+    budget: float = 0.0
+    released_amount: float = 0.0
+    due_amount: float = 0.0
+    projected_released_amount: float = 0.0
+    calendar_fraction: float = 0.0
+    target_fraction: float = 0.0
+    qqq_drawdown_63: float = 0.0
+    bull_pullback: bool = False
+    reasons: tuple[str, ...] = ()
+    use_pullback: bool = False
+    use_drawdown_10: bool = False
+    use_drawdown_20: bool = False
+    retry: bool = False
+    allocation_dollars: dict[str, float] = field(default_factory=dict)
+    estimated_units: dict[str, float] = field(default_factory=dict)
+
+    @property
+    def notification_due(self) -> bool:
+        return self.enabled and self.due_amount >= 0.01
+
+
 @dataclass
 class PortfolioState:
     state_version: int = STATE_VERSION
@@ -299,6 +325,21 @@ class PortfolioState:
     pending_recommendation_fingerprint: str = ""
     pending_recommendation_annual_year: int = 0
 
+    contribution_plan_year: int = 0
+    contribution_policy_revision: str = ""
+    contribution_budget: float = 0.0
+    contribution_released_amount: float = 0.0
+    contribution_pullback_used: bool = False
+    contribution_drawdown_10_used: bool = False
+    contribution_drawdown_20_used: bool = False
+    pending_contribution_date: str = ""
+    pending_contribution_amount: float = 0.0
+    pending_contribution_reason: str = ""
+    pending_contribution_pullback: bool = False
+    pending_contribution_drawdown_10: bool = False
+    pending_contribution_drawdown_20: bool = False
+    last_contribution_notice_date: str = ""
+
     last_processed_data_fingerprint: str = ""
     last_delivered_decision_hash: str = ""
     last_delivered_signal_date: str = ""
@@ -319,6 +360,7 @@ class StrategyRun:
     market_data_fingerprint: str
     rebalance_plan: RebalancePlan
     execution_diagnostics: ExecutionDiagnostics
+    contribution_plan: ContributionPlan = field(default_factory=ContributionPlan)
 
 
 _configured_amount = os.environ.get("ROTH_IRA_AMOUNT", "").strip()
@@ -448,7 +490,19 @@ def validate_state(state: PortfolioState) -> None:
     if not _is_number(state.cash_balance) or not _is_number(state.portfolio_value):
         raise RuntimeError("Portfolio balances are invalid")
     _validate_weights(state.target_weights, "target_weights", require_total=bool(state.target_weights))
-    for name in ("strategy_initialized", "tqqq_active", "executed_tqqq_active", "pending_recommendation_tqqq_active", "pending_recommendation_notified"):
+    for name in (
+        "strategy_initialized",
+        "tqqq_active",
+        "executed_tqqq_active",
+        "pending_recommendation_tqqq_active",
+        "pending_recommendation_notified",
+        "contribution_pullback_used",
+        "contribution_drawdown_10_used",
+        "contribution_drawdown_20_used",
+        "pending_contribution_pullback",
+        "pending_contribution_drawdown_10",
+        "pending_contribution_drawdown_20",
+    ):
         if not isinstance(getattr(state, name), bool):
             raise RuntimeError(f"{name} must be boolean")
     if not isinstance(state.tqqq_bullish_streak, int) or isinstance(state.tqqq_bullish_streak, bool) or state.tqqq_bullish_streak < 0:
@@ -478,7 +532,68 @@ def validate_state(state: PortfolioState) -> None:
               state.pending_recommendation_lifecycle_stage,
               state.pending_recommendation_annual_year)):
         raise RuntimeError("Pending recommendation state is inconsistent")
-    for name in ("tqqq_switch_date", "last_processed_signal_date", "lifecycle_stage_date", "last_delivered_signal_date"):
+    if not isinstance(state.contribution_plan_year, int) or isinstance(
+        state.contribution_plan_year, bool
+    ) or state.contribution_plan_year < 0:
+        raise RuntimeError("contribution_plan_year is invalid")
+    for name in (
+        "contribution_budget",
+        "contribution_released_amount",
+        "pending_contribution_amount",
+    ):
+        if not _is_number(getattr(state, name)):
+            raise RuntimeError(f"{name} is invalid")
+    contribution_fields = (
+        state.contribution_policy_revision,
+        state.contribution_budget,
+        state.contribution_released_amount,
+        state.pending_contribution_amount,
+        state.contribution_pullback_used,
+        state.contribution_drawdown_10_used,
+        state.contribution_drawdown_20_used,
+        state.pending_contribution_date,
+        state.pending_contribution_reason,
+        state.pending_contribution_pullback,
+        state.pending_contribution_drawdown_10,
+        state.pending_contribution_drawdown_20,
+        state.last_contribution_notice_date,
+    )
+    if state.contribution_plan_year == 0:
+        if any(contribution_fields):
+            raise RuntimeError("Disabled contribution plan contains state")
+    else:
+        if state.contribution_policy_revision != contribution.POLICY_REVISION:
+            raise RuntimeError("Contribution policy revision is unsupported")
+        if state.contribution_budget <= 0:
+            raise RuntimeError("Enabled contribution plan requires a positive budget")
+        if state.contribution_released_amount > state.contribution_budget + 0.005:
+            raise RuntimeError("Released contribution exceeds its budget")
+        if state.pending_contribution_date:
+            _parse_date(state.pending_contribution_date, "pending_contribution_date")
+            if state.pending_contribution_amount < 0.01 or not state.pending_contribution_reason:
+                raise RuntimeError("Pending contribution state is incomplete")
+            if (
+                state.contribution_released_amount + state.pending_contribution_amount
+                > state.contribution_budget + 0.005
+            ):
+                raise RuntimeError("Pending contribution exceeds its budget")
+        elif any(
+            (
+                state.pending_contribution_amount,
+                state.pending_contribution_reason,
+                state.pending_contribution_pullback,
+                state.pending_contribution_drawdown_10,
+                state.pending_contribution_drawdown_20,
+            )
+        ):
+            raise RuntimeError("Pending contribution state is inconsistent")
+    for name in (
+        "tqqq_switch_date",
+        "last_processed_signal_date",
+        "lifecycle_stage_date",
+        "last_delivered_signal_date",
+        "last_contribution_notice_date",
+    ):
         _parse_date(getattr(state, name), name)
     for name in ("last_processed_data_fingerprint", "last_delivered_decision_hash"):
         value = getattr(state, name)
@@ -936,6 +1051,110 @@ def resolve_portfolio_value(
     return float(amount), planning
 
 
+def _allocate_contribution(
+    amount: float,
+    state: PortfolioState,
+    prices: pd.DataFrame,
+    target: dict[str, float],
+    portfolio_value: float,
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Allocate new cash across target underweights without assuming any fills."""
+    if amount < 0.01:
+        return {}, {}
+    post_contribution_value = portfolio_value + amount
+    deficits = {}
+    for ticker, weight in target.items():
+        current_value = state.shares.get(ticker, 0.0) * float(prices[ticker].iloc[-1])
+        deficits[ticker] = max(0.0, weight * post_contribution_value - current_value)
+    total_deficit = sum(deficits.values())
+    proportions = (
+        {ticker: deficit / total_deficit for ticker, deficit in deficits.items()}
+        if total_deficit > 1e-12
+        else dict(target)
+    )
+    dollars = {ticker: round(amount * weight, 2) for ticker, weight in proportions.items()}
+    residual = round(amount - sum(dollars.values()), 2)
+    if dollars and abs(residual) >= 0.01:
+        largest = max(dollars, key=dollars.get)
+        dollars[largest] = round(dollars[largest] + residual, 2)
+    dollars = {ticker: value for ticker, value in dollars.items() if value >= 0.01}
+    units = {
+        ticker: value / float(prices[ticker].iloc[-1]) for ticker, value in dollars.items()
+    }
+    return dollars, units
+
+
+def build_contribution_plan(
+    state: PortfolioState,
+    decision: StrategyDecision,
+    prices: pd.DataFrame,
+    portfolio_value: float,
+    signal_date: pd.Timestamp,
+) -> ContributionPlan:
+    plan_year = state.contribution_plan_year
+    year = pd.Timestamp(signal_date).year
+    if plan_year == 0 or state.contribution_budget <= 0 or plan_year != year:
+        return ContributionPlan(
+            enabled=plan_year > 0,
+            year=plan_year,
+            budget=state.contribution_budget,
+            released_amount=state.contribution_released_amount,
+        )
+
+    qqq = prices[MARKET_INDEX]
+    high_63 = float(qqq.iloc[-contribution.LOOKBACK_SESSIONS :].max())
+    rule = contribution.evaluate_release(
+        as_of=pd.Timestamp(signal_date).date(),
+        qqq_close=decision.qqq_close,
+        qqq_sma_50=decision.qqq_sma_50,
+        qqq_sma_200=decision.qqq_sma_200,
+        qqq_high_63=high_63,
+        pullback_used=state.contribution_pullback_used,
+        drawdown_10_used=state.contribution_drawdown_10_used,
+        drawdown_20_used=state.contribution_drawdown_20_used,
+    )
+    retry = bool(state.pending_contribution_date)
+    if retry:
+        due = state.pending_contribution_amount
+        reasons = tuple(state.pending_contribution_reason.split("+"))
+        use_pullback = state.pending_contribution_pullback
+        use_drawdown_10 = state.pending_contribution_drawdown_10
+        use_drawdown_20 = state.pending_contribution_drawdown_20
+    else:
+        target_amount = round(state.contribution_budget * rule.target_fraction, 2)
+        due = max(0.0, round(target_amount - state.contribution_released_amount, 2))
+        reasons = rule.reasons
+        use_pullback = rule.use_pullback
+        use_drawdown_10 = rule.use_drawdown_10
+        use_drawdown_20 = rule.use_drawdown_20
+    projected = min(
+        state.contribution_budget,
+        round(state.contribution_released_amount + due, 2),
+    )
+    dollars, units = _allocate_contribution(
+        due, state, prices, decision.target_weights, portfolio_value
+    )
+    return ContributionPlan(
+        enabled=True,
+        year=plan_year,
+        budget=state.contribution_budget,
+        released_amount=state.contribution_released_amount,
+        due_amount=due,
+        projected_released_amount=projected,
+        calendar_fraction=rule.calendar_fraction,
+        target_fraction=rule.target_fraction,
+        qqq_drawdown_63=rule.drawdown,
+        bull_pullback=rule.bull_pullback,
+        reasons=reasons,
+        use_pullback=use_pullback,
+        use_drawdown_10=use_drawdown_10,
+        use_drawdown_20=use_drawdown_20,
+        retry=retry,
+        allocation_dollars=dollars,
+        estimated_units=units,
+    )
+
+
 def _one_way_turnover(
     existing: dict[str, float], execution: dict[str, float], components: Iterable[str]
 ) -> float:
@@ -1113,6 +1332,9 @@ def run_strategy(roth_amount: float | None, *, backup_legacy_state: bool = True)
     diagnostics = calculate_execution_diagnostics(
         table, value, current, decision.target_weights, table_target
     )
+    contribution_plan = build_contribution_plan(
+        state, decision, prices, value, signal_date
+    )
     return StrategyRun(
         price_data=prices,
         decision=decision,
@@ -1125,6 +1347,7 @@ def run_strategy(roth_amount: float | None, *, backup_legacy_state: bool = True)
         market_data_fingerprint=fingerprint,
         rebalance_plan=plan,
         execution_diagnostics=diagnostics,
+        contribution_plan=contribution_plan,
     )
 
 
@@ -1153,6 +1376,13 @@ def decide_notification(run: StrategyRun) -> NotificationDecision:
             return NotificationDecision("ACTION", "NEW_RECOMMENDATION")
         if _pending_matches(run):
             if state.pending_recommendation_notified:
+                if run.contribution_plan.notification_due:
+                    kind = (
+                        "CONTRIBUTION_RETRY"
+                        if run.contribution_plan.retry
+                        else "CONTRIBUTION"
+                    )
+                    return NotificationDecision(kind, "+".join(run.contribution_plan.reasons))
                 return NotificationDecision(
                     "NONE",
                     "IDENTICAL_PENDING_RECOMMENDATION",
@@ -1178,6 +1408,9 @@ def decide_notification(run: StrategyRun) -> NotificationDecision:
         )
     if run.rebalance_plan.annual_rebalance_due:
         return NotificationDecision("ANNUAL_REVIEW", "ANNUAL_ALLOCATION_CONFIRMED")
+    if run.contribution_plan.notification_due:
+        kind = "CONTRIBUTION_RETRY" if run.contribution_plan.retry else "CONTRIBUTION"
+        return NotificationDecision(kind, "+".join(run.contribution_plan.reasons))
     return NotificationDecision("NONE", "HOLD")
 
 
@@ -1190,6 +1423,15 @@ def _clear_pending(state: PortfolioState) -> None:
     state.pending_recommendation_supersedes_date = ""
     state.pending_recommendation_fingerprint = ""
     state.pending_recommendation_annual_year = 0
+
+
+def _clear_pending_contribution(state: PortfolioState) -> None:
+    state.pending_contribution_date = ""
+    state.pending_contribution_amount = 0.0
+    state.pending_contribution_reason = ""
+    state.pending_contribution_pullback = False
+    state.pending_contribution_drawdown_10 = False
+    state.pending_contribution_drawdown_20 = False
 
 
 def persist_signal_run(run: StrategyRun) -> None:
@@ -1225,8 +1467,30 @@ def prepare_notification_delivery(run: StrategyRun, notification: NotificationDe
         if not state.pending_recommendation_date:
             raise RuntimeError("Cannot retry a missing recommendation")
         state.pending_recommendation_notified = False
-    elif notification.kind not in {"CANCELLATION", "ANNUAL_REVIEW"}:
+    elif notification.kind not in {
+        "CANCELLATION",
+        "ANNUAL_REVIEW",
+        "CONTRIBUTION",
+        "CONTRIBUTION_RETRY",
+    }:
         raise ValueError("Unsupported notification kind")
+
+
+def prepare_contribution_delivery(run: StrategyRun) -> None:
+    plan = run.contribution_plan
+    if not plan.notification_due:
+        return
+    state = run.state
+    if plan.retry:
+        if not state.pending_contribution_date:
+            raise RuntimeError("Cannot retry a missing contribution notice")
+        return
+    state.pending_contribution_date = run.signal_date.date().isoformat()
+    state.pending_contribution_amount = plan.due_amount
+    state.pending_contribution_reason = "+".join(plan.reasons)
+    state.pending_contribution_pullback = plan.use_pullback
+    state.pending_contribution_drawdown_10 = plan.use_drawdown_10
+    state.pending_contribution_drawdown_20 = plan.use_drawdown_20
 
 
 def build_decision_audit(
@@ -1277,6 +1541,8 @@ def build_decision_audit(
                 for bps, amount in sorted(run.execution_diagnostics.estimated_costs.items())
             },
         },
+        "contribution": asdict(run.contribution_plan),
+        "contribution_policy": {"revision": contribution.POLICY_REVISION},
         "notification": asdict(notification),
         "delivery_status": delivery_status,
     }
@@ -1313,6 +1579,23 @@ def persist_notification_delivery(
         _clear_pending(state)
     elif notification.kind == "ANNUAL_REVIEW":
         state.last_completed_annual_rebalance_year = run.rebalance_plan.annual_rebalance_year
+    elif notification.kind not in {"CONTRIBUTION", "CONTRIBUTION_RETRY"}:
+        raise ValueError("Unsupported notification kind")
+    if run.contribution_plan.notification_due:
+        if not state.pending_contribution_date:
+            raise RuntimeError("Delivered contribution notice lacks pending state")
+        state.contribution_released_amount = min(
+            state.contribution_budget,
+            round(
+                state.contribution_released_amount + state.pending_contribution_amount,
+                2,
+            ),
+        )
+        state.contribution_pullback_used |= state.pending_contribution_pullback
+        state.contribution_drawdown_10_used |= state.pending_contribution_drawdown_10
+        state.contribution_drawdown_20_used |= state.pending_contribution_drawdown_20
+        state.last_contribution_notice_date = state.pending_contribution_date
+        _clear_pending_contribution(state)
     state.last_delivered_decision_hash = str(delivered_decision_hash)
     state.last_delivered_signal_date = run.signal_date.date().isoformat()
     state.last_delivered_notification_kind = notification.kind
@@ -1359,6 +1642,48 @@ def sync_holdings(shares: dict[str, float], cash: float) -> PortfolioState:
         raise RuntimeError("Cannot sync while a recommendation is pending")
     state.shares = dict(shares)
     state.cash_balance = float(cash)
+    save_state(state)
+    return state
+
+
+def configure_contribution_plan(year: int, budget: float) -> PortfolioState:
+    if not STATE_FILE.exists():
+        raise RuntimeError("Initialize or synchronize portfolio holdings first")
+    if not isinstance(year, int) or isinstance(year, bool) or year < 2000:
+        raise ValueError("Contribution year is invalid")
+    if not _is_number(budget, positive=True):
+        raise ValueError("Contribution budget must be positive and finite")
+    state = load_state()
+    if state.pending_contribution_date:
+        raise RuntimeError("Cannot replace a contribution plan while delivery is pending")
+    state.contribution_plan_year = year
+    state.contribution_policy_revision = contribution.POLICY_REVISION
+    state.contribution_budget = round(float(budget), 2)
+    state.contribution_released_amount = 0.0
+    state.contribution_pullback_used = False
+    state.contribution_drawdown_10_used = False
+    state.contribution_drawdown_20_used = False
+    state.last_contribution_notice_date = ""
+    _clear_pending_contribution(state)
+    save_state(state)
+    return state
+
+
+def disable_contribution_plan() -> PortfolioState:
+    if not STATE_FILE.exists():
+        raise RuntimeError("No portfolio state exists")
+    state = load_state()
+    if state.pending_contribution_date:
+        raise RuntimeError("Cannot disable a contribution plan while delivery is pending")
+    state.contribution_plan_year = 0
+    state.contribution_policy_revision = ""
+    state.contribution_budget = 0.0
+    state.contribution_released_amount = 0.0
+    state.contribution_pullback_used = False
+    state.contribution_drawdown_10_used = False
+    state.contribution_drawdown_20_used = False
+    state.last_contribution_notice_date = ""
+    _clear_pending_contribution(state)
     save_state(state)
     return state
 
@@ -1461,6 +1786,51 @@ def build_dashboard(run: StrategyRun) -> str:
         ),
     ])
 
+    contribution_plan = run.contribution_plan
+    if contribution_plan.enabled:
+        lines.extend([
+            "",
+            "CONTRIBUTION PLAN",
+            _dashboard_rule(),
+            _dashboard_field("Plan year", str(contribution_plan.year)),
+            _dashboard_field(
+                "Notified",
+                f"${contribution_plan.released_amount:,.2f} of "
+                f"${contribution_plan.budget:,.2f}",
+            ),
+        ])
+        if contribution_plan.year != run.signal_date.year:
+            lines.append(_dashboard_field("Status", "Plan is not active for this year"))
+        else:
+            lines.extend([
+                _dashboard_field(
+                    "QQQ drawdown", f"{contribution_plan.qqq_drawdown_63:.1%} from 63-session high"
+                ),
+                _dashboard_field(
+                    "SMA setup",
+                    "pullback above SMA200" if contribution_plan.bull_pullback else "no pullback trigger",
+                ),
+            ])
+        if contribution_plan.notification_due:
+            lines.extend([
+                _dashboard_field(
+                    "Deposit now",
+                    f"${contribution_plan.due_amount:,.2f}  "
+                    f"({' + '.join(contribution_plan.reasons)})",
+                ),
+                f"{'Ticker':<10}{'Buy dollars':>16}{'Est. units':>18}",
+                _dashboard_rule(),
+            ])
+            for ticker, dollars in contribution_plan.allocation_dollars.items():
+                lines.append(
+                    f"{ticker:<10}${dollars:>15,.2f}"
+                    f"{contribution_plan.estimated_units[ticker]:>18,.4f}"
+                )
+            lines.extend([
+                "Deposit and execute at next-session prices. These quantities do not",
+                "become confirmed holdings until broker execution is synchronized.",
+            ])
+
     if plan.rebalance_due:
         trades = _visible_execution_rows(run.execution_table)
         trades = trades[trades["Action"] != "HOLD"]
@@ -1519,14 +1889,17 @@ def notification_subject(run: StrategyRun, notification: NotificationDecision) -
         "UPDATE_RETRY": "Action Updated (Retry)",
         "CANCELLATION": "Action Cancelled",
         "ANNUAL_REVIEW": "Annual Review",
+        "CONTRIBUTION": "Contribution Due",
+        "CONTRIBUTION_RETRY": "Contribution Due (Retry)",
     }.get(notification.kind)
     if label is None:
         raise ValueError("A NONE notification has no subject")
-    subject_date = (
-        notification.previous_recommendation_date
-        if notification.kind in {"RETRY", "UPDATE_RETRY"}
-        else run.signal_date.date().isoformat()
-    )
+    if notification.kind in {"RETRY", "UPDATE_RETRY"}:
+        subject_date = notification.previous_recommendation_date
+    elif notification.kind == "CONTRIBUTION_RETRY":
+        subject_date = run.state.pending_contribution_date
+    else:
+        subject_date = run.signal_date.date().isoformat()
     return f"ROTH IRA {label} - {subject_date}"
 
 
@@ -1559,6 +1932,10 @@ def notification_text_body(
         prefix = "A portfolio update is required.\n\n"
     elif notification.kind == "ANNUAL_REVIEW":
         prefix = "Your annual allocation review is complete; no trades are required.\n\n"
+    elif notification.kind == "CONTRIBUTION":
+        prefix = "A scheduled or accelerated Roth IRA contribution is due.\n\n"
+    elif notification.kind == "CONTRIBUTION_RETRY":
+        prefix = "Delivery of your Roth IRA contribution notice is being retried.\n\n"
     else:
         raise ValueError("A NONE notification has no body")
     return prefix + dashboard
@@ -1571,6 +1948,8 @@ NOTIFICATION_STATUS_LABELS = {
     "UPDATE_RETRY": "UPDATED ACTION DELIVERY RETRY",
     "CANCELLATION": "PREVIOUS ACTION CANCELLED",
     "ANNUAL_REVIEW": "ANNUAL REVIEW COMPLETE",
+    "CONTRIBUTION": "ROTH CONTRIBUTION DUE",
+    "CONTRIBUTION_RETRY": "ROTH CONTRIBUTION DELIVERY RETRY",
 }
 NOTIFICATION_ACCENTS = {
     "ACTION": "#b45309",
@@ -1579,6 +1958,8 @@ NOTIFICATION_ACCENTS = {
     "UPDATE_RETRY": "#b45309",
     "CANCELLATION": "#6b7280",
     "ANNUAL_REVIEW": "#15803d",
+    "CONTRIBUTION": "#1d4ed8",
+    "CONTRIBUTION_RETRY": "#1d4ed8",
 }
 _ACTION_COLORS = {"BUY": "#15803d", "SELL": "#b91c1c"}
 
@@ -1640,6 +2021,32 @@ def build_email_html(run: StrategyRun, notification: NotificationDecision) -> st
         if plan.rebalance_due
         else ""
     )
+    contribution_html = ""
+    if run.contribution_plan.notification_due:
+        contribution_rows = "".join(
+            "<tr>"
+            f'<td style="{_CELL};font-weight:600">{ticker}</td>'
+            f'<td style="{_CELL};text-align:right">${dollars:,.2f}</td>'
+            f'<td style="{_CELL};text-align:right">'
+            f'{run.contribution_plan.estimated_units[ticker]:,.4f}</td></tr>'
+            for ticker, dollars in run.contribution_plan.allocation_dollars.items()
+        )
+        contribution_html = f"""
+<tr><td style="padding:4px 24px 18px">
+  <div style="font-size:15px;font-weight:600;color:#1d4ed8;padding-bottom:8px">
+    Deposit ${run.contribution_plan.due_amount:,.2f} now</div>
+  <div style="font-size:12px;color:#4b5563;padding-bottom:8px">
+    {' + '.join(run.contribution_plan.reasons)} &middot; QQQ drawdown
+    {run.contribution_plan.qqq_drawdown_63:.1%} from its 63-session high</div>
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0"
+   style="border-collapse:collapse;border:1px solid #e5e7eb">
+    <tr style="background:#f9fafb">
+      <th style="{_HEAD_CELL};text-align:left">Ticker</th>
+      <th style="{_HEAD_CELL};text-align:right">Buy dollars</th>
+      <th style="{_HEAD_CELL};text-align:right">Est. units</th>
+    </tr>{contribution_rows}
+  </table>
+</td></tr>"""
     return f"""<!doctype html>
 <html><body style="margin:0;padding:24px 12px;background:#f3f4f6;{_EMAIL_BASE}">
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0"
@@ -1648,7 +2055,8 @@ def build_email_html(run: StrategyRun, notification: NotificationDecision) -> st
   <div style="font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:#6b7280">
     Roth IRA allocator &middot; {STRATEGY_REVISION}</div>
   <div style="font-size:21px;font-weight:600;color:{accent};padding-top:6px">{status}</div>
-  <div style="font-size:13px;color:#4b5563;padding-top:3px">{plan.reason}</div>
+  <div style="font-size:13px;color:#4b5563;padding-top:3px">
+    {plan.reason if plan.rebalance_due else notification.reason}</div>
 </td></tr>
 <tr><td style="padding:18px 24px 6px">
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0"
@@ -1674,6 +2082,7 @@ def build_email_html(run: StrategyRun, notification: NotificationDecision) -> st
     <th style="{_HEAD_CELL};text-align:right">Action</th>
   </tr>{rows}{footnote}</table>
 </td></tr>
+{contribution_html}
 <tr><td style="padding:0 24px 22px">
   <div style="padding:12px 14px;background:#f9fafb;border-left:3px solid #d1d5db;
    font-size:12px;color:#4b5563;line-height:1.6">
@@ -1756,6 +2165,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--confirm-execution", action="store_true")
     mode.add_argument("--sync-holdings", action="store_true")
+    mode.add_argument("--configure-contributions", action="store_true")
+    mode.add_argument("--disable-contributions", action="store_true")
     parser.add_argument(
         "--test", action="store_true",
         help="Generate a report without state, email, audit, or log persistence",
@@ -1763,6 +2174,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--roth-amount", type=float, default=None)
     parser.add_argument("--executed-shares", nargs="+", metavar="TICKER=SHARES")
     parser.add_argument("--executed-signal-date", metavar="YYYY-MM-DD")
+    parser.add_argument("--contribution-budget", type=float)
+    parser.add_argument("--contribution-year", type=int)
     return parser
 
 
@@ -1775,11 +2188,57 @@ def main() -> None:
         not np.isfinite(args.roth_amount) or args.roth_amount <= 0
     ):
         parser.error("--roth-amount must be positive and finite")
+    if args.contribution_budget is not None and (
+        not np.isfinite(args.contribution_budget) or args.contribution_budget <= 0
+    ):
+        parser.error("--contribution-budget must be positive and finite")
     try:
         executed_shares, executed_cash = parse_executed_shares(args.executed_shares)
         executed_signal_date = parse_signal_date(args.executed_signal_date)
     except ValueError as exc:
         parser.error(str(exc))
+
+    if args.configure_contributions:
+        if (
+            args.test
+            or args.roth_amount is not None
+            or executed_shares is not None
+            or executed_signal_date is not None
+            or args.contribution_budget is None
+        ):
+            parser.error(
+                "--configure-contributions requires only --contribution-budget "
+                "and optional --contribution-year"
+            )
+        contribution_year = args.contribution_year or datetime.now(NEW_YORK).year
+        try:
+            state = configure_contribution_plan(
+                contribution_year, args.contribution_budget
+            )
+        except (RuntimeError, ValueError) as exc:
+            parser.error(str(exc))
+        print(
+            f"Contribution plan configured for {state.contribution_plan_year}: "
+            f"${state.contribution_budget:,.2f} remaining budget."
+        )
+        return
+    if args.disable_contributions:
+        if any(
+            (
+                args.test,
+                args.roth_amount is not None,
+                executed_shares is not None,
+                executed_signal_date is not None,
+                args.contribution_budget is not None,
+                args.contribution_year is not None,
+            )
+        ):
+            parser.error("--disable-contributions cannot be combined with other inputs")
+        disable_contribution_plan()
+        print("Contribution plan disabled.")
+        return
+    if args.contribution_budget is not None or args.contribution_year is not None:
+        parser.error("Contribution inputs require --configure-contributions")
 
     if args.confirm_execution:
         if args.test or args.roth_amount is not None:
@@ -1810,6 +2269,7 @@ def main() -> None:
     log_decision(run)
     logger.info("notification kind=%s reason=%s", notification.kind, notification.reason)
     prepare_notification_delivery(run, notification)
+    prepare_contribution_delivery(run)
     persist_signal_run(run)
     audit = write_decision_audit(
         run, notification, "STAGED" if notification.should_send else "NOT_REQUIRED"

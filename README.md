@@ -32,6 +32,41 @@ router sharply increased whipsaw and reduced net growth. The former SMH
 residual and HAR-volatility signals were SOXL admission and sizing controls;
 they have no valid production role after removal of the SOXL sleeve.
 
+## Contribution deployment
+
+An optional stateful contribution plan emails only when new Roth funding is
+due. The configured budget means the amount still available to contribute for
+that tax year; it is not assumed to equal the statutory maximum or the account
+balance.
+
+- 50% is released immediately.
+- Five additional 10% calendar tranches become due in March, May, July,
+  September, and November.
+- A QQQ close below its 50-session SMA but still above its 200-session SMA
+  advances one future tranche once.
+- A 10% QQQ drawdown from its trailing 63-session high advances one future
+  tranche once.
+- A 20% drawdown releases every remaining tranche.
+- Calendar dates are floors: market strength can never postpone a tranche, and
+  the budget is fully released by November.
+
+Each email allocates the new dollars across the current target's underweight
+holdings and includes estimated units. Volume is not a gate. Notices have
+retry-safe state, but emailed amounts are recorded as notices—not fabricated
+broker deposits or fills. Confirmed shares and cash remain the accounting source
+of truth.
+
+After holdings have been initialized, configure the remaining annual budget:
+
+```powershell
+python port12_cloud.py --configure-contributions --contribution-budget 7500 --contribution-year 2026
+```
+
+The GitHub workflow exposes the same `configure-contributions` operation. Use
+`disable-contributions` to turn the scheduler off. Configure a new remaining
+budget each tax year; the engine never assumes Roth eligibility or contribution
+room.
+
 TQQQ and UPRO both target three times their index's **daily** return. The switch
 changes the equity engine from Nasdaq-100 to S&P 500 exposure; it does not
 reduce the leverage multiplier. The base portfolio's advertised daily exposure
@@ -104,7 +139,7 @@ account.
 
 ```powershell
 python -m unittest discover -s tests -v
-python -m py_compile port12_cloud.py alpha_core.py
+python -m py_compile port12_cloud.py alpha_core.py contribution_core.py
 python port12_cloud.py --test --roth-amount 10000
 git diff --check
 git status --short
