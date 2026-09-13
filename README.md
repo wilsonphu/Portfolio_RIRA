@@ -10,7 +10,10 @@ shares and cash rather than an old target allocation.
 The dashboard leads with the required action, then shows the target, signal,
 contribution status, and only the orders that need to be placed. Detailed risk
 and turnover diagnostics remain in the structured audit artifact rather than
-cluttering the email.
+cluttering the email. Each audit also records measurement-only paper-track
+comparisons, realized volatility, sleeve risk contribution, and estimated
+leveraged-fund financing drag. These diagnostics cannot change or block a
+portfolio decision and are explicitly not the account's dollar-weighted return.
 
 ## Production allocation
 
@@ -147,7 +150,7 @@ account.
 
 ```powershell
 python -m unittest discover -s tests -v
-python -m py_compile port12_cloud.py alpha_core.py contribution_core.py
+python -m py_compile port12_cloud.py alpha_core.py contribution_core.py performance_core.py
 python port12_cloud.py --test --roth-amount 10000
 git diff --check
 git status --short

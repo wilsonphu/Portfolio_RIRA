@@ -602,7 +602,7 @@ class DecisionAuditTests(unittest.TestCase):
         audit = portfolio.build_decision_audit(
             run, portfolio.NotificationDecision("ACTION", "NEW_RECOMMENDATION"), "STAGED"
         )
-        self.assertEqual(audit["schema_version"], 9)
+        self.assertEqual(audit["schema_version"], 10)
         lifecycle = audit["lifecycle"]
         self.assertEqual(lifecycle["stage"], run.decision.lifecycle_stage)
         self.assertEqual(lifecycle["value_stage"], run.decision.lifecycle_value_stage)
@@ -754,6 +754,46 @@ class DataAndCliTests(unittest.TestCase):
         save.assert_not_called()
         send.assert_not_called()
         audit.assert_not_called()
+
+
+class PerformanceDiagnosticsTests(unittest.TestCase):
+    def test_diagnostics_attached_outside_decision_hash(self):
+        """Telemetry must not perturb the hash that identifies the decision."""
+        run = run_fixture()
+        notice = portfolio.NotificationDecision("ACTION", "NEW_RECOMMENDATION")
+        audit = portfolio.build_decision_audit(run, notice, "STAGED")
+        self.assertIn("diagnostics", audit)
+
+        without = {
+            key: value
+            for key, value in audit.items()
+            if key not in {"decision_hash", "diagnostics"}
+        }
+        self.assertEqual(portfolio.canonical_sha256(without), audit["decision_hash"])
+
+    def test_diagnostics_never_raise(self):
+        """Bad diagnostic input must not block the portfolio engine."""
+        run = run_fixture()
+        for bad in (portfolio.pd.DataFrame(), None, "not-a-frame"):
+            with self.subTest(bad=type(bad).__name__):
+                result = portfolio.build_performance_diagnostics(
+                    replace(run, price_data=bad)
+                )
+                self.assertIn("available", result)
+                json.dumps(result, allow_nan=False)
+
+    def test_unusable_price_data_reports_unavailable(self):
+        run = run_fixture()
+        result = portfolio.build_performance_diagnostics(
+            replace(run, price_data=None)
+        )
+        self.assertFalse(result["available"])
+
+    def test_audit_payload_is_json_serialisable(self):
+        run = run_fixture()
+        notice = portfolio.NotificationDecision("ACTION", "NEW_RECOMMENDATION")
+        audit = portfolio.build_decision_audit(run, notice, "STAGED")
+        json.dumps(audit, allow_nan=False)
 
 
 if __name__ == "__main__":

@@ -29,6 +29,7 @@ import pandas as pd
 
 import alpha_core as core
 import contribution_core as contribution
+import performance_core as performance
 
 
 # Configuration and universe
@@ -121,7 +122,7 @@ LIFECYCLE_ANCHOR_AGE = 23.0
 
 STRATEGY_REVISION = "tqqq-upro40-dbmf20-zroz20-ugl20-sma200-annual-v3"
 STATE_VERSION = 18
-DECISION_AUDIT_SCHEMA_VERSION = 9
+DECISION_AUDIT_SCHEMA_VERSION = 10
 APP_DIR = Path(__file__).resolve().parent
 STATE_FILE = APP_DIR / "roth_ira_state.json"
 LOG_FILE = APP_DIR / "roth_ira.log"
@@ -1593,6 +1594,64 @@ def prepare_contribution_delivery(run: StrategyRun) -> None:
     state.pending_contribution_drawdown_20 = plan.use_drawdown_20
 
 
+BENCHMARK_BOOKS = {
+    "unlevered_qqq": {MARKET_INDEX: 1.00},
+    "qqq60_zroz40": {MARKET_INDEX: 0.60, ZROZ: 0.40},
+    "permanent_growth": {
+        GROWTH_EQUITY: 0.40,
+        DBMF: 0.20,
+        ZROZ: 0.20,
+        LEVERAGED_GOLD: 0.20,
+    },
+    "permanent_defensive": {
+        DEFENSIVE_EQUITY: 0.40,
+        DBMF: 0.20,
+        ZROZ: 0.20,
+        LEVERAGED_GOLD: 0.20,
+    },
+}
+LIVE_BOOK = {
+    GROWTH_EQUITY: 0.40,
+    DBMF: 0.20,
+    ZROZ: 0.20,
+    LEVERAGED_GOLD: 0.20,
+}
+
+
+def build_performance_diagnostics(run: StrategyRun) -> dict[str, object]:
+    """Build measurement-only telemetry that can never block a decision."""
+    try:
+        report = performance.build_performance_report(
+            run.price_data,
+            reference_books=BENCHMARK_BOOKS,
+            live_book=LIVE_BOOK,
+            index_ticker=MARKET_INDEX,
+            growth=GROWTH_EQUITY,
+            defensive=DEFENSIVE_EQUITY,
+            cash_proxy=TREASURY_RESERVE,
+            sma_window=SMA_WINDOW,
+            multipliers=ADVERTISED_DAILY_MULTIPLIERS,
+            current_weights=run.current_weights,
+        )
+    except Exception as error:  # noqa: BLE001 - diagnostics cannot halt trading
+        logger.warning("Performance diagnostics unavailable: %s", error)
+        return {"available": False, "reason": type(error).__name__}
+
+    return {
+        "available": True,
+        "note": (
+            "Paper track from price history assuming a clean annually rebalanced "
+            "book. Not the dollar-weighted return of the account."
+        ),
+        "sample_sessions": report.sample_sessions,
+        "paper_track": report.paper_track,
+        "realized_volatility": report.realized_volatility,
+        "sleeve_risk_contribution": report.sleeve_risk_contribution,
+        "estimated_short_rate": report.estimated_short_rate,
+        "financing_drag": report.financing_drag,
+    }
+
+
 def build_decision_audit(
     run: StrategyRun, notification: NotificationDecision, delivery_status: str
 ) -> dict[str, object]:
@@ -1647,6 +1706,9 @@ def build_decision_audit(
         "delivery_status": delivery_status,
     }
     payload["decision_hash"] = canonical_sha256(payload)
+    # Diagnostics are outside the decision hash so changing measurements cannot
+    # make an unchanged trading decision appear different.
+    payload["diagnostics"] = build_performance_diagnostics(run)
     return payload
 
 
