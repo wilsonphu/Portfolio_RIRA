@@ -1,93 +1,71 @@
 # Strategy development protocol
 
-Revised on 2026-09-13. This document governs research around the Roth IRA
-allocator. It is not a trade instruction and cannot change production state.
+## Live decision boundary
 
-## Objective
-
-The objective is maximum long-run net log growth subject to a predeclared
-historical drawdown boundary of 70%. Report CAGR, Sharpe, Sortino, Calmar,
-expected shortfall, recovery time, rolling returns, turnover, and costs, but do
-not optimize CAGR in isolation.
-
-Production remains the benchmark until a challenger clears every applicable
-gate. Research cannot change holdings, send a recommendation, or change the
-live strategy fingerprint.
-
-## Frozen production control
-
-The current sprint target is defined by one binary SOXL tier, `s ∈ {0%, 15%}`:
+Production is frozen as `tqqq-upro40-dbmf20-zroz20-ugl20-sma200-v1`:
 
 ```text
-TQQQ = 40% * (1 - s)
-DBMF = 20% * (1 - s)
-ZROZ = 20% * (1 - s)
-GLD  = 20% * (1 - s)
-SOXL = s
+Bull-confirmed: 40% TQQQ / 20% DBMF / 20% ZROZ / 20% UGL
+Trend failed:  40% UPRO / 20% DBMF / 20% ZROZ / 20% UGL
 ```
 
-The 15% tier requires positive SMH-on-QQQ residual momentum from a separated
-126-session regression and 63-session scoring window, with QQQ above its
-200-session SMA. The QQQ trend rule is a defensive SOXL exit fuse, not an
-independently proven return source. The causal HAR-style forecast and 55%
-overlay budget decide whether the single tier fits. Trend failure exits
-immediately; re-entry needs two distinct completed closes; a tier reduction is
-immediate. There are no 25% or 35% SOXL production tiers.
+The QQQ close is bullish only when it is strictly above its trailing
+200-session SMA. One failed completed close selects UPRO immediately. TQQQ
+requires two distinct bullish completed closes. Signals observed after a close
+are intended for the next executable session. No SOXL tier, residual-momentum
+overlay, or alternative ETF can affect production.
 
-The current revision intentionally does not implement SMA-based TQQQ-to-QLD or
-TQQQ-to-QQQ de-leveraging. That proposal must be tested as a separate frozen
-challenger before it can change live targets.
+This is an index router, not a leverage-reduction rule: TQQQ and UPRO both
+target 3x daily returns. The portfolio's base advertised exposure is 2.00x.
+Age/value lifecycle ceilings scale all risky weights proportionally into SGOV
+and ratchet in one direction only.
 
-The one-way lifecycle ratchet remains a risk policy. Until product-level
-deleveraging is promoted, a lifecycle ceiling scales the current target into
-SGOV proportionally and never re-levers after a stage advance.
+## Evidence behind promotion
 
-## Evidence and legacy variants
+The pre-promotion comparison used actual ETF histories from May 2019 through
+September 2026 and charged 25 basis points per dollar bought or sold. Annual
+rebalancing was retained for the fixed sleeves, while a switch traded only the
+40% equity sleeve. Results from this short, unusually favorable sample were:
 
-Historical QLD/UGL, TQQQ/UGL, SOXL multi-tier, SPY/SSO, and other allocations
-remain useful research or migration controls. Their historical results do not
-describe the current production target and do not establish future alpha.
-The current revision was chosen to make the live portfolio easier to inspect:
-four fixed foundation ETFs and one bounded tactical sleeve.
+| Equity rule | CAGR | Max drawdown |
+|---|---:|---:|
+| Permanent UPRO | 21.11% | -34.00% |
+| Permanent TQQQ | 29.22% | -40.33% |
+| QQQ SMA200 TQQQ/UPRO router | 26.00% | -35.97% |
+| 5% SMA band router | 27.48% | -41.09% |
 
-## Data and timing rules
+The simple SMA rule was selected because it reduced the permanent-TQQQ
+drawdown in this sample without adding a second fitted threshold. A proposed
+Nasdaq-versus-S&P relative-strength condition was rejected. These figures are
+not a forecast and do not establish statistical proof; DBMF's live history is
+too short for a full-cycle inference.
 
-- Use point-in-time completed daily observations only.
-- Reject synthetic pre-inception history, interpolation, ticker substitution,
-  stale or incomplete bars, invalid prices, and zero/NaN volatility.
-- Indicators use close `t`; the earliest modeled action is session `t+1`.
-  Same-date reruns cannot create additional evidence.
-- Use blocked or walk-forward time-series validation with purging and embargo
-  when labels overlap. Random k-fold validation is prohibited.
-- Charge 10, 25, and 50 basis points per one-way turnover.
-- Share quantities and cash must evolve through time; daily target replacement
-  is an invalid free-rebalance assumption.
+## Rules for future changes
 
-## Required benchmarks
+Every challenger must be isolated from the production decision path and frozen
+before its final evaluation. Its protocol must state:
 
-Every complete study must report:
+- hypothesis and causal rationale;
+- exact universe, weights, signal timing, and rebalance rule;
+- training, validation, and untouched holdout boundaries;
+- purging/embargo where labels overlap;
+- costs, turnover, distributions, and delisting assumptions;
+- primary objective (net geometric growth) and drawdown constraint;
+- sensitivity tests and explicit rejection criteria.
 
-1. current production with its stateful alpha, lifecycle, and drift rules;
-2. the same TQQQ/DBMF/ZROZ/GLD foundation without SOXL;
-3. the permanent 15% SOXL overlay;
-4. the prior QLD/UGL production control;
-5. the proposed TQQQ deleveraging challenger with unchanged timing/costs; and
-6. a zero-cost path only as attribution, never as the decision result.
+Promote only evidence that survives multiple market regimes, realistic costs,
+parameter perturbations, and prospective observation. A higher in-sample CAGR
+alone is not sufficient. Any production change requires a new revision, state
+migration, fingerprint review, tests, and a written comparison against the
+current live rule.
 
-## Promotion gates
+## Operational invariants
 
-A challenger must show positive net log-growth improvement at 10 and 25 bps,
-nonnegative improvement at 50 bps, drawdown no worse than 70% and no more than
-2.5 percentage points worse than production, improvement in at least three of
-four fixed chronological slices including the final slice, and a moving-block
-bootstrap probability of nonpositive improvement of at most 10%. It must also
-survive a Deflated-Sharpe review using the honest trial count and show that no
-single crisis, asset, or terminal subperiod explains over half the gain.
-
-Historical passage is insufficient. Promotion additionally requires 252
-prospective completed sessions under one frozen fingerprint, three prospective
-structural SOXL decisions, positive net log-growth after modeled costs,
-complete shadow/fill reconciliation, and a written negative-evidence review.
-
-Changing a hypothesis, allocation, parameter neighborhood, benchmark, cost,
-sample split, or gate creates a new dated protocol and a new trial.
+- Confirmed broker shares and cash are the source of truth.
+- Missing, stale, partial, zero, infinite, or NaN market data fail closed.
+- A duplicate close cannot mutate the signal state twice.
+- Old holdings remain priceable until explicitly sold.
+- State is atomic and private; credentials, balances, shares, and state files
+  are never committed.
+- HOLD is silent; notification retries cannot erase confirmed fills.
+- Test mode cannot save, email, log, or write an audit.

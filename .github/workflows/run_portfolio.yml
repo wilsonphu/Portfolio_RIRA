@@ -207,11 +207,6 @@ jobs:
           fi
 
           cp .state-restore/unpacked/roth_ira_state.json roth_ira_state.json
-          if [[ -f .state-restore/unpacked/roth_ira_shadow_ledger.jsonl ]]; then
-            cp \
-              .state-restore/unpacked/roth_ira_shadow_ledger.jsonl \
-              roth_ira_shadow_ledger.jsonl
-          fi
           echo "restored=true" >> "${GITHUB_OUTPUT}"
           echo "Restored roth_ira_state.json from artifact ${artifact_id}."
 
@@ -412,9 +407,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: roth-ira-state
-          path: |
-            roth_ira_state.json
-            roth_ira_shadow_ledger.jsonl
+          path: roth_ira_state.json
           if-no-files-found: error
           retention-days: 90
           overwrite: true

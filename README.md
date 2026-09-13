@@ -1,102 +1,95 @@
 # Roth IRA production allocator
 
 This repository contains one stateful, notification-only Roth IRA allocator.
-The current production revision is `tqqq40-dbmf20-zroz20-gld20-soxl15-v1`.
-It does not connect to a broker or place trades automatically: it calculates a
-next-session plan, emails only when a decision requires action, and treats
-confirmed broker shares and cash as the source of truth.
+The production revision is `tqqq-upro40-dbmf20-zroz20-ugl20-sma200-v1`.
+It does not place broker trades. It calculates next-session instructions,
+emails only when action is required, and values the account from confirmed
+shares and cash rather than an old target allocation.
 
-## Current strategy
+## Production allocation
 
-At the current SOXL tier `s`, the sprint target is:
+The base target always contains:
 
-```text
-TQQQ = 40% * (1 - s)
-DBMF = 20% * (1 - s)
-ZROZ = 20% * (1 - s)
-GLD  = 20% * (1 - s)
-SOXL = s
-```
+| Sleeve | Weight |
+|---|---:|
+| Routed equity ETF | 40% |
+| DBMF | 20% |
+| ZROZ | 20% |
+| UGL | 20% |
 
-`s` has only two production values: `0%` and `15%`. The 15% SOXL tier is
-admitted only when both of these completed-close conditions are satisfied:
+The 40% equity sleeve uses one completed-close QQQ trend rule:
 
-- QQQ is strictly above its 200-session SMA; and
-- 63-session residual momentum for the separated-window SMH-on-QQQ OLS model
-  is positive.
+- Hold `TQQQ` after two distinct QQQ closes strictly above its 200-session SMA.
+- Switch immediately to `UPRO` after one QQQ close at or below its 200-session SMA.
+- A duplicate run for the same close cannot advance the bullish count.
+- Missed completed sessions are replayed in order.
 
-The causal HAR-style volatility forecast and its 55% overlay budget decide
-whether the 15% tier fits. This is a risk-sizing gate, not a promise that
-realized volatility will remain below 55%. Trend failure exits SOXL
-immediately; re-entry requires two distinct eligible closes. The current
-revision deliberately has no SMA-based TQQQ-to-QLD/QQQ de-leveraging rule yet;
-that is a separate risk-management design discussion.
+TQQQ and UPRO both target three times their index's **daily** return. The switch
+changes the equity engine from Nasdaq-100 to S&P 500 exposure; it does not
+reduce the leverage multiplier. The base portfolio's advertised daily exposure
+is 2.00x: 1.20x equity, 0.20x managed futures, 0.20x long Treasuries, and 0.40x
+gold. Actual returns and risk are path-dependent.
 
-The maximum advertised daily exposure is 1.80x with no SOXL and 1.98x when the
-15% tier is active. The core sleeves are intentionally simple and fixed; the
-only tactical sleeve in this first revision is the single SOXL tier.
+SOXL is no longer a strategic sleeve. The engine retains migration-only pricing
+for SOXL and other prior holdings so an existing position appears as an explicit
+SELL instead of disappearing from account state.
 
-## Lifecycle reserve policy
+## Lifecycle reserve
 
-The existing one-way lifecycle ratchet remains enabled. Account value and age
-independently impose an exposure ceiling, and the safer ceiling wins. Until a
-future revision specifies product-level SMA deleveraging, a lifecycle ceiling
-is implemented by scaling the current TQQQ/DBMF/ZROZ/GLD/SOXL target
-proportionally into `SGOV`. A stage never re-levers after it advances.
+The one-way age/value ratchet remains enabled. When its exposure ceiling falls
+below the base target, all risky sleeves are scaled proportionally and the
+remainder moves to `SGOV`. A stage never moves backward.
 
-| Stage | 2026-dollar value gate | Age gate | Ceiling |
+| Stage | 2026-dollar value gate | Age gate | Exposure ceiling |
 |---|---:|---:|---:|
-| `SPRINT` | below $250,000 | below 45 | current target (1.80x–1.98x) |
-| `GLIDE_225` | $250,000 | 45 | 2.25x maximum |
-| `TWO_X` | $500,000 | 50 | 2.00x maximum |
+| `SPRINT` | below $250,000 | below 45 | base target |
+| `GLIDE_225` | $250,000 | 45 | 2.25x |
+| `TWO_X` | $500,000 | 50 | 2.00x |
 | `PHI` | $1,000,000 | 55 | 1.618x |
 | `ONE_THREE` | $2,000,000 | 59.5 | 1.30x |
 | `ONE_X` | $5,000,000 | 65 | 1.00x |
-| `RETIREMENT` | age only | 70 | 0.75x plus 25% SGOV |
+| `RETIREMENT` | age only | 70 | 0.75x |
 
-The value gates are indexed at 2.5% annually from August 14, 2026. Set the
-optional `INVESTOR_BIRTH_DATE` repository secret (`YYYY-MM-DD`) for exact age
-boundaries; otherwise the dated age-23 anchor is used.
+Value gates rise 2.5% annually from August 14, 2026. Set the optional
+`INVESTOR_BIRTH_DATE` secret in `YYYY-MM-DD` form for exact age boundaries.
 
-## Rebalancing and notifications
+## Rebalancing and email
 
-The engine rebalances only for a structural change, a five-percentage-point
-individual drift, or a five-point aggregate equity drift. Risk-off SOXL exits
-and lifecycle transitions bypass the drift band. Ordinary HOLD runs are
-silent. Email is sent only for a new action, a material update, a one-time
-cancellation, or a delivery retry. Duplicate pending recommendations are
-suppressed.
+The engine issues an action for a TQQQ/UPRO switch, a lifecycle transition, an
+individual position drift of at least five percentage points, aggregate equity
+drift of at least five points, or an obsolete holding that must be sold. An
+ordinary drift rebalance trades only far enough to return inside a 2.5-point
+band. Structural transitions use the exact target.
 
-Legacy QLD/UGL/TECL/other positions remain priceable during migration so that
-the first run can sell them explicitly; they are not strategic targets in this
-revision. No state, balances, addresses, or credentials belong in Git.
+HOLD runs do not email. Identical pending instructions are suppressed. A
+material change replaces the pending action, a no-longer-needed action gets one
+cancellation, and failed SMTP delivery stays pending for retry.
 
-## Production workflow
+## Operating cycle
 
-The GitHub Actions workflow runs after completed NYSE closes. When an action
-email arrives:
+The scheduled GitHub workflow runs after completed NYSE closes. An emailed
+quantity is a signal-close estimate, not a guaranteed fill.
 
-1. Recalculate quantities using executable next-session prices.
+1. Recalculate quantities from executable prices during the next session.
 2. Execute the trades manually at the broker.
 3. Run the workflow with `run_mode: confirm-execution`.
-4. Supply the email's signal date and every final holding as `TICKER=SHARES`,
+4. Enter the email's signal date and every final holding as `TICKER=SHARES`,
    including `CASH=...`.
 
-Use `run_mode: sync-holdings` for a contribution, withdrawal, dividend, or
-broker correction when no recommendation is pending. For a genuinely new
-all-cash account, use `run_mode: signal`, `initialize_portfolio: true`, and
-set the `ROTH_IRA_AMOUNT` secret. Do not use that secret to replace existing
-broker holdings.
+Use `run_mode: sync-holdings` after a contribution, withdrawal, dividend, or
+broker correction when no action is pending. A truly new all-cash account must
+be explicitly initialized with `run_mode: signal`, `initialize_portfolio: true`,
+and the `ROTH_IRA_AMOUNT` secret. Never use that secret to overwrite an existing
+account.
 
-## Research governance
+## Safety and validation
 
-The runner records non-trading comparison targets in a hash-chained shadow
-ledger. Historical QLD/UGL and other variants remain research or migration
-artifacts; they cannot alter production holdings, orders, notifications, or
-the live strategy fingerprint. A future TQQQ deleveraging rule must be tested
-as a new frozen revision before promotion.
-
-## Local validation
+- Latest prices must cover every held and strategic ticker.
+- QQQ signal history must contain the latest completed NYSE sessions with no
+  synthetic fill or stale daily bar.
+- State is saved atomically and stored as a private workflow artifact, never in
+  Git.
+- Test mode never saves state, writes an audit/log, or sends email.
 
 ```powershell
 python -m unittest discover -s tests -v
@@ -105,6 +98,3 @@ python port12_cloud.py --test --roth-amount 10000
 git diff --check
 git status --short
 ```
-
-Test mode may download live market data, but it never saves production state,
-writes logs or audits, or sends email.
