@@ -143,22 +143,6 @@ class HoldingsAndRebalanceTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             portfolio.existing_portfolio_value(portfolio.PortfolioState(shares={"TQQQ": 1.0}), prices)
 
-    def test_exact_individual_five_point_drift_triggers(self):
-        existing = {"TQQQ": 0.35, "DBMF": 0.25, "ZROZ": 0.2, "UGL": 0.2}
-        individual, aggregate = portfolio.drift_triggers(existing, portfolio.target_weights(True))
-        self.assertTrue(individual)
-        self.assertTrue(aggregate)
-
-    def test_below_band_does_not_trigger(self):
-        existing = {"TQQQ": 0.351, "DBMF": 0.249, "ZROZ": 0.2, "UGL": 0.2}
-        self.assertEqual(portfolio.drift_triggers(existing, portfolio.target_weights(True)), (False, False))
-
-    def test_exact_aggregate_equity_drift_triggers(self):
-        existing = {"TQQQ": 0.425, "UPRO": 0.025, "DBMF": 0.183, "ZROZ": 0.183, "UGL": 0.184}
-        individual, aggregate = portfolio.drift_triggers(existing, portfolio.target_weights(True))
-        self.assertFalse(individual)
-        self.assertTrue(aggregate)
-
     def test_legacy_soxl_is_explicitly_sold(self):
         state = portfolio.PortfolioState(
             executed_tqqq_active=True,
@@ -183,11 +167,28 @@ class HoldingsAndRebalanceTests(unittest.TestCase):
         self.assertFalse(plan.rebalance_due)
         self.assertEqual(plan.reason, "CONFIRMED_TARGET_STATE")
 
-    def test_inner_band_destination_is_inside_threshold(self):
-        current = {"TQQQ": 0.30, "DBMF": 0.30, "ZROZ": 0.20, "UGL": 0.20}
-        result = portfolio.inner_band_rebalance_weights(current, portfolio.target_weights(True))
-        for ticker, target in portfolio.target_weights(True).items():
-            self.assertLessEqual(abs(result.get(ticker, 0) - target), 0.025 + 1e-9)
+    def test_router_switch_preserves_non_equity_weights(self):
+        state = portfolio.PortfolioState(
+            executed_tqqq_active=True,
+            executed_strategy_fingerprint=portfolio.STRATEGY_FINGERPRINT,
+            last_completed_annual_rebalance_year=2026,
+        )
+        current = {"TQQQ": 0.44, "DBMF": 0.18, "ZROZ": 0.19, "UGL": 0.17, "CASH": 0.02}
+        plan = portfolio.build_rebalance_plan(current, decision(False), state)
+        self.assertTrue(plan.rebalance_due)
+        self.assertFalse(plan.full_transition)
+        self.assertEqual(plan.execution_weights, {"DBMF": 0.18, "ZROZ": 0.19, "UGL": 0.17, "CASH": 0.02, "UPRO": 0.44})
+
+    def test_midyear_drift_waits_for_annual_rebalance(self):
+        state = portfolio.PortfolioState(
+            executed_tqqq_active=True,
+            executed_strategy_fingerprint=portfolio.STRATEGY_FINGERPRINT,
+            last_completed_annual_rebalance_year=2026,
+        )
+        current = {"TQQQ": 0.50, "DBMF": 0.15, "ZROZ": 0.15, "UGL": 0.20}
+        plan = portfolio.build_rebalance_plan(current, decision(True), state)
+        self.assertFalse(plan.rebalance_due)
+        self.assertEqual(plan.reason, "HOLD")
 
     def test_new_calendar_year_forces_exact_rebalance(self):
         state = portfolio.PortfolioState(

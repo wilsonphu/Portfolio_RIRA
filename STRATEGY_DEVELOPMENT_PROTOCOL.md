@@ -20,6 +20,10 @@ The first completed NYSE signal in each calendar year forces an exact target
 rebalance. QQQ's 50-session average and 252-session momentum are displayed as
 supporting health checks only.
 
+Between annual rebalances, a router change replaces the current TQQQ/UPRO
+equity position without resetting the other sleeves. Ordinary weight drift does
+not produce an email or a trade.
+
 This is an index router, not a leverage-reduction rule: TQQQ and UPRO both
 target 3x daily returns. The portfolio's base advertised exposure is 2.00x.
 Age/value lifecycle ceilings scale all risky weights proportionally into SGOV

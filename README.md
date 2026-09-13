@@ -67,11 +67,10 @@ On the first completed NYSE signal of each calendar year, the engine performs
 an exact annual rebalance. If the portfolio is already exact, it sends one
 annual-review email and records the completed year without requesting a trade.
 
-The engine also issues an action for a TQQQ/UPRO switch, a lifecycle transition, an
-individual position drift of at least five percentage points, aggregate equity
-drift of at least five points, or an obsolete holding that must be sold. An
-ordinary drift rebalance trades only far enough to return inside a 2.5-point
-band. Structural transitions use the exact target.
+The engine also issues an action for a TQQQ/UPRO switch, a lifecycle transition,
+or an obsolete holding that must be sold. A midyear equity switch replaces the
+current equity fund without rebalancing DBMF, ZROZ, UGL, or cash. Ordinary
+allocation drift waits for the annual rebalance.
 
 Other HOLD runs do not email. Identical pending instructions are suppressed. A
 material change replaces the pending action, a no-longer-needed action gets one

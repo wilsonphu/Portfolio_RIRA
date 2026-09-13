@@ -82,8 +82,6 @@ SHORT_TREND_WINDOW = 50
 MOMENTUM_WINDOW = 252
 REQUIRED_SIGNAL_ROWS = MOMENTUM_WINDOW + core.BULLISH_ENTRY_CLOSES
 MODEL_START_DATE = core.MODEL_HISTORY_START
-REBALANCE_BAND = 0.05
-REBALANCE_DESTINATION = 0.025
 NOTIFICATION_WEIGHT_TOLERANCE = 0.005
 TRANSACTION_COST_SCENARIOS_BPS = (5, 10, 25)
 MARKET_CLOSE_BUFFER_MINUTES = 15
@@ -191,9 +189,8 @@ def strategy_manifest() -> dict[str, object]:
             "signal": "completed_close",
             "fill": "next_session",
             "missed_sessions": "replay_all",
-            "individual_and_equity_drift_trigger": REBALANCE_BAND,
-            "inner_destination": REBALANCE_DESTINATION,
-            "structural_switch": "exact_target",
+            "ordinary_rebalance": "annual_only",
+            "equity_switch": "replace_equity_fund_without_rebalancing_other_sleeves",
             "holdings_source": "confirmed_shares_and_cash",
             "annual_rebalance": "first_completed_XNYS_signal_each_calendar_year",
         },
@@ -205,7 +202,7 @@ def calculate_strategy_fingerprint(manifest: dict[str, object] | None = None) ->
 
 
 STRATEGY_FINGERPRINT = calculate_strategy_fingerprint()
-EXPECTED_STRATEGY_FINGERPRINT = "d446dad503a16f5803e92590c634558ad1adb05e374ad05eba44a887e9e91fb8"
+EXPECTED_STRATEGY_FINGERPRINT = "bf12915cea8fd7caa27ac71ab1bb71d6c7c115cdc80d574adfcecdaa3eafe06c"
 
 
 @dataclass(frozen=True)
@@ -247,8 +244,6 @@ class RebalancePlan:
     reason: str
     one_way_turnover: float
     individual_orders: int
-    individual_drift_triggered: bool = False
-    aggregate_equity_drift_triggered: bool = False
     annual_rebalance_due: bool = False
     annual_rebalance_year: int = 0
 
@@ -941,74 +936,10 @@ def resolve_portfolio_value(
     return float(amount), planning
 
 
-def drift_triggers(
-    existing: dict[str, float], target: dict[str, float], *, band: float = REBALANCE_BAND
-) -> tuple[bool, bool]:
-    if not 0 < band < 1:
-        raise ValueError("band must be between zero and one")
-    if not existing:
-        return True, True
-    desired = _with_cash(target)
-    individual = any(
-        abs(desired.get(ticker, 0.0) - existing.get(ticker, 0.0)) >= band - 1e-12
-        for ticker in set(existing) | set(desired)
-    )
-    current_equity = sum(existing.get(ticker, 0.0) for ticker in EQUITY_TICKERS)
-    target_equity = sum(desired.get(ticker, 0.0) for ticker in EQUITY_TICKERS)
-    aggregate = abs(current_equity - target_equity) >= band - 1e-12
-    return individual, aggregate
-
-
-def inner_band_rebalance_weights(
-    existing: dict[str, float],
-    target: dict[str, float],
-    destination: float = REBALANCE_DESTINATION,
-    *,
-    trigger_band: float = REBALANCE_BAND,
-) -> dict[str, float]:
-    if not existing:
-        return dict(target)
-    if not 0 < destination < trigger_band < 1:
-        raise ValueError("Destination must be inside the trigger band")
-    desired_mapping = _with_cash(target)
-    tickers = sorted(set(existing) | set(desired_mapping))
-    current = np.array([existing.get(ticker, 0.0) for ticker in tickers])
-    desired = np.array([desired_mapping.get(ticker, 0.0) for ticker in tickers])
-    if not np.isclose(current.sum(), 1.0, atol=1e-9) or not np.isclose(desired.sum(), 1.0, atol=1e-9):
-        raise RuntimeError("Weight maps must sum to one")
-    lower = np.maximum(0.0, desired - destination)
-    upper = np.minimum(1.0, desired + destination)
-    low_shift = float(np.min(current - upper)) - 1.0
-    high_shift = float(np.max(current - lower)) + 1.0
-    for _ in range(100):
-        shift = (low_shift + high_shift) / 2.0
-        candidate = np.clip(current - shift, lower, upper)
-        if candidate.sum() > 1.0:
-            low_shift = shift
-        else:
-            high_shift = shift
-    projected = np.clip(current - high_shift, lower, upper)
-    remainder = 1.0 - projected.sum()
-    if abs(remainder) > 1e-10:
-        slack = upper - projected if remainder > 0 else projected - lower
-        for index in np.argsort(-slack):
-            adjustment = min(abs(remainder), slack[index])
-            projected[index] += adjustment if remainder > 0 else -adjustment
-            remainder += -adjustment if remainder > 0 else adjustment
-            if abs(remainder) <= 1e-12:
-                break
-    if not np.isclose(projected.sum(), 1.0, atol=1e-9):
-        raise RuntimeError("Inner-band projection failed")
-    return {ticker: float(weight) for ticker, weight in zip(tickers, projected) if weight > 1e-12}
-
-
 def build_rebalance_plan(
     existing: dict[str, float],
     decision: StrategyDecision,
     state: PortfolioState,
-    *,
-    rebalance_band: float = REBALANCE_BAND,
-    rebalance_destination: float = REBALANCE_DESTINATION,
 ) -> RebalancePlan:
     target = _with_cash(decision.target_weights)
     signal_year = date.fromisoformat(
@@ -1019,9 +950,8 @@ def build_rebalance_plan(
     lifecycle_changed = state.executed_lifecycle_stage != decision.lifecycle_stage
     router_changed = state.executed_tqqq_active != decision.router_state.tqqq_active
     legacy_exit = any(existing.get(ticker, 0.0) > 1e-12 for ticker in LEGACY_HOLDINGS)
-    individual, aggregate = drift_triggers(existing, target, band=rebalance_band)
-    full = strategy_changed or lifecycle_changed or router_changed or legacy_exit or annual_due
-    due = full or individual or aggregate
+    full = strategy_changed or lifecycle_changed or legacy_exit or annual_due
+    due = full or router_changed
     if strategy_changed:
         reason = "STRATEGY_REVISION_TRANSITION"
     elif legacy_exit:
@@ -1032,15 +962,20 @@ def build_rebalance_plan(
         reason = decision.transition_reason
     elif annual_due:
         reason = "ANNUAL_REBALANCE"
-    elif individual:
-        reason = "INDIVIDUAL_DRIFT_BAND"
-    elif aggregate:
-        reason = "AGGREGATE_EQUITY_DRIFT_BAND"
     else:
         reason = "HOLD"
-    execution = target if full or not due else inner_band_rebalance_weights(
-        existing, target, rebalance_destination, trigger_band=rebalance_band
-    )
+    if full or not due:
+        execution = target
+    else:
+        execution = dict(existing)
+        equity_weight = sum(execution.pop(ticker, 0.0) for ticker in EQUITY_TICKERS)
+        active_ticker = (
+            GROWTH_EQUITY
+            if decision.router_state.tqqq_active
+            else DEFENSIVE_EQUITY
+        )
+        if equity_weight > 1e-12:
+            execution[active_ticker] = equity_weight
     components = set(existing) | set(execution)
     one_way = 0.5 * sum(abs(execution.get(item, 0.0) - existing.get(item, 0.0)) for item in components) if due else 0.0
     orders = sum(
@@ -1057,8 +992,6 @@ def build_rebalance_plan(
         reason,
         float(one_way),
         int(orders),
-        individual,
-        aggregate,
         annual_due,
         signal_year if annual_due else 0,
     )
