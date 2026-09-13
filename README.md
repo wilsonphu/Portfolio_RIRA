@@ -2,7 +2,7 @@
 
 This repository contains one stateful, notification-only Roth IRA allocator.
 The production revision is
-`tqqq-upro40-dbmf20-zroz20-ugl20-sma200-annual-v2`.
+`tqqq-upro40-dbmf20-zroz20-ugl20-sma200-annual-v3`.
 It does not place broker trades. It calculates next-session instructions,
 emails only when action is required, and values the account from confirmed
 shares and cash rather than an old target allocation.
@@ -27,10 +27,8 @@ The 40% equity sleeve uses one completed-close QQQ trend rule:
 
 The compact dashboard also reports QQQ versus its 50-session average and its
 252-session momentum. These are supporting health checks, not extra trade
-triggers. Tests found that attaching the former short-horizon filters to this
-router sharply increased whipsaw and reduced net growth. The former SMH
-residual and HAR-volatility signals were SOXL admission and sizing controls;
-they have no valid production role after removal of the SOXL sleeve.
+triggers. Tests found that attaching short-horizon filters to this router
+sharply increased whipsaw and reduced net growth.
 
 ## Contribution deployment
 
@@ -73,10 +71,6 @@ reduce the leverage multiplier. The base portfolio's advertised daily exposure
 is 2.00x: 1.20x equity, 0.20x managed futures, 0.20x long Treasuries, and 0.40x
 gold. Actual returns and risk are path-dependent.
 
-SOXL is no longer a strategic sleeve. The engine retains migration-only pricing
-for SOXL and other prior holdings so an existing position appears as an explicit
-SELL instead of disappearing from account state.
-
 ## Lifecycle reserve
 
 The one-way age/value ratchet remains enabled. When its exposure ceiling falls
@@ -102,8 +96,8 @@ On the first completed NYSE signal of each calendar year, the engine performs
 an exact annual rebalance. If the portfolio is already exact, it sends one
 annual-review email and records the completed year without requesting a trade.
 
-The engine also issues an action for a TQQQ/UPRO switch, a lifecycle transition,
-or an obsolete holding that must be sold. A midyear equity switch replaces the
+The engine also issues an action for a TQQQ/UPRO switch or a lifecycle transition.
+A midyear equity switch replaces the
 current equity fund without rebalancing DBMF, ZROZ, UGL, or cash. Ordinary
 allocation drift waits for the annual rebalance.
 

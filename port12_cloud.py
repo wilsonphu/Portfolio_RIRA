@@ -42,9 +42,6 @@ LEVERAGED_GOLD = core.UGL
 TREASURY_RESERVE = "SGOV"
 CASH_ASSET = core.CASH
 
-LEGACY_HOLDINGS = frozenset(
-    {"SOXL", "QLD", "GLD", "TECL", "SPMO", "USD", "QQQM", "GLDM", "SMH"}
-)
 STRATEGIC_TICKERS = (
     GROWTH_EQUITY,
     DEFENSIVE_EQUITY,
@@ -54,9 +51,9 @@ STRATEGIC_TICKERS = (
     TREASURY_RESERVE,
 )
 EQUITY_TICKERS = (GROWTH_EQUITY, DEFENSIVE_EQUITY)
-VALUATION_TICKERS = tuple(sorted(set(STRATEGIC_TICKERS) | LEGACY_HOLDINGS))
+VALUATION_TICKERS = STRATEGIC_TICKERS
 ALL_TICKERS = tuple(dict.fromkeys((MARKET_INDEX, *VALUATION_TICKERS)))
-TRADED_TICKERS = frozenset(VALUATION_TICKERS)
+TRADED_TICKERS = frozenset(STRATEGIC_TICKERS)
 PORTFOLIO_COMPONENTS = TRADED_TICKERS | {CASH_ASSET}
 
 ADVERTISED_DAILY_MULTIPLIERS = {
@@ -66,15 +63,6 @@ ADVERTISED_DAILY_MULTIPLIERS = {
     ZROZ: 1.0,
     LEVERAGED_GOLD: 2.0,
     TREASURY_RESERVE: 0.0,
-    "SOXL": 3.0,
-    "QLD": 2.0,
-    "GLD": 1.0,
-    "TECL": 3.0,
-    "SPMO": 1.0,
-    "USD": 2.0,
-    "QQQM": 1.0,
-    "GLDM": 1.0,
-    "SMH": 1.0,
     CASH_ASSET: 0.0,
 }
 
@@ -132,7 +120,7 @@ LIFECYCLE_INFLATION_RATE = 0.025
 LIFECYCLE_ANCHOR_DATE = date(2026, 8, 14)
 LIFECYCLE_ANCHOR_AGE = 23.0
 
-STRATEGY_REVISION = "tqqq-upro40-dbmf20-zroz20-ugl20-sma200-annual-v2"
+STRATEGY_REVISION = "tqqq-upro40-dbmf20-zroz20-ugl20-sma200-annual-v3"
 STATE_VERSION = 17
 DECISION_AUDIT_SCHEMA_VERSION = 8
 APP_DIR = Path(__file__).resolve().parent
@@ -173,7 +161,6 @@ def strategy_manifest() -> dict[str, object]:
                 LEVERAGED_GOLD: core.DIVERSIFIER_WEIGHT,
             },
             "maximum_advertised_daily_exposure": core.MAX_ADVERTISED_DAILY_EXPOSURE,
-            "soxl": "not_a_strategic_holding",
         },
         "lifecycle": {
             "stages": list(LIFECYCLE_STAGES),
@@ -203,7 +190,7 @@ def calculate_strategy_fingerprint(manifest: dict[str, object] | None = None) ->
 
 
 STRATEGY_FINGERPRINT = calculate_strategy_fingerprint()
-EXPECTED_STRATEGY_FINGERPRINT = "bf12915cea8fd7caa27ac71ab1bb71d6c7c115cdc80d574adfcecdaa3eafe06c"
+EXPECTED_STRATEGY_FINGERPRINT = "fce93c048eff45a632501633c06ac66e9dcc491b283a60085598d83ca5746c65"
 
 
 @dataclass(frozen=True)
@@ -1188,13 +1175,10 @@ def build_rebalance_plan(
     strategy_changed = state.executed_strategy_fingerprint != STRATEGY_FINGERPRINT
     lifecycle_changed = state.executed_lifecycle_stage != decision.lifecycle_stage
     router_changed = state.executed_tqqq_active != decision.router_state.tqqq_active
-    legacy_exit = any(existing.get(ticker, 0.0) > 1e-12 for ticker in LEGACY_HOLDINGS)
-    full = strategy_changed or lifecycle_changed or legacy_exit or annual_due
+    full = strategy_changed or lifecycle_changed or annual_due
     due = full or router_changed
     if strategy_changed:
         reason = "STRATEGY_REVISION_TRANSITION"
-    elif legacy_exit:
-        reason = "LEGACY_POSITION_EXIT"
     elif lifecycle_changed:
         reason = "LIFECYCLE_STAGE_ADVANCE"
     elif router_changed:

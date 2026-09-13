@@ -171,20 +171,6 @@ class HoldingsAndRebalanceTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             portfolio.existing_portfolio_value(portfolio.PortfolioState(shares={"TQQQ": 1.0}), prices)
 
-    def test_legacy_soxl_is_explicitly_sold(self):
-        state = portfolio.PortfolioState(
-            executed_tqqq_active=True,
-            executed_strategy_fingerprint=portfolio.STRATEGY_FINGERPRINT,
-            last_completed_annual_rebalance_year=2026,
-            shares={"TQQQ": 39.0, "SOXL": 1.0, "DBMF": 20.0, "ZROZ": 20.0, "UGL": 20.0},
-        )
-        existing = {"TQQQ": 0.39, "SOXL": 0.01, "DBMF": 0.2, "ZROZ": 0.2, "UGL": 0.2}
-        plan = portfolio.build_rebalance_plan(existing, decision(True), state)
-        self.assertTrue(plan.full_transition)
-        self.assertEqual(plan.execution_weights.get("SOXL", 0), 0)
-        table = portfolio.calculate_execution_table(price_frame(), plan.execution_weights, 10_000.0, state, actionable=True)
-        self.assertEqual(table.set_index("Ticker").loc["SOXL", "Action"], "SELL")
-
     def test_exact_holdings_confirm_new_strategy_without_trade(self):
         state = portfolio.PortfolioState(
             executed_tqqq_active=True,
@@ -255,24 +241,6 @@ class StateTests(unittest.TestCase):
     def tearDown(self):
         self.patcher.stop()
         self.temp.cleanup()
-
-    def test_version_14_migration_preserves_legacy_shares_cash_and_pending(self):
-        payload = {
-            "state_version": 14,
-            "shares": {"SOXL": 1.5, "GLD": 2.0},
-            "cash_balance": 123.45,
-            "portfolio_value": 999.0,
-            "target_weights": {"SOXL": 0.15, "GLD": 0.85},
-            "pending_recommendation_date": "2026-09-10",
-            "pending_recommendation_weights": {"SOXL": 0.15, "GLD": 0.85},
-            "pending_recommendation_notified": True,
-        }
-        self.state_path.write_text(json.dumps(payload), encoding="utf-8")
-        state = portfolio.load_state(backup_legacy=False)
-        self.assertEqual(state.shares, {"SOXL": 1.5, "GLD": 2.0})
-        self.assertEqual(state.cash_balance, 123.45)
-        self.assertEqual(state.pending_recommendation_date, "2026-09-10")
-        self.assertFalse(state.strategy_initialized)
 
     def test_version_15_migration_defers_annual_rebalance_until_next_year(self):
         payload = {
@@ -612,8 +580,8 @@ class DataAndCliTests(unittest.TestCase):
     def test_complete_holdings_parser_requires_cash(self):
         with self.assertRaises(ValueError):
             portfolio.parse_executed_shares(["TQQQ=1"])
-        shares, cash = portfolio.parse_executed_shares(["TQQQ=1", "SOXL=2", "CASH=3"])
-        self.assertEqual(shares, {"TQQQ": 1.0, "SOXL": 2.0})
+        shares, cash = portfolio.parse_executed_shares(["TQQQ=1", "UPRO=2", "CASH=3"])
+        self.assertEqual(shares, {"TQQQ": 1.0, "UPRO": 2.0})
         self.assertEqual(cash, 3.0)
 
     def test_test_mode_never_persists_or_sends(self):

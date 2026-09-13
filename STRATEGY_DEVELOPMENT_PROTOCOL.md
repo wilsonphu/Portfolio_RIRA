@@ -3,7 +3,7 @@
 ## Live decision boundary
 
 Production is frozen as
-`tqqq-upro40-dbmf20-zroz20-ugl20-sma200-annual-v2`:
+`tqqq-upro40-dbmf20-zroz20-ugl20-sma200-annual-v3`:
 
 ```text
 Bull-confirmed: 40% TQQQ / 20% DBMF / 20% ZROZ / 20% UGL
@@ -13,8 +13,8 @@ Trend failed:  40% UPRO / 20% DBMF / 20% ZROZ / 20% UGL
 The QQQ close is bullish only when it is strictly above its trailing
 200-session SMA. One failed completed close selects UPRO immediately. TQQQ
 requires two distinct bullish completed closes. Signals observed after a close
-are intended for the next executable session. No SOXL tier, residual-momentum
-overlay, or alternative ETF can affect production.
+are intended for the next executable session. No satellite tier,
+residual-momentum overlay, or alternative ETF can affect production.
 
 The first completed NYSE signal in each calendar year forces an exact target
 rebalance. QQQ's 50-session average and 252-session momentum are displayed as
@@ -51,9 +51,8 @@ Nasdaq-versus-S&P relative-strength condition was rejected. These figures are
 not a forecast and do not establish statistical proof; DBMF's live history is
 too short for a full-cycle inference.
 
-The former SMH-on-QQQ OLS residual and HAR-style volatility forecast were
-designed exclusively to admit and size SOXL. They were retired with that sleeve
-rather than repurposed without evidence. Tests of the short-trend filter set
+Retired overlay-specific residual and volatility features were not repurposed
+without evidence. Tests of the short-trend filter set
 produced 76–86 equity switches versus 16 for SMA200 and materially reduced net
 growth at the same 25-basis-point cost assumption.
 
