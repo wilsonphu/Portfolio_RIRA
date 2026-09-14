@@ -3,58 +3,58 @@
 ## Live decision boundary
 
 Production is frozen as
-`tqqq-upro40-dbmf20-zroz20-ugl20-sma200-annual-v3`:
+`tqqq40-btal10-extreme-bear-8-2-annual-v4`:
 
 ```text
-Bull-confirmed: 40% TQQQ / 20% DBMF / 20% ZROZ / 20% UGL
-Trend failed:  40% UPRO / 20% DBMF / 20% ZROZ / 20% UGL
+Normal:       40% TQQQ / 20% DBMF / 20% ZROZ / 20% UGL
+Extreme bear: 30% TQQQ / 10% BTAL / 20% DBMF / 20% ZROZ / 20% UGL
 ```
 
-The QQQ close is bullish only when it is strictly above its trailing
-200-session SMA. One failed completed close selects UPRO immediately. TQQQ
-requires two distinct bullish completed closes. Signals observed after a close
-are intended for the next executable session. No satellite tier,
-residual-momentum overlay, or alternative ETF can affect production.
+BTAL enters only after two distinct completed sessions where both conditions
+are true:
+
+1. QQQ closes at or below 92% of its trailing 200-session SMA.
+2. SPY closes below its trailing 200-session SMA.
+
+BTAL exits only after two distinct completed sessions where both conditions
+are true:
+
+1. QQQ closes at or above 98% of its trailing 200-session SMA.
+2. SPY closes above its trailing 50-session SMA.
+
+The asymmetric thresholds are an explicit deadband. Signals observed after a
+completed close are intended for the next executable session. Duplicate dates
+cannot advance either confirmation count, and missed sessions are replayed in
+order. BTAL is capped at 10%; there are no intermediate hedge tiers.
 
 The first completed NYSE signal in each calendar year forces an exact target
-rebalance. QQQ's 50-session average and 252-session momentum are displayed as
-supporting health checks only.
+rebalance. Between annual rebalances, a crisis transition preserves the
+current total TQQQ/BTAL sleeve and changes only its internal 100/0 or 75/25
+split. Ordinary drift in DBMF, ZROZ, UGL, or cash does not produce a trade.
 
-Between annual rebalances, a router change replaces the current TQQQ/UPRO
-equity position without resetting the other sleeves. Ordinary weight drift does
-not produce an email or a trade.
+The normal portfolio's advertised gross daily exposure is 2.00x and the
+extreme-bear target's is 1.80x. BTAL is dollar-neutral rather than guaranteed
+beta-neutral, so advertised exposure is not a forecast of realized portfolio
+beta. Age/value lifecycle ceilings continue to scale all risky weights
+proportionally into SGOV and ratchet in one direction only.
 
-This is an index router, not a leverage-reduction rule: TQQQ and UPRO both
-target 3x daily returns. The portfolio's base advertised exposure is 2.00x.
-Age/value lifecycle ceilings scale all risky weights proportionally into SGOV
-and ratchet in one direction only.
+## Evidence and limitations
 
-## Evidence behind promotion
+The permanent 40% TQQQ / 20% DBMF / 20% ZROZ / 20% UGL allocation remains the
+return engine. The BTAL rule is a narrowly capped crisis overlay selected to
+reduce high-beta exposure only after severe, broad deterioration while
+retaining 30% TQQQ for a rebound.
 
-The pre-promotion comparison used actual ETF histories from May 2019 through
-September 2026 and charged 25 basis points per dollar bought or sold. Annual
-rebalancing was retained for the fixed sleeves, while a switch traded only the
-40% equity sleeve. Results from this short, unusually favorable sample were:
+The 8% entry distance, 2% recovery distance, two-close confirmation, and 10%
+cap are predeclared policy parameters. They are not statistically proven
+optima. BTAL began trading in 2011 and changed from passive index tracking to
+an active rules-based process in 2022, so its live history does not support a
+full-cycle inference. UPRO is no longer a target; it remains accepted only as
+a migration and liquidation-only holding so confirmed broker assets are never
+silently discarded.
 
-| Equity rule | CAGR | Max drawdown |
-|---|---:|---:|
-| Permanent UPRO | 21.11% | -34.00% |
-| Permanent TQQQ | 29.22% | -40.33% |
-| QQQ SMA200 TQQQ/UPRO router | 26.00% | -35.97% |
-| 5% SMA band router | 27.48% | -41.09% |
-| SMA/Donchian/VWMA 2-of-3, annual | 21.61% | -36.75% |
-| SMA plus short-filter confirmation, annual | 20.72% | -36.68% |
-
-The simple SMA rule was selected because it reduced the permanent-TQQQ
-drawdown in this sample without adding a second fitted threshold. A proposed
-Nasdaq-versus-S&P relative-strength condition was rejected. These figures are
-not a forecast and do not establish statistical proof; DBMF's live history is
-too short for a full-cycle inference.
-
-Retired overlay-specific residual and volatility features were not repurposed
-without evidence. Tests of the short-trend filter set
-produced 76–86 equity switches versus 16 for SMA200 and materially reduced net
-growth at the same 25-basis-point cost assumption.
+Measurement-only diagnostics reconstruct the same delayed two-close crisis
+rule. They cannot influence or block a production decision.
 
 ## Rules for future changes
 
@@ -71,15 +71,15 @@ before its final evaluation. Its protocol must state:
 
 Promote only evidence that survives multiple market regimes, realistic costs,
 parameter perturbations, and prospective observation. A higher in-sample CAGR
-alone is not sufficient. Any production change requires a new revision, state
-migration, fingerprint review, tests, and a written comparison against the
-current live rule.
+alone is insufficient. Any production change requires a new revision, state
+migration, fingerprint review, tests, and a written comparison with the live
+rule.
 
 ## Operational invariants
 
 - Confirmed broker shares and cash are the source of truth.
 - Missing, stale, partial, zero, infinite, or NaN market data fail closed.
-- A duplicate close cannot mutate the signal state twice.
+- A duplicate close cannot mutate signal state twice.
 - Old holdings remain priceable until explicitly sold.
 - State is atomic and private; credentials, balances, shares, and state files
   are never committed.

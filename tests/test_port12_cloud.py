@@ -24,27 +24,36 @@ def price_frame(*, bullish: bool = True, periods: int = 280) -> pd.DataFrame:
     if bullish:
         frame.loc[index[-2], portfolio.MARKET_INDEX] = 110.0
         frame.loc[index[-1], portfolio.MARKET_INDEX] = 111.0
+        frame.loc[index[-2], portfolio.CONFIRMATION_INDEX] = 105.0
+        frame.loc[index[-1], portfolio.CONFIRMATION_INDEX] = 106.0
     else:
-        frame.loc[index[-1], portfolio.MARKET_INDEX] = 80.0
+        frame.loc[index[-2], portfolio.MARKET_INDEX] = 80.0
+        frame.loc[index[-1], portfolio.MARKET_INDEX] = 79.0
+        frame.loc[index[-2], portfolio.CONFIRMATION_INDEX] = 90.0
+        frame.loc[index[-1], portfolio.CONFIRMATION_INDEX] = 89.0
     return frame
 
 
-def decision(active: bool) -> portfolio.StrategyDecision:
-    router = portfolio.core.EquityRouterState(
-        tqqq_active=active,
-        bullish_streak=2 if active else 0,
+def decision(hedged: bool) -> portfolio.StrategyDecision:
+    hedge = portfolio.core.CrisisHedgeState(
+        btal_active=hedged,
         last_processed_signal_date="2026-09-11",
     )
     return portfolio.StrategyDecision(
-        target_weights=portfolio.target_weights(active),
-        router_state=router,
-        transition_reason="TQQQ_HOLD" if active else "UPRO_HOLD",
+        target_weights=portfolio.target_weights(hedged),
+        hedge_state=hedge,
+        transition_reason="EXTREME_HEDGE_HOLD" if hedged else "TQQQ_HOLD",
         structural_change=False,
-        trend_positive=active,
-        qqq_close=110.0 if active else 90.0,
+        trend_positive=not hedged,
+        qqq_close=90.0 if hedged else 110.0,
         qqq_sma_200=100.0,
         qqq_sma_50=102.0,
         qqq_momentum_252=0.10,
+        spy_close=90.0 if hedged else 105.0,
+        spy_sma_200=100.0,
+        spy_sma_50=102.0,
+        extreme_bearish=hedged,
+        recovery_confirmed=not hedged,
         lifecycle_stage=portfolio.LIFECYCLE_SPRINT,
     )
 
@@ -53,30 +62,29 @@ def run_fixture() -> portfolio.StrategyRun:
     prices = price_frame()
     state = portfolio.PortfolioState(
         shares={"TQQQ": 40.0, "DBMF": 20.0, "ZROZ": 20.0, "UGL": 20.0},
-        target_weights=portfolio.target_weights(True),
+        target_weights=portfolio.target_weights(False),
         strategy_initialized=True,
-        tqqq_active=True,
-        tqqq_bullish_streak=2,
+        btal_active=False,
         last_processed_signal_date="2026-09-11",
-        executed_tqqq_active=True,
+        executed_btal_active=False,
         executed_strategy_fingerprint=portfolio.STRATEGY_FINGERPRINT,
         last_completed_annual_rebalance_year=2026,
     )
-    current = portfolio.target_weights(True)
+    current = portfolio.target_weights(False)
     plan = portfolio.RebalancePlan(current, False, False, "HOLD", 0.0, 0)
     table = portfolio.calculate_execution_table(prices, current, 10_000.0, state, actionable=False)
     diagnostics = portfolio.calculate_execution_diagnostics(table, 10_000.0, current, current, current)
     return portfolio.StrategyRun(
-        prices, decision(True), state, deepcopy(state), 10_000.0, current,
+        prices, decision(False), state, deepcopy(state), 10_000.0, current,
         table, pd.Timestamp("2026-09-11"), "1" * 64, plan, diagnostics,
     )
 
 
 def action_run_fixture() -> portfolio.StrategyRun:
-    """A coherent TQQQ-to-UPRO action, including its executable trade rows."""
+    """A coherent TQQQ-to-BTAL action, including executable trade rows."""
     run = run_fixture()
-    routed = decision(False)
-    plan = portfolio.build_rebalance_plan(run.current_weights, routed, run.state)
+    hedged = decision(True)
+    plan = portfolio.build_rebalance_plan(run.current_weights, hedged, run.state)
     table = portfolio.calculate_execution_table(
         run.price_data,
         plan.execution_weights,
@@ -88,12 +96,12 @@ def action_run_fixture() -> portfolio.StrategyRun:
         table,
         run.portfolio_value,
         run.current_weights,
-        routed.target_weights,
+        hedged.target_weights,
         plan.execution_weights,
     )
     return replace(
         run,
-        decision=routed,
+        decision=hedged,
         execution_table=table,
         rebalance_plan=plan,
         execution_diagnostics=diagnostics,
@@ -105,45 +113,40 @@ class StrategyTests(unittest.TestCase):
         portfolio.validate_configuration()
         self.assertEqual(portfolio.STRATEGY_FINGERPRINT, portfolio.calculate_strategy_fingerprint())
 
-    def test_initialization_replays_two_completed_bullish_closes(self):
+    def test_initialization_replays_two_completed_closes_without_hedging(self):
         prices = price_frame()
         result = portfolio.calculate_strategy_decision(prices, portfolio.PortfolioState())
-        self.assertTrue(result.router_state.tqqq_active)
+        self.assertFalse(result.hedge_state.btal_active)
         self.assertEqual(result.processed_signal_dates, tuple(item.date().isoformat() for item in prices.index[-2:]))
 
-    def test_bearish_close_exits_tqqq_immediately(self):
+    def test_two_extreme_bear_closes_activate_btal(self):
         prices = price_frame(bullish=False)
-        state = portfolio.PortfolioState(
-            strategy_initialized=True,
-            tqqq_active=True,
-            tqqq_bullish_streak=9,
-            last_processed_signal_date=prices.index[-2].date().isoformat(),
-        )
-        result = portfolio.calculate_strategy_decision(prices, state)
-        self.assertFalse(result.router_state.tqqq_active)
-        self.assertEqual(result.transition_reason, "TREND_SWITCH_TO_UPRO")
+        result = portfolio.calculate_strategy_decision(prices, portfolio.PortfolioState())
+        self.assertTrue(result.hedge_state.btal_active)
+        self.assertEqual(result.transition_reason, "EXTREME_HEDGE_ENTRY")
+        self.assertEqual(result.target_weights["TQQQ"], 0.30)
+        self.assertEqual(result.target_weights["BTAL"], 0.10)
 
     def test_same_date_run_is_idempotent(self):
         prices = price_frame()
         state = portfolio.PortfolioState(
             strategy_initialized=True,
-            tqqq_active=False,
-            tqqq_bullish_streak=1,
+            btal_entry_streak=1,
             last_processed_signal_date=prices.index[-1].date().isoformat(),
         )
         result = portfolio.calculate_strategy_decision(prices, state)
-        self.assertFalse(result.router_state.tqqq_active)
-        self.assertEqual(result.router_state.bullish_streak, 1)
+        self.assertFalse(result.hedge_state.btal_active)
+        self.assertEqual(result.hedge_state.entry_streak, 1)
 
     def test_missed_sessions_are_replayed(self):
-        prices = price_frame()
+        prices = price_frame(bullish=False)
         state = portfolio.PortfolioState(
             strategy_initialized=True,
             last_processed_signal_date=prices.index[-3].date().isoformat(),
         )
         result = portfolio.calculate_strategy_decision(prices, state)
         self.assertEqual(len(result.processed_signal_dates), 2)
-        self.assertTrue(result.router_state.tqqq_active)
+        self.assertTrue(result.hedge_state.btal_active)
 
     def test_lifecycle_ceiling_scales_risk_into_sgov(self):
         weights = portfolio.target_weights(True, portfolio.LIFECYCLE_PHI)
@@ -173,90 +176,100 @@ class HoldingsAndRebalanceTests(unittest.TestCase):
 
     def test_exact_holdings_confirm_new_strategy_without_trade(self):
         state = portfolio.PortfolioState(
-            executed_tqqq_active=True,
+            executed_btal_active=False,
             last_completed_annual_rebalance_year=2026,
         )
-        current = portfolio.target_weights(True)
-        plan = portfolio.build_rebalance_plan(current, decision(True), state)
+        current = portfolio.target_weights(False)
+        plan = portfolio.build_rebalance_plan(current, decision(False), state)
         self.assertFalse(plan.rebalance_due)
         self.assertEqual(plan.reason, "CONFIRMED_TARGET_STATE")
 
     def test_all_cash_forces_full_allocation_from_confirmed_holdings(self):
         state = portfolio.PortfolioState(
-            executed_tqqq_active=True,
+            executed_btal_active=False,
             executed_strategy_fingerprint=portfolio.STRATEGY_FINGERPRINT,
             last_completed_annual_rebalance_year=2026,
         )
         plan = portfolio.build_rebalance_plan(
-            {"CASH": 1.0}, decision(True), state
+            {"CASH": 1.0}, decision(False), state
         )
         self.assertTrue(plan.rebalance_due)
         self.assertTrue(plan.full_transition)
-        self.assertEqual(plan.reason, "MISSING_EQUITY_POSITION")
+        self.assertEqual(plan.reason, "MISSING_TACTICAL_POSITION")
         self.assertEqual(
             plan.execution_weights,
-            {**portfolio.target_weights(True), "CASH": 0.0},
+            {**portfolio.target_weights(False), "CASH": 0.0},
         )
 
-    def test_confirmed_equity_overrides_stale_executed_router_flag(self):
+    def test_confirmed_holdings_override_stale_executed_hedge_flag(self):
         state = portfolio.PortfolioState(
-            executed_tqqq_active=False,
+            executed_btal_active=True,
             executed_strategy_fingerprint=portfolio.STRATEGY_FINGERPRINT,
             last_completed_annual_rebalance_year=2026,
         )
-        aligned = portfolio.target_weights(True)
-        plan = portfolio.build_rebalance_plan(aligned, decision(True), state)
+        aligned = portfolio.target_weights(False)
+        plan = portfolio.build_rebalance_plan(aligned, decision(False), state)
         self.assertFalse(plan.rebalance_due)
         self.assertEqual(plan.reason, "HOLD")
 
-    def test_wrong_confirmed_equity_is_replaced_even_when_state_flag_matches(self):
+    def test_legacy_upro_is_liquidated_without_losing_the_holding(self):
         state = portfolio.PortfolioState(
-            executed_tqqq_active=True,
+            executed_btal_active=False,
             executed_strategy_fingerprint=portfolio.STRATEGY_FINGERPRINT,
             last_completed_annual_rebalance_year=2026,
         )
         current = {"UPRO": 0.40, "DBMF": 0.20, "ZROZ": 0.20, "UGL": 0.20}
-        plan = portfolio.build_rebalance_plan(current, decision(True), state)
+        plan = portfolio.build_rebalance_plan(current, decision(False), state)
         self.assertTrue(plan.rebalance_due)
-        self.assertFalse(plan.full_transition)
-        self.assertEqual(plan.reason, "EQUITY_ROUTER_REALIGNMENT")
-        self.assertEqual(plan.execution_weights, portfolio.target_weights(True))
+        self.assertTrue(plan.full_transition)
+        self.assertEqual(plan.reason, "LEGACY_UPRO_LIQUIDATION")
+        self.assertEqual(plan.execution_weights, {**portfolio.target_weights(False), "CASH": 0.0})
 
-    def test_router_switch_preserves_non_equity_weights(self):
+    def test_crisis_switch_preserves_non_tactical_weights(self):
         state = portfolio.PortfolioState(
-            executed_tqqq_active=True,
+            executed_btal_active=False,
             executed_strategy_fingerprint=portfolio.STRATEGY_FINGERPRINT,
             last_completed_annual_rebalance_year=2026,
         )
         current = {"TQQQ": 0.44, "DBMF": 0.18, "ZROZ": 0.19, "UGL": 0.17, "CASH": 0.02}
-        plan = portfolio.build_rebalance_plan(current, decision(False), state)
+        plan = portfolio.build_rebalance_plan(current, decision(True), state)
         self.assertTrue(plan.rebalance_due)
         self.assertFalse(plan.full_transition)
-        self.assertEqual(plan.execution_weights, {"DBMF": 0.18, "ZROZ": 0.19, "UGL": 0.17, "CASH": 0.02, "UPRO": 0.44})
+        expected = {
+            "DBMF": 0.18,
+            "ZROZ": 0.19,
+            "UGL": 0.17,
+            "CASH": 0.02,
+            "TQQQ": 0.33,
+            "BTAL": 0.11,
+        }
+        self.assertEqual(set(plan.execution_weights), set(expected))
+        for ticker, weight in expected.items():
+            self.assertAlmostEqual(plan.execution_weights[ticker], weight)
 
     def test_midyear_drift_waits_for_annual_rebalance(self):
         state = portfolio.PortfolioState(
-            executed_tqqq_active=True,
+            executed_btal_active=False,
             executed_strategy_fingerprint=portfolio.STRATEGY_FINGERPRINT,
             last_completed_annual_rebalance_year=2026,
         )
         current = {"TQQQ": 0.50, "DBMF": 0.15, "ZROZ": 0.15, "UGL": 0.20}
-        plan = portfolio.build_rebalance_plan(current, decision(True), state)
+        plan = portfolio.build_rebalance_plan(current, decision(False), state)
         self.assertFalse(plan.rebalance_due)
         self.assertEqual(plan.reason, "HOLD")
 
     def test_new_calendar_year_forces_exact_rebalance(self):
         state = portfolio.PortfolioState(
-            executed_tqqq_active=True,
+            executed_btal_active=False,
             executed_strategy_fingerprint=portfolio.STRATEGY_FINGERPRINT,
             last_completed_annual_rebalance_year=2025,
         )
         current = {"TQQQ": 0.39, "DBMF": 0.21, "ZROZ": 0.20, "UGL": 0.20}
-        plan = portfolio.build_rebalance_plan(current, decision(True), state)
+        plan = portfolio.build_rebalance_plan(current, decision(False), state)
         self.assertTrue(plan.rebalance_due)
         self.assertTrue(plan.annual_rebalance_due)
         self.assertEqual(plan.annual_rebalance_year, 2026)
-        self.assertEqual(plan.execution_weights, {**portfolio.target_weights(True), "CASH": 0.0})
+        self.assertEqual(plan.execution_weights, {**portfolio.target_weights(False), "CASH": 0.0})
 
     def test_exact_new_year_allocation_sends_one_review(self):
         run = run_fixture()
@@ -304,7 +317,7 @@ class StateTests(unittest.TestCase):
         }
         self.state_path.write_text(json.dumps(payload), encoding="utf-8")
         state = portfolio.load_state()
-        self.assertEqual(state.state_version, 18)
+        self.assertEqual(state.state_version, 19)
         self.assertEqual(state.contribution_plan_year, 0)
         self.assertEqual(state.contribution_budget, 0.0)
 
@@ -322,11 +335,33 @@ class StateTests(unittest.TestCase):
         }
         self.state_path.write_text(json.dumps(payload), encoding="utf-8")
         state = portfolio.load_state()
-        self.assertEqual(state.state_version, 18)
+        self.assertEqual(state.state_version, 19)
         self.assertEqual(state.cash_balance, 14_000.0)
         self.assertEqual(state.contribution_budget, 6_400.0)
         self.assertEqual(state.contribution_released_amount, 5_760.0)
         self.assertEqual(state.last_processed_data_fingerprint, "")
+
+    def test_version_18_migration_preserves_legacy_upro_and_restarts_new_signal(self):
+        payload = {
+            "state_version": 18,
+            "shares": {"UPRO": 3.5},
+            "cash_balance": 25.0,
+            "target_weights": {"UPRO": 0.4, "DBMF": 0.2, "ZROZ": 0.2, "UGL": 0.2},
+            "portfolio_value": 1_000.0,
+            "strategy_initialized": True,
+            "tqqq_active": False,
+            "tqqq_bullish_streak": 0,
+            "last_processed_signal_date": "2026-09-11",
+            "executed_strategy_fingerprint": "1" * 64,
+            "last_completed_annual_rebalance_year": 2026,
+        }
+        self.state_path.write_text(json.dumps(payload), encoding="utf-8")
+        state = portfolio.load_state()
+        self.assertEqual(state.state_version, 19)
+        self.assertEqual(state.shares, {"UPRO": 3.5})
+        self.assertFalse(state.strategy_initialized)
+        self.assertEqual(state.last_processed_signal_date, "")
+        self.assertFalse(state.btal_active)
 
     def test_configure_contributions_records_remaining_budget(self):
         portfolio.save_state(portfolio.PortfolioState(shares={"TQQQ": 1.0}))
@@ -381,15 +416,17 @@ class StateTests(unittest.TestCase):
         state = portfolio.PortfolioState(
             pending_recommendation_date="2026-09-11",
             pending_recommendation_weights=portfolio.target_weights(True),
-            pending_recommendation_tqqq_active=True,
+            pending_recommendation_btal_active=True,
             pending_recommendation_lifecycle_stage=portfolio.LIFECYCLE_SPRINT,
             pending_recommendation_notified=True,
             pending_recommendation_fingerprint=portfolio.STRATEGY_FINGERPRINT,
             pending_recommendation_annual_year=2026,
         )
         portfolio.save_state(state)
-        confirmed = portfolio.confirm_execution({"TQQQ": 12.25}, 3.21, "2026-09-11")
-        self.assertEqual(confirmed.shares, {"TQQQ": 12.25})
+        confirmed = portfolio.confirm_execution(
+            {"TQQQ": 12.25, "BTAL": 2.0}, 3.21, "2026-09-11"
+        )
+        self.assertEqual(confirmed.shares, {"TQQQ": 12.25, "BTAL": 2.0})
         self.assertEqual(confirmed.cash_balance, 3.21)
         self.assertFalse(confirmed.pending_recommendation_date)
         self.assertEqual(confirmed.last_completed_annual_rebalance_year, 2026)
@@ -398,7 +435,7 @@ class StateTests(unittest.TestCase):
         state = portfolio.PortfolioState(
             pending_recommendation_date="2026-09-11",
             pending_recommendation_weights=portfolio.target_weights(True),
-            pending_recommendation_tqqq_active=True,
+            pending_recommendation_btal_active=True,
             pending_recommendation_lifecycle_stage=portfolio.LIFECYCLE_SPRINT,
             pending_recommendation_notified=True,
             pending_recommendation_supersedes_date="2026-09-10",
@@ -421,26 +458,26 @@ class NotificationTests(unittest.TestCase):
     def test_identical_delivered_pending_is_suppressed(self):
         run = run_fixture()
         run.state.pending_recommendation_date = "2026-09-10"
-        run.state.pending_recommendation_weights = portfolio.target_weights(True)
-        run.state.pending_recommendation_tqqq_active = True
+        run.state.pending_recommendation_weights = portfolio.target_weights(False)
+        run.state.pending_recommendation_btal_active = False
         run.state.pending_recommendation_lifecycle_stage = portfolio.LIFECYCLE_SPRINT
         run.state.pending_recommendation_notified = True
         run.state.pending_recommendation_fingerprint = portfolio.STRATEGY_FINGERPRINT
-        run = replace(run, rebalance_plan=portfolio.RebalancePlan(portfolio.target_weights(True), True, True, "TEST", 0.1, 1))
+        run = replace(run, rebalance_plan=portfolio.RebalancePlan(portfolio.target_weights(False), True, True, "TEST", 0.1, 1))
         self.assertEqual(portfolio.decide_notification(run).kind, "NONE")
 
     def test_explicit_resend_rearms_identical_pending_action(self):
         run = run_fixture()
         run.state.pending_recommendation_date = "2026-09-10"
-        run.state.pending_recommendation_weights = portfolio.target_weights(True)
-        run.state.pending_recommendation_tqqq_active = True
+        run.state.pending_recommendation_weights = portfolio.target_weights(False)
+        run.state.pending_recommendation_btal_active = False
         run.state.pending_recommendation_lifecycle_stage = portfolio.LIFECYCLE_SPRINT
         run.state.pending_recommendation_notified = True
         run.state.pending_recommendation_fingerprint = portfolio.STRATEGY_FINGERPRINT
         run = replace(
             run,
             rebalance_plan=portfolio.RebalancePlan(
-                portfolio.target_weights(True), True, True, "TEST", 0.1, 1
+                portfolio.target_weights(False), True, True, "TEST", 0.1, 1
             ),
         )
 
@@ -457,7 +494,7 @@ class NotificationTests(unittest.TestCase):
         run = run_fixture()
         run.state.pending_recommendation_date = "2026-09-10"
         run.state.pending_recommendation_weights = portfolio.target_weights(True)
-        run.state.pending_recommendation_tqqq_active = True
+        run.state.pending_recommendation_btal_active = True
         run.state.pending_recommendation_lifecycle_stage = portfolio.LIFECYCLE_SPRINT
         run.state.pending_recommendation_notified = True
         run.state.pending_recommendation_fingerprint = portfolio.STRATEGY_FINGERPRINT
@@ -474,14 +511,14 @@ class NotificationTests(unittest.TestCase):
                 portfolio.send_email("subject", "text", "<p>html</p>")
 
     def test_material_update_replaces_pending_action(self):
-        run = run_fixture()
+        run = action_run_fixture()
         run.state.pending_recommendation_date = "2026-09-10"
         run.state.pending_recommendation_weights = portfolio.target_weights(False)
-        run.state.pending_recommendation_tqqq_active = False
+        run.state.pending_recommendation_btal_active = False
         run.state.pending_recommendation_lifecycle_stage = portfolio.LIFECYCLE_SPRINT
         run.state.pending_recommendation_notified = True
         run.state.pending_recommendation_fingerprint = portfolio.STRATEGY_FINGERPRINT
-        run = replace(run, rebalance_plan=portfolio.RebalancePlan(portfolio.target_weights(True), True, True, "TREND_SWITCH_TO_TQQQ", 0.4, 2))
+        run = replace(run, rebalance_plan=portfolio.RebalancePlan(portfolio.target_weights(True), True, True, "EXTREME_HEDGE_ENTRY", 0.1, 2))
         notice = portfolio.decide_notification(run)
         self.assertEqual(notice.kind, "UPDATE")
         portfolio.prepare_notification_delivery(run, notice)
@@ -602,7 +639,7 @@ class DecisionAuditTests(unittest.TestCase):
         audit = portfolio.build_decision_audit(
             run, portfolio.NotificationDecision("ACTION", "NEW_RECOMMENDATION"), "STAGED"
         )
-        self.assertEqual(audit["schema_version"], 10)
+        self.assertEqual(audit["schema_version"], 11)
         lifecycle = audit["lifecycle"]
         self.assertEqual(lifecycle["stage"], run.decision.lifecycle_stage)
         self.assertEqual(lifecycle["value_stage"], run.decision.lifecycle_value_stage)
@@ -652,7 +689,7 @@ class RenderingTests(unittest.TestCase):
         dashboard = portfolio.build_dashboard(action_run_fixture())
         self.assertIn("TQQQ", dashboard)
         self.assertIn("SELL", dashboard)
-        self.assertIn("UPRO", dashboard)
+        self.assertIn("BTAL", dashboard)
         self.assertIn("BUY", dashboard)
 
     def test_hold_dashboard_remains_compact_and_omits_trade_table(self):
@@ -669,7 +706,7 @@ class RenderingTests(unittest.TestCase):
         )
         self.assertIn("ACTION REQUIRED", html)
         self.assertIn("TQQQ", html)
-        self.assertIn("UPRO", html)
+        self.assertIn("BTAL", html)
         self.assertIn("Portfolio orders", html)
         self.assertIn("Place the portfolio orders", html)
         self.assertNotIn("Advertised exposure", html)

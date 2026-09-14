@@ -80,28 +80,53 @@ def annual_rebalanced_curve(
     return pd.Series(values, index=returns.index)
 
 
-def router_equity_returns(
+def crisis_tactical_returns(
     returns: pd.DataFrame,
     prices: pd.DataFrame,
     index_ticker: str,
+    confirmation_ticker: str,
     growth: str,
-    defensive: str,
+    hedge: str,
     sma_window: int,
+    short_sma_window: int,
+    entry_ratio: float,
+    exit_ratio: float,
 ) -> pd.Series:
-    """Replicate the live equity rule FOR MEASUREMENT ONLY.
+    """Replicate the live extreme-bear rule FOR MEASUREMENT ONLY.
 
     This reconstruction is never consulted by the allocator. It exists so the
     paper track reflects the rule actually in production rather than a
     permanently-held fund.
     """
-    index_series = pd.to_numeric(prices[index_ticker], errors="coerce").reindex(
-        returns.index.union(prices.index)
-    ).sort_index()
-    sma = index_series.rolling(sma_window, min_periods=sma_window).mean()
-    above = (index_series > sma).reindex(returns.index).fillna(False)
-    confirmed = above & above.shift(1, fill_value=False)
-    hold_growth = confirmed.shift(1, fill_value=False)
-    return returns[growth].where(hold_growth, returns[defensive])
+    common = returns.index.union(prices.index)
+    qqq = pd.to_numeric(prices[index_ticker], errors="coerce").reindex(common).sort_index()
+    spy = pd.to_numeric(prices[confirmation_ticker], errors="coerce").reindex(common).sort_index()
+    qqq_sma = qqq.rolling(sma_window, min_periods=sma_window).mean()
+    spy_sma = spy.rolling(sma_window, min_periods=sma_window).mean()
+    spy_short = spy.rolling(short_sma_window, min_periods=short_sma_window).mean()
+    extreme = ((qqq <= entry_ratio * qqq_sma) & (spy < spy_sma)).reindex(returns.index).fillna(False)
+    recovery = ((qqq >= exit_ratio * qqq_sma) & (spy > spy_short)).reindex(returns.index).fillna(False)
+    active = False
+    entry_streak = 0
+    exit_streak = 0
+    signal_state: list[bool] = []
+    for is_extreme, is_recovery in zip(extreme, recovery):
+        if active:
+            exit_streak = exit_streak + 1 if is_recovery else 0
+            if exit_streak >= 2:
+                active = False
+                exit_streak = 0
+            entry_streak = 0
+        else:
+            entry_streak = entry_streak + 1 if is_extreme else 0
+            if entry_streak >= 2:
+                active = True
+                entry_streak = 0
+            exit_streak = 0
+        signal_state.append(active)
+    hold_hedge = pd.Series(signal_state, index=returns.index).shift(1, fill_value=False)
+    hedged_return = 0.75 * returns[growth] + 0.25 * returns[hedge]
+    return returns[growth].where(~hold_hedge, hedged_return)
 
 
 def trailing_returns(curve: pd.Series) -> dict[str, float]:
@@ -193,15 +218,19 @@ def build_performance_report(
     reference_books: dict[str, dict[str, float]],
     live_book: dict[str, float],
     index_ticker: str,
+    confirmation_ticker: str,
     growth: str,
-    defensive: str,
+    hedge: str,
     cash_proxy: str,
     sma_window: int,
+    short_sma_window: int,
+    entry_ratio: float,
+    exit_ratio: float,
     multipliers: dict[str, float],
     current_weights: dict[str, float],
 ) -> PerformanceReport:
     required = {
-        index_ticker, growth, defensive,
+        index_ticker, confirmation_ticker, growth, hedge,
         *live_book,
         *(t for book in reference_books.values() for t in book),
     }
@@ -222,11 +251,20 @@ def build_performance_report(
             paper[label] = trailing_returns(curve)
 
     routed = returns.copy()
-    routed["__ROUTED__"] = router_equity_returns(
-        returns, prices, index_ticker, growth, defensive, sma_window
+    routed["__TACTICAL__"] = crisis_tactical_returns(
+        returns,
+        prices,
+        index_ticker,
+        confirmation_ticker,
+        growth,
+        hedge,
+        sma_window,
+        short_sma_window,
+        entry_ratio,
+        exit_ratio,
     )
     live_mapped = {
-        ("__ROUTED__" if t == growth else t): w for t, w in live_book.items()
+        ("__TACTICAL__" if t == growth else t): w for t, w in live_book.items()
     }
     live_curve = annual_rebalanced_curve(routed, live_mapped)
     if len(live_curve):

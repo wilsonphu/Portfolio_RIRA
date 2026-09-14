@@ -2,7 +2,7 @@
 
 This repository contains one stateful, notification-only Roth IRA allocator.
 The production revision is
-`tqqq-upro40-dbmf20-zroz20-ugl20-sma200-annual-v3`.
+`tqqq40-btal10-extreme-bear-8-2-annual-v4`.
 It does not place broker trades. It calculates next-session instructions,
 emails only when action is required, and values the account from confirmed
 shares and cash rather than an old target allocation.
@@ -21,22 +21,27 @@ The base target always contains:
 
 | Sleeve | Weight |
 |---|---:|
-| Routed equity ETF | 40% |
+| TQQQ | 40% normally; 30% with the crisis hedge active |
+| BTAL | 0% normally; 10% with the crisis hedge active |
 | DBMF | 20% |
 | ZROZ | 20% |
 | UGL | 20% |
 
-The 40% equity sleeve uses one completed-close QQQ trend rule:
+The tactical sleeve uses one stateful extreme-bear rule:
 
-- Hold `TQQQ` after two distinct QQQ closes strictly above its 200-session SMA.
-- Switch immediately to `UPRO` after one QQQ close at or below its 200-session SMA.
-- A duplicate run for the same close cannot advance the bullish count.
+- Normally hold 40% `TQQQ` and no `BTAL`.
+- Enter 30% TQQQ / 10% BTAL after two distinct completed sessions where QQQ
+  closes at or below 92% of its SMA200 and SPY closes below its SMA200.
+- Exit BTAL and restore 40% TQQQ after two distinct completed sessions where
+  QQQ closes at or above 98% of its SMA200 and SPY closes above its SMA50.
+- The asymmetric 8% entry and 2% recovery boundaries form a deadband.
+- A duplicate run for the same close cannot advance either count.
 - Missed completed sessions are replayed in order.
 
-The compact dashboard also reports QQQ versus its 50-session average and its
-252-session momentum. These are supporting health checks, not extra trade
-triggers. Tests found that attaching short-horizon filters to this router
-sharply increased whipsaw and reduced net growth.
+The compact dashboard reports the QQQ/SMA200 distance, SPY confirmation
+distances, and the two stateful confirmation counters. QQQ's SMA50 and
+252-session momentum remain available to contribution and diagnostic code but
+cannot activate the crisis hedge.
 
 ## Contribution deployment
 
@@ -74,11 +79,10 @@ budget each tax year; the engine never assumes Roth eligibility or contribution
 room. A plan must be configured for the current New York calendar year because
 the scheduler cannot safely act on prior- or future-year contribution room.
 
-TQQQ and UPRO both target three times their index's **daily** return. The switch
-changes the equity engine from Nasdaq-100 to S&P 500 exposure; it does not
-reduce the leverage multiplier. The base portfolio's advertised daily exposure
-is 2.00x: 1.20x equity, 0.20x managed futures, 0.20x long Treasuries, and 0.40x
-gold. Actual returns and risk are path-dependent.
+TQQQ targets three times the Nasdaq-100's **daily** return. BTAL is a
+dollar-neutral long-low-beta/short-high-beta strategy, not a guaranteed inverse
+fund. The normal portfolio's advertised gross daily exposure is 2.00x; the
+hedged target is 1.80x. Actual beta, returns, and risk remain path-dependent.
 
 ## Lifecycle reserve
 
@@ -105,10 +109,11 @@ On the first completed NYSE signal of each calendar year, the engine performs
 an exact annual rebalance. If the portfolio is already exact, it sends one
 annual-review email and records the completed year without requesting a trade.
 
-The engine also issues an action for a TQQQ/UPRO switch or a lifecycle transition.
-A midyear equity switch replaces the
-current equity fund without rebalancing DBMF, ZROZ, UGL, or cash. Ordinary
-allocation drift waits for the annual rebalance.
+The engine also issues an action for a BTAL crisis-hedge transition or a
+lifecycle transition. A midyear hedge transition moves one quarter of the
+current TQQQ/BTAL tactical sleeve between TQQQ and BTAL without rebalancing
+DBMF, ZROZ, UGL, or cash. Ordinary allocation drift waits for the annual
+rebalance.
 
 Other HOLD runs do not email. Identical pending instructions are suppressed. A
 material change replaces the pending action, a no-longer-needed action gets one
@@ -117,9 +122,9 @@ Use the explicit `resend-notification` workflow operation when another copy of
 the current pending portfolio action is needed; ordinary scheduled runs remain
 quiet.
 
-Confirmed holdings also determine whether the equity router is actually
-aligned. Missing equity exposure, the wrong routed fund, or both equity funds
-being present cannot be hidden by stale state metadata. Confirming a late fill
+Confirmed holdings also determine whether the crisis hedge is actually
+aligned. Missing TQQQ exposure, an unexpected BTAL position, or a legacy UPRO
+position cannot be hidden by stale state metadata. Confirming a late fill
 from an older signal updates the holdings without erasing a newer pending action.
 
 ## Operating cycle
@@ -142,7 +147,7 @@ account.
 ## Safety and validation
 
 - Latest prices must cover every held and strategic ticker.
-- QQQ signal history must contain the latest completed NYSE sessions with no
+- QQQ and SPY signal history must contain the latest completed NYSE sessions with no
   synthetic fill or stale daily bar.
 - State is saved atomically and stored as a private workflow artifact, never in
   Git.

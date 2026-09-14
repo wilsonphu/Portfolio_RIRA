@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Stateful Roth allocator with a 40% TQQQ/UPRO equity router.
+"""Stateful Roth allocator with a capped extreme-bear BTAL hedge.
 
-Completed QQQ closes drive one decision: TQQQ after two closes above SMA200,
-UPRO immediately after a failed close. DBMF, ZROZ, and UGL remain 20% each.
+The normal allocation holds 40% TQQQ. After two completed broad-market closes
+meeting the extreme-bear threshold, 10% moves from TQQQ to BTAL. The hedge
+exits after two completed recovery closes. DBMF, ZROZ, and UGL remain 20% each.
 Confirmed broker shares and cash are always the source of current weights.
 """
 
@@ -34,8 +35,12 @@ import performance_core as performance
 
 # Configuration and universe
 MARKET_INDEX = core.QQQ
+CONFIRMATION_INDEX = core.SPY
 GROWTH_EQUITY = core.TQQQ
-DEFENSIVE_EQUITY = core.UPRO
+CRISIS_HEDGE = core.BTAL
+# UPRO remains valuation/liquidation-only so a version-18 state can migrate
+# without silently dropping a real broker holding.
+LEGACY_UPRO = "UPRO"
 DBMF = core.DBMF
 ZROZ = core.ZROZ
 LEVERAGED_GOLD = core.UGL
@@ -44,21 +49,24 @@ CASH_ASSET = core.CASH
 
 STRATEGIC_TICKERS = (
     GROWTH_EQUITY,
-    DEFENSIVE_EQUITY,
+    CRISIS_HEDGE,
     DBMF,
     ZROZ,
     LEVERAGED_GOLD,
     TREASURY_RESERVE,
 )
-EQUITY_TICKERS = (GROWTH_EQUITY, DEFENSIVE_EQUITY)
-VALUATION_TICKERS = STRATEGIC_TICKERS
-ALL_TICKERS = tuple(dict.fromkeys((MARKET_INDEX, *VALUATION_TICKERS)))
-TRADED_TICKERS = frozenset(STRATEGIC_TICKERS)
+TACTICAL_TICKERS = (GROWTH_EQUITY, CRISIS_HEDGE)
+VALUATION_TICKERS = (*STRATEGIC_TICKERS, LEGACY_UPRO)
+ALL_TICKERS = tuple(
+    dict.fromkeys((MARKET_INDEX, CONFIRMATION_INDEX, *VALUATION_TICKERS))
+)
+TRADED_TICKERS = frozenset(VALUATION_TICKERS)
 PORTFOLIO_COMPONENTS = TRADED_TICKERS | {CASH_ASSET}
 
 ADVERTISED_DAILY_MULTIPLIERS = {
     GROWTH_EQUITY: 3.0,
-    DEFENSIVE_EQUITY: 3.0,
+    CRISIS_HEDGE: 1.0,
+    LEGACY_UPRO: 3.0,
     DBMF: 1.0,
     ZROZ: 1.0,
     LEVERAGED_GOLD: 2.0,
@@ -67,9 +75,9 @@ ADVERTISED_DAILY_MULTIPLIERS = {
 }
 
 SMA_WINDOW = core.SMA_WINDOW
-SHORT_TREND_WINDOW = 50
+SHORT_TREND_WINDOW = core.SHORT_SMA_WINDOW
 MOMENTUM_WINDOW = 252
-REQUIRED_SIGNAL_ROWS = MOMENTUM_WINDOW + core.BULLISH_ENTRY_CLOSES
+REQUIRED_SIGNAL_ROWS = MOMENTUM_WINDOW + core.CONFIRMATION_CLOSES
 MODEL_START_DATE = core.MODEL_HISTORY_START
 NOTIFICATION_WEIGHT_TOLERANCE = 0.005
 TRANSACTION_COST_SCENARIOS_BPS = (5, 10, 25)
@@ -120,9 +128,9 @@ LIFECYCLE_INFLATION_RATE = 0.025
 LIFECYCLE_ANCHOR_DATE = date(2026, 8, 14)
 LIFECYCLE_ANCHOR_AGE = 23.0
 
-STRATEGY_REVISION = "tqqq-upro40-dbmf20-zroz20-ugl20-sma200-annual-v3"
-STATE_VERSION = 18
-DECISION_AUDIT_SCHEMA_VERSION = 10
+STRATEGY_REVISION = "tqqq40-btal10-extreme-bear-8-2-annual-v4"
+STATE_VERSION = 19
+DECISION_AUDIT_SCHEMA_VERSION = 11
 APP_DIR = Path(__file__).resolve().parent
 STATE_FILE = APP_DIR / "roth_ira_state.json"
 LOG_FILE = APP_DIR / "roth_ira.log"
@@ -140,11 +148,20 @@ def strategy_manifest() -> dict[str, object]:
         "revision": STRATEGY_REVISION,
         "quantitative_core_revision": core.DECISION_SEMANTIC_REVISION,
         "signal": {
-            "index": MARKET_INDEX,
-            "trend": "close_strictly_above_sma",
+            "primary_index": MARKET_INDEX,
+            "confirmation_index": CONFIRMATION_INDEX,
             "sma_sessions": SMA_WINDOW,
-            "tqqq_entry_closes": core.BULLISH_ENTRY_CLOSES,
-            "upro_entry": "immediate_on_failed_trend",
+            "short_sma_sessions": SHORT_TREND_WINDOW,
+            "extreme_entry": {
+                "qqq_ratio_to_sma200_lte": core.EXTREME_BEAR_RATIO,
+                "spy_below_sma200": True,
+                "distinct_closes": core.CONFIRMATION_CLOSES,
+            },
+            "recovery_exit": {
+                "qqq_ratio_to_sma200_gte": core.RECOVERY_RATIO,
+                "spy_above_sma50": True,
+                "distinct_closes": core.CONFIRMATION_CLOSES,
+            },
             "same_date": "idempotent",
             "supporting_health_checks": {
                 "qqq_sma_sessions": SHORT_TREND_WINDOW,
@@ -153,8 +170,9 @@ def strategy_manifest() -> dict[str, object]:
             },
         },
         "allocation": {
-            "equity_weight": core.EQUITY_WEIGHT,
-            "equity_choices": [GROWTH_EQUITY, DEFENSIVE_EQUITY],
+            "normal_tqqq_weight": core.TQQQ_WEIGHT,
+            "extreme_bear_tqqq_weight": core.HEDGED_TQQQ_WEIGHT,
+            "extreme_bear_btal_weight": core.BTAL_WEIGHT,
             "fixed_sleeves": {
                 DBMF: core.DIVERSIFIER_WEIGHT,
                 ZROZ: core.DIVERSIFIER_WEIGHT,
@@ -178,7 +196,7 @@ def strategy_manifest() -> dict[str, object]:
             "fill": "next_session",
             "missed_sessions": "replay_all",
             "ordinary_rebalance": "annual_only",
-            "equity_switch": "replace_equity_fund_without_rebalancing_other_sleeves",
+            "crisis_switch": "move_10pp_between_TQQQ_and_BTAL_without_rebalancing_other_sleeves",
             "holdings_source": "confirmed_shares_and_cash",
             "annual_rebalance": "first_completed_XNYS_signal_each_calendar_year",
         },
@@ -190,13 +208,13 @@ def calculate_strategy_fingerprint(manifest: dict[str, object] | None = None) ->
 
 
 STRATEGY_FINGERPRINT = calculate_strategy_fingerprint()
-EXPECTED_STRATEGY_FINGERPRINT = "fce93c048eff45a632501633c06ac66e9dcc491b283a60085598d83ca5746c65"
+EXPECTED_STRATEGY_FINGERPRINT = "373c3655762642fd99f4dff471840c2133cbc1caa8bf83a4c7c6428e69cecf36"
 
 
 @dataclass(frozen=True)
 class StrategyDecision:
     target_weights: dict[str, float]
-    router_state: core.EquityRouterState
+    hedge_state: core.CrisisHedgeState
     transition_reason: str
     structural_change: bool
     trend_positive: bool
@@ -204,6 +222,11 @@ class StrategyDecision:
     qqq_sma_200: float
     qqq_sma_50: float
     qqq_momentum_252: float
+    spy_close: float
+    spy_sma_200: float
+    spy_sma_50: float
+    extreme_bearish: bool
+    recovery_confirmed: bool
     processed_signal_dates: tuple[str, ...] = ()
     transition_path: tuple[str, ...] = ()
     lifecycle_stage: str = LIFECYCLE_SPRINT
@@ -291,21 +314,22 @@ class PortfolioState:
     portfolio_value: float = 0.0
 
     strategy_initialized: bool = False
-    tqqq_active: bool = False
-    tqqq_bullish_streak: int = 0
-    tqqq_switch_date: str = ""
+    btal_active: bool = False
+    btal_entry_streak: int = 0
+    btal_exit_streak: int = 0
+    btal_switch_date: str = ""
     last_processed_signal_date: str = ""
     lifecycle_stage: str = LIFECYCLE_SPRINT
     lifecycle_stage_date: str = ""
 
-    executed_tqqq_active: bool = False
+    executed_btal_active: bool = False
     executed_lifecycle_stage: str = LIFECYCLE_SPRINT
     executed_strategy_fingerprint: str = ""
     last_completed_annual_rebalance_year: int = 0
 
     pending_recommendation_date: str = ""
     pending_recommendation_weights: dict[str, float] = field(default_factory=dict)
-    pending_recommendation_tqqq_active: bool = False
+    pending_recommendation_btal_active: bool = False
     pending_recommendation_lifecycle_stage: str = ""
     pending_recommendation_notified: bool = False
     pending_recommendation_supersedes_date: str = ""
@@ -427,10 +451,10 @@ def advertised_daily_exposure(weights: dict[str, float]) -> float:
     return float(exposure)
 
 
-def target_weights(tqqq_active: bool, lifecycle_stage: str = LIFECYCLE_SPRINT) -> dict[str, float]:
+def target_weights(btal_active: bool, lifecycle_stage: str = LIFECYCLE_SPRINT) -> dict[str, float]:
     if lifecycle_stage not in LIFECYCLE_STAGES:
         raise ValueError(f"Unknown lifecycle stage: {lifecycle_stage}")
-    aggressive = core.target_weights(tqqq_active)
+    aggressive = core.target_weights(btal_active)
     ceiling = LIFECYCLE_EXPOSURE_CEILINGS[lifecycle_stage]
     exposure = advertised_daily_exposure(aggressive)
     if ceiling is None or exposure <= ceiling + 1e-12:
@@ -450,12 +474,12 @@ def validate_configuration() -> None:
         raise RuntimeError("Decision boundaries changed without fingerprint review")
     for stage in LIFECYCLE_STAGES:
         ceiling = LIFECYCLE_EXPOSURE_CEILINGS[stage]
-        for active in (False, True):
-            weights = target_weights(active, stage)
+        for hedged in (False, True):
+            weights = target_weights(hedged, stage)
             if not np.isclose(sum(weights.values()), 1.0, atol=1e-12):
                 raise RuntimeError("Allocation invariant failed")
             exposure = advertised_daily_exposure(weights)
-            expected = core.MAX_ADVERTISED_DAILY_EXPOSURE
+            expected = core.advertised_daily_exposure(hedged)
             if ceiling is not None:
                 expected = min(expected, ceiling)
             if not np.isclose(exposure, expected, atol=1e-12):
@@ -491,9 +515,9 @@ def validate_state(state: PortfolioState) -> None:
     _validate_weights(state.target_weights, "target_weights", require_total=bool(state.target_weights))
     for name in (
         "strategy_initialized",
-        "tqqq_active",
-        "executed_tqqq_active",
-        "pending_recommendation_tqqq_active",
+        "btal_active",
+        "executed_btal_active",
+        "pending_recommendation_btal_active",
         "pending_recommendation_notified",
         "contribution_pullback_used",
         "contribution_drawdown_10_used",
@@ -505,11 +529,17 @@ def validate_state(state: PortfolioState) -> None:
         if not isinstance(getattr(state, name), bool):
             raise RuntimeError(f"{name} must be boolean")
     if (
-        not isinstance(state.tqqq_bullish_streak, int)
-        or isinstance(state.tqqq_bullish_streak, bool)
-        or state.tqqq_bullish_streak < 0
+        not isinstance(state.btal_entry_streak, int)
+        or isinstance(state.btal_entry_streak, bool)
+        or state.btal_entry_streak < 0
     ):
-        raise RuntimeError("tqqq_bullish_streak is invalid")
+        raise RuntimeError("btal_entry_streak is invalid")
+    if (
+        not isinstance(state.btal_exit_streak, int)
+        or isinstance(state.btal_exit_streak, bool)
+        or state.btal_exit_streak < 0
+    ):
+        raise RuntimeError("btal_exit_streak is invalid")
     for name in (
         "last_completed_annual_rebalance_year",
         "pending_recommendation_annual_year",
@@ -543,10 +573,14 @@ def validate_state(state: PortfolioState) -> None:
             raise RuntimeError("Pending recommendation fingerprint is invalid")
         if state.pending_recommendation_lifecycle_stage not in LIFECYCLE_STAGES:
             raise RuntimeError("Pending lifecycle stage is invalid")
+        pending_has_btal = state.pending_recommendation_weights.get(CRISIS_HEDGE, 0.0) > 0
+        if state.pending_recommendation_btal_active != pending_has_btal:
+            raise RuntimeError("Pending crisis-hedge state is inconsistent")
     elif any((state.pending_recommendation_weights, state.pending_recommendation_notified,
               state.pending_recommendation_supersedes_date, state.pending_recommendation_fingerprint,
               state.pending_recommendation_lifecycle_stage,
-              state.pending_recommendation_annual_year)):
+              state.pending_recommendation_annual_year,
+              state.pending_recommendation_btal_active)):
         raise RuntimeError("Pending recommendation state is inconsistent")
     if not isinstance(state.contribution_plan_year, int) or isinstance(
         state.contribution_plan_year, bool
@@ -604,7 +638,7 @@ def validate_state(state: PortfolioState) -> None:
         ):
             raise RuntimeError("Pending contribution state is inconsistent")
     for name in (
-        "tqqq_switch_date",
+        "btal_switch_date",
         "last_processed_signal_date",
         "lifecycle_stage_date",
         "last_delivered_signal_date",
@@ -645,83 +679,62 @@ def _migrate_state(payload: dict[str, object]) -> PortfolioState:
     version = payload.get("state_version")
     if not isinstance(version, int) or isinstance(version, bool) or not 2 <= version < STATE_VERSION:
         raise RuntimeError(f"Unsupported state version: {version!r}")
-    if version == 17:
-        allowed = {item.name for item in fields(PortfolioState)}
-        unknown = set(payload) - allowed
-        if unknown:
-            raise RuntimeError(
-                f"Portfolio state contains unknown fields: {sorted(unknown)}"
-            )
-        migrated = dict(payload)
-        migrated["state_version"] = STATE_VERSION
-        # Version 18 fingerprints normalized signal inputs rather than raw
-        # provider floats. Accept one same-date replay after this migration.
-        migrated["last_processed_data_fingerprint"] = ""
-        return PortfolioState(**migrated)
     shares = _migrate_mapping(payload.get("shares"), "shares")
+    target = _migrate_mapping(payload.get("target_weights"), "target_weights")
     pending = _migrate_mapping(
         payload.get("pending_recommendation_weights"),
         "pending_recommendation_weights",
     )
-    prior_stage = payload.get("lifecycle_stage", LIFECYCLE_SPRINT)
-    lifecycle = prior_stage if prior_stage in LIFECYCLE_STAGES else LIFECYCLE_SPRINT
-    executed_stage = payload.get("executed_lifecycle_stage", lifecycle)
-    if executed_stage not in LIFECYCLE_STAGES:
-        executed_stage = lifecycle
-    pending_stage = payload.get("pending_recommendation_lifecycle_stage", "")
-    if pending and pending_stage not in LIFECYCLE_STAGES:
-        pending_stage = lifecycle
-    pending_date = str(payload.get("pending_recommendation_date", "")) if pending else ""
-    pending_fp = str(payload.get("pending_recommendation_fingerprint", "")) if pending_date else ""
-    if pending_date and not _is_sha256(pending_fp):
-        pending_fp = "0" * 64
-    last_signal = str(payload.get("last_processed_signal_date", ""))
-    try:
-        default_annual_year = date.fromisoformat(last_signal).year if last_signal else 0
-    except ValueError:
-        default_annual_year = 0
-    state = PortfolioState(
+    new_names = {item.name for item in fields(PortfolioState)}
+    migrated = {
+        name: payload[name]
+        for name in new_names
+        if name in payload
+        and name
+        not in {
+            "state_version",
+            "shares",
+            "target_weights",
+            "pending_recommendation_weights",
+            "strategy_initialized",
+            "btal_active",
+            "btal_entry_streak",
+            "btal_exit_streak",
+            "btal_switch_date",
+            "executed_btal_active",
+            "pending_recommendation_btal_active",
+            "last_processed_signal_date",
+            "last_processed_data_fingerprint",
+        }
+    }
+    migrated.update(
+        state_version=STATE_VERSION,
         shares=shares,
-        cash_balance=float(payload.get("cash_balance", 0.0)),
-        target_weights=_migrate_mapping(payload.get("target_weights"), "target_weights"),
-        portfolio_value=float(payload.get("portfolio_value", 0.0)),
-        strategy_initialized=False,
-        tqqq_active=False,
-        tqqq_bullish_streak=0,
-        lifecycle_stage=lifecycle,
-        lifecycle_stage_date=str(payload.get("lifecycle_stage_date", "")),
-        executed_tqqq_active=shares.get(GROWTH_EQUITY, 0.0) > 0 and shares.get(DEFENSIVE_EQUITY, 0.0) <= 0,
-        executed_lifecycle_stage=executed_stage,
-        executed_strategy_fingerprint=str(payload.get("executed_strategy_fingerprint", "")),
-        last_completed_annual_rebalance_year=int(
-            payload.get("last_completed_annual_rebalance_year", default_annual_year)
-        ),
-        pending_recommendation_date=pending_date,
+        target_weights=target,
         pending_recommendation_weights=pending,
-        pending_recommendation_tqqq_active=(
-            pending.get(GROWTH_EQUITY, 0.0)
-            > pending.get(DEFENSIVE_EQUITY, 0.0)
-        ),
-        pending_recommendation_lifecycle_stage=pending_stage if pending_date else "",
-        pending_recommendation_notified=(
-            bool(payload.get("pending_recommendation_notified", False))
-            if pending_date
-            else False
-        ),
-        pending_recommendation_supersedes_date=(
-            str(payload.get("pending_recommendation_supersedes_date", ""))
-            if pending_date
-            else ""
-        ),
-        pending_recommendation_fingerprint=pending_fp,
-        pending_recommendation_annual_year=int(
-            payload.get("pending_recommendation_annual_year", 0)
-        ) if pending_date else 0,
-        last_delivered_decision_hash=str(payload.get("last_delivered_decision_hash", "")),
-        last_delivered_signal_date=str(payload.get("last_delivered_signal_date", "")),
-        last_delivered_notification_kind=str(payload.get("last_delivered_notification_kind", "")),
-        last_updated=str(payload.get("last_updated", "")),
+        # A strategy revision must evaluate two fresh completed sessions. It
+        # must not inherit the old TQQQ/UPRO router's signal state.
+        strategy_initialized=False,
+        btal_active=False,
+        btal_entry_streak=0,
+        btal_exit_streak=0,
+        btal_switch_date="",
+        last_processed_signal_date="",
+        last_processed_data_fingerprint="",
+        executed_btal_active=shares.get(CRISIS_HEDGE, 0.0) > 0,
+        pending_recommendation_btal_active=pending.get(CRISIS_HEDGE, 0.0) > 0,
     )
+    if "last_completed_annual_rebalance_year" not in payload:
+        previous_signal = str(payload.get("last_processed_signal_date", ""))
+        try:
+            migrated["last_completed_annual_rebalance_year"] = (
+                date.fromisoformat(previous_signal).year if previous_signal else 0
+            )
+        except ValueError:
+            migrated["last_completed_annual_rebalance_year"] = 0
+    state = PortfolioState(**migrated)
+    if not pending:
+        _clear_pending(state)
     if state.target_weights and not np.isclose(sum(state.target_weights.values()), 1.0, atol=1e-9):
         state.target_weights = {}
     return state
@@ -872,8 +885,12 @@ def download_market_data(
         raise RuntimeError(f"Market data is stale: expected {expected.date()}, received {received.date()}")
     if len(prices) < REQUIRED_SIGNAL_ROWS:
         raise RuntimeError("Insufficient market history")
-    validate_session_continuity(prices[MARKET_INDEX].dropna().index, expected, REQUIRED_SIGNAL_ROWS)
-    _require_positive(prices[MARKET_INDEX].dropna().iloc[-REQUIRED_SIGNAL_ROWS:], "QQQ signal history")
+    for ticker in (MARKET_INDEX, CONFIRMATION_INDEX):
+        history = prices[ticker].dropna()
+        validate_session_continuity(history.index, expected, REQUIRED_SIGNAL_ROWS)
+        _require_positive(
+            history.iloc[-REQUIRED_SIGNAL_ROWS:], f"{ticker} signal history"
+        )
     _require_positive(prices.loc[received, requested], "Latest valuation prices")
     return prices
 
@@ -882,64 +899,109 @@ def market_data_fingerprint(prices: pd.DataFrame) -> str:
     if len(prices) < REQUIRED_SIGNAL_ROWS:
         raise ValueError("Insufficient data for fingerprint")
     qqq = pd.to_numeric(prices[MARKET_INDEX], errors="coerce")
+    spy = pd.to_numeric(prices[CONFIRMATION_INDEX], errors="coerce")
     close = float(qqq.iloc[-1])
     sma_200 = float(qqq.iloc[-SMA_WINDOW:].mean())
     sma_50 = float(qqq.iloc[-SHORT_TREND_WINDOW:].mean())
     momentum_252 = float(close / qqq.iloc[-(MOMENTUM_WINDOW + 1)] - 1.0)
-    values = (close, sma_200, sma_50, momentum_252)
+    spy_close = float(spy.iloc[-1])
+    spy_sma_200 = float(spy.iloc[-SMA_WINDOW:].mean())
+    spy_sma_50 = float(spy.iloc[-SHORT_TREND_WINDOW:].mean())
+    values = (close, sma_200, sma_50, momentum_252, spy_close, spy_sma_200, spy_sma_50)
     if not all(np.isfinite(value) for value in values):
         raise ValueError("Signal inputs are invalid for fingerprinting")
+    extreme, recovery = core.crisis_conditions(
+        qqq_close=close,
+        qqq_sma_200=sma_200,
+        spy_close=spy_close,
+        spy_sma_200=spy_sma_200,
+        spy_sma_50=spy_sma_50,
+    )
     return canonical_sha256(
         {
-            "semantic_version": "normalized-signal-inputs-v2",
+            "semantic_version": "extreme-bear-normalized-inputs-v3",
             "session": pd.Timestamp(prices.index[-1]).date().isoformat(),
             "qqq_close": round(close, 4),
             "qqq_sma_200": round(sma_200, 4),
             "qqq_sma_50": round(sma_50, 4),
             "qqq_momentum_252": round(momentum_252, 6),
-            "trend_positive": close > sma_200,
+            "spy_close": round(spy_close, 4),
+            "spy_sma_200": round(spy_sma_200, 4),
+            "spy_sma_50": round(spy_sma_50, 4),
+            "extreme_bearish": extreme,
+            "recovery_confirmed": recovery,
         }
     )
 
 
-def _router_state(state: PortfolioState) -> core.EquityRouterState:
-    return core.EquityRouterState(
-        tqqq_active=state.tqqq_active,
-        bullish_streak=state.tqqq_bullish_streak,
+def _hedge_state(state: PortfolioState) -> core.CrisisHedgeState:
+    return core.CrisisHedgeState(
+        btal_active=state.btal_active,
+        entry_streak=state.btal_entry_streak,
+        exit_streak=state.btal_exit_streak,
         last_processed_signal_date=state.last_processed_signal_date,
-        switch_date=state.tqqq_switch_date,
+        switch_date=state.btal_switch_date,
     )
 
 
-def _apply_router(state: PortfolioState, router: core.EquityRouterState) -> None:
+def _apply_hedge(state: PortfolioState, hedge: core.CrisisHedgeState) -> None:
     state.strategy_initialized = True
-    state.tqqq_active = router.tqqq_active
-    state.tqqq_bullish_streak = router.bullish_streak
-    state.last_processed_signal_date = router.last_processed_signal_date
-    state.tqqq_switch_date = router.switch_date
+    state.btal_active = hedge.btal_active
+    state.btal_entry_streak = hedge.entry_streak
+    state.btal_exit_streak = hedge.exit_streak
+    state.last_processed_signal_date = hedge.last_processed_signal_date
+    state.btal_switch_date = hedge.switch_date
 
 
 def _latest_decision(prices: pd.DataFrame, state: PortfolioState) -> StrategyDecision:
     session = pd.Timestamp(prices.index[-1]).normalize()
     qqq = pd.to_numeric(prices[MARKET_INDEX], errors="coerce")
+    spy = pd.to_numeric(prices[CONFIRMATION_INDEX], errors="coerce")
     close = float(qqq.iloc[-1])
     average = float(qqq.iloc[-SMA_WINDOW:].mean())
     short_average = float(qqq.iloc[-SHORT_TREND_WINDOW:].mean())
     momentum = float(close / qqq.iloc[-(MOMENTUM_WINDOW + 1)] - 1.0)
+    spy_close = float(spy.iloc[-1])
+    spy_average = float(spy.iloc[-SMA_WINDOW:].mean())
+    spy_short_average = float(spy.iloc[-SHORT_TREND_WINDOW:].mean())
     if (
-        not all(np.isfinite(value) for value in (close, average, short_average, momentum))
+        not all(
+            np.isfinite(value)
+            for value in (
+                close,
+                average,
+                short_average,
+                momentum,
+                spy_close,
+                spy_average,
+                spy_short_average,
+            )
+        )
         or close <= 0
         or average <= 0
         or short_average <= 0
+        or spy_close <= 0
+        or spy_average <= 0
+        or spy_short_average <= 0
     ):
-        raise RuntimeError("QQQ trend inputs are invalid")
+        raise RuntimeError("Crisis-hedge signal inputs are invalid")
     trend = close > average
-    transition = core.advance_equity_router(
-        _router_state(state), signal_date=session, trend_positive=trend
+    extreme, recovery = core.crisis_conditions(
+        qqq_close=close,
+        qqq_sma_200=average,
+        spy_close=spy_close,
+        spy_sma_200=spy_average,
+        spy_sma_50=spy_short_average,
+    )
+    transition = core.advance_crisis_hedge(
+        _hedge_state(state),
+        signal_date=session,
+        extreme_bearish=extreme,
+        recovery_confirmed=recovery,
     )
     return StrategyDecision(
-        target_weights=target_weights(transition.state.tqqq_active),
-        router_state=transition.state,
+        target_weights=target_weights(transition.state.btal_active),
+        hedge_state=transition.state,
         transition_reason=transition.reason,
         structural_change=transition.structural_change,
         trend_positive=trend,
@@ -947,6 +1009,11 @@ def _latest_decision(prices: pd.DataFrame, state: PortfolioState) -> StrategyDec
         qqq_sma_200=average,
         qqq_sma_50=short_average,
         qqq_momentum_252=momentum,
+        spy_close=spy_close,
+        spy_sma_200=spy_average,
+        spy_sma_50=spy_short_average,
+        extreme_bearish=extreme,
+        recovery_confirmed=recovery,
     )
 
 
@@ -961,7 +1028,7 @@ def calculate_strategy_decision(prices: pd.DataFrame, state: PortfolioState) -> 
         unseen = pd.DatetimeIndex(prices.index[prices.index > prior])
         sessions = unseen if len(unseen) else pd.DatetimeIndex([latest])
     else:
-        sessions = pd.DatetimeIndex(prices.index[-core.BULLISH_ENTRY_CLOSES:])
+        sessions = pd.DatetimeIndex(prices.index[-core.CONFIRMATION_CLOSES:])
     working = copy.deepcopy(state)
     decisions = []
     reasons = []
@@ -970,9 +1037,9 @@ def calculate_strategy_decision(prices: pd.DataFrame, state: PortfolioState) -> 
     for session in sessions:
         history = prices.loc[:session]
         if len(history) < MOMENTUM_WINDOW + 1:
-            raise RuntimeError("Insufficient history for router replay")
+            raise RuntimeError("Insufficient history for crisis-hedge replay")
         decision = _latest_decision(history, working)
-        _apply_router(working, decision.router_state)
+        _apply_hedge(working, decision.hedge_state)
         decisions.append(decision)
         reasons.append(decision.transition_reason)
         dates.append(pd.Timestamp(session).date().isoformat())
@@ -1055,7 +1122,7 @@ def apply_lifecycle_policy(
     )
     return replace(
         decision,
-        target_weights=target_weights(decision.router_state.tqqq_active, selected.stage),
+        target_weights=target_weights(decision.hedge_state.btal_active, selected.stage),
         lifecycle_stage=selected.stage,
         lifecycle_reason=selected.reason,
         estimated_investor_age=selected.estimated_age,
@@ -1267,33 +1334,35 @@ def build_rebalance_plan(
 ) -> RebalancePlan:
     target = _with_cash(decision.target_weights)
     signal_year = date.fromisoformat(
-        decision.router_state.last_processed_signal_date
+        decision.hedge_state.last_processed_signal_date
     ).year
     annual_due = signal_year > state.last_completed_annual_rebalance_year
     strategy_changed = state.executed_strategy_fingerprint != STRATEGY_FINGERPRINT
     lifecycle_changed = state.executed_lifecycle_stage != decision.lifecycle_stage
-    active_ticker = (
-        GROWTH_EQUITY if decision.router_state.tqqq_active else DEFENSIVE_EQUITY
+    tactical_weight = sum(existing.get(ticker, 0.0) for ticker in TACTICAL_TICKERS)
+    tactical_missing = tactical_weight <= 1e-12
+    legacy_position = existing.get(LEGACY_UPRO, 0.0) > 1e-12
+    hedge_misaligned = (
+        decision.hedge_state.btal_active
+        and existing.get(CRISIS_HEDGE, 0.0) <= 1e-12
+    ) or (
+        not decision.hedge_state.btal_active
+        and existing.get(CRISIS_HEDGE, 0.0) > 1e-12
     )
-    inactive_ticker = (
-        DEFENSIVE_EQUITY if decision.router_state.tqqq_active else GROWTH_EQUITY
-    )
-    equity_weight = sum(existing.get(ticker, 0.0) for ticker in EQUITY_TICKERS)
-    equity_missing = equity_weight <= 1e-12
-    router_misaligned = existing.get(inactive_ticker, 0.0) > 1e-12
-    router_changed = equity_missing or router_misaligned
-    full = strategy_changed or lifecycle_changed or annual_due or equity_missing
-    due = full or router_changed
+    full = strategy_changed or lifecycle_changed or annual_due or tactical_missing or legacy_position
+    due = full or hedge_misaligned or decision.structural_change
     if strategy_changed:
         reason = "STRATEGY_REVISION_TRANSITION"
     elif lifecycle_changed:
         reason = "LIFECYCLE_STAGE_ADVANCE"
-    elif equity_missing:
-        reason = "MISSING_EQUITY_POSITION"
+    elif legacy_position:
+        reason = "LEGACY_UPRO_LIQUIDATION"
+    elif tactical_missing:
+        reason = "MISSING_TACTICAL_POSITION"
     elif decision.structural_change:
         reason = decision.transition_reason
-    elif router_misaligned:
-        reason = "EQUITY_ROUTER_REALIGNMENT"
+    elif hedge_misaligned:
+        reason = "CRISIS_HEDGE_REALIGNMENT"
     elif annual_due:
         reason = "ANNUAL_REBALANCE"
     else:
@@ -1302,9 +1371,13 @@ def build_rebalance_plan(
         execution = target
     else:
         execution = dict(existing)
-        equity_weight = sum(execution.pop(ticker, 0.0) for ticker in EQUITY_TICKERS)
-        if equity_weight > 1e-12:
-            execution[active_ticker] = equity_weight
+        tactical_weight = sum(execution.pop(ticker, 0.0) for ticker in TACTICAL_TICKERS)
+        target_tactical = sum(target.get(ticker, 0.0) for ticker in TACTICAL_TICKERS)
+        if tactical_weight > 1e-12 and target_tactical > 1e-12:
+            for ticker in TACTICAL_TICKERS:
+                ratio = target.get(ticker, 0.0) / target_tactical
+                if ratio > 0:
+                    execution[ticker] = tactical_weight * ratio
     components = set(existing) | set(execution)
     one_way = _one_way_turnover(existing, execution, components) if due else 0.0
     orders = _individual_orders(existing, execution, components) if due else 0
@@ -1407,7 +1480,7 @@ def run_strategy(roth_amount: float | None) -> StrategyRun:
     value, planning = resolve_portfolio_value(roth_amount, state, prices)
     decision = calculate_strategy_decision(prices, state)
     decision = apply_lifecycle_policy(decision, state, value, signal_date)
-    _apply_router(planning, decision.router_state)
+    _apply_hedge(planning, decision.hedge_state)
     _apply_lifecycle(planning, decision, signal_date)
     current = existing_weights(planning, prices)
     plan = preserve_pending_delivery_plan(
@@ -1446,7 +1519,7 @@ def _pending_matches(run: StrategyRun) -> bool:
     return (
         bool(state.pending_recommendation_date)
         and state.pending_recommendation_fingerprint == STRATEGY_FINGERPRINT
-        and state.pending_recommendation_tqqq_active == run.decision.router_state.tqqq_active
+        and state.pending_recommendation_btal_active == run.decision.hedge_state.btal_active
         and state.pending_recommendation_lifecycle_stage == run.decision.lifecycle_stage
         and state.pending_recommendation_annual_year
         == run.rebalance_plan.annual_rebalance_year
@@ -1514,7 +1587,7 @@ def request_notification_resend(run: StrategyRun) -> None:
 def _clear_pending(state: PortfolioState) -> None:
     state.pending_recommendation_date = ""
     state.pending_recommendation_weights = {}
-    state.pending_recommendation_tqqq_active = False
+    state.pending_recommendation_btal_active = False
     state.pending_recommendation_lifecycle_stage = ""
     state.pending_recommendation_notified = False
     state.pending_recommendation_supersedes_date = ""
@@ -1535,13 +1608,13 @@ def persist_signal_run(run: StrategyRun) -> None:
     state = run.state
     if not state.shares and state.cash_balance == 0:
         state.cash_balance = run.planning_state.cash_balance
-    _apply_router(state, run.decision.router_state)
+    _apply_hedge(state, run.decision.hedge_state)
     _apply_lifecycle(state, run.decision, run.signal_date)
     state.portfolio_value = round(run.portfolio_value, 2)
     state.last_processed_data_fingerprint = run.market_data_fingerprint
     if run.rebalance_plan.reason == "CONFIRMED_TARGET_STATE":
         state.target_weights = dict(run.rebalance_plan.execution_weights)
-        state.executed_tqqq_active = run.decision.router_state.tqqq_active
+        state.executed_btal_active = run.decision.hedge_state.btal_active
         state.executed_lifecycle_stage = run.decision.lifecycle_stage
         state.executed_strategy_fingerprint = STRATEGY_FINGERPRINT
     save_state(state)
@@ -1554,7 +1627,7 @@ def prepare_notification_delivery(run: StrategyRun, notification: NotificationDe
     if notification.kind in {"ACTION", "UPDATE"}:
         state.pending_recommendation_date = run.signal_date.date().isoformat()
         state.pending_recommendation_weights = dict(run.rebalance_plan.execution_weights)
-        state.pending_recommendation_tqqq_active = run.decision.router_state.tqqq_active
+        state.pending_recommendation_btal_active = run.decision.hedge_state.btal_active
         state.pending_recommendation_lifecycle_stage = run.decision.lifecycle_stage
         state.pending_recommendation_notified = False
         state.pending_recommendation_supersedes_date = (
@@ -1603,8 +1676,9 @@ BENCHMARK_BOOKS = {
         ZROZ: 0.20,
         LEVERAGED_GOLD: 0.20,
     },
-    "permanent_defensive": {
-        DEFENSIVE_EQUITY: 0.40,
+    "permanent_10pct_btal": {
+        GROWTH_EQUITY: 0.30,
+        CRISIS_HEDGE: 0.10,
         DBMF: 0.20,
         ZROZ: 0.20,
         LEVERAGED_GOLD: 0.20,
@@ -1626,10 +1700,14 @@ def build_performance_diagnostics(run: StrategyRun) -> dict[str, object]:
             reference_books=BENCHMARK_BOOKS,
             live_book=LIVE_BOOK,
             index_ticker=MARKET_INDEX,
+            confirmation_ticker=CONFIRMATION_INDEX,
             growth=GROWTH_EQUITY,
-            defensive=DEFENSIVE_EQUITY,
+            hedge=CRISIS_HEDGE,
             cash_proxy=TREASURY_RESERVE,
             sma_window=SMA_WINDOW,
+            short_sma_window=SHORT_TREND_WINDOW,
+            entry_ratio=core.EXTREME_BEAR_RATIO,
+            exit_ratio=core.RECOVERY_RATIO,
             multipliers=ADVERTISED_DAILY_MULTIPLIERS,
             current_weights=run.current_weights,
         )
@@ -1664,13 +1742,19 @@ def build_decision_audit(
             "qqq_close": run.decision.qqq_close,
             "qqq_sma_200": run.decision.qqq_sma_200,
             "trend_positive": run.decision.trend_positive,
-            "tqqq_active": run.decision.router_state.tqqq_active,
-            "bullish_streak": run.decision.router_state.bullish_streak,
+            "btal_active": run.decision.hedge_state.btal_active,
+            "btal_entry_streak": run.decision.hedge_state.entry_streak,
+            "btal_exit_streak": run.decision.hedge_state.exit_streak,
             "transition": run.decision.transition_reason,
             "transition_path": list(run.decision.transition_path),
             "processed_dates": list(run.decision.processed_signal_dates),
             "qqq_sma_50": run.decision.qqq_sma_50,
             "qqq_momentum_252": run.decision.qqq_momentum_252,
+            "spy_close": run.decision.spy_close,
+            "spy_sma_200": run.decision.spy_sma_200,
+            "spy_sma_50": run.decision.spy_sma_50,
+            "extreme_bearish": run.decision.extreme_bearish,
+            "recovery_confirmed": run.decision.recovery_confirmed,
         },
         "portfolio": {
             "value": run.portfolio_value,
@@ -1789,7 +1873,7 @@ def confirm_execution(shares: dict[str, float], cash: float, signal_date: str) -
     state.cash_balance = float(cash)
     if matches:
         state.target_weights = dict(state.pending_recommendation_weights)
-        state.executed_tqqq_active = state.pending_recommendation_tqqq_active
+        state.executed_btal_active = state.pending_recommendation_btal_active
         state.executed_lifecycle_stage = state.pending_recommendation_lifecycle_stage
         state.executed_strategy_fingerprint = state.pending_recommendation_fingerprint
         if state.pending_recommendation_annual_year:
@@ -1797,10 +1881,7 @@ def confirm_execution(shares: dict[str, float], cash: float, signal_date: str) -
         _clear_pending(state)
     else:
         state.target_weights = {}
-        state.executed_tqqq_active = (
-            shares.get(GROWTH_EQUITY, 0.0) > 0
-            and shares.get(DEFENSIVE_EQUITY, 0.0) <= 0
-        )
+        state.executed_btal_active = shares.get(CRISIS_HEDGE, 0.0) > 0
         state.executed_lifecycle_stage = state.lifecycle_stage
         state.executed_strategy_fingerprint = ""
     save_state(state)
@@ -1813,10 +1894,7 @@ def sync_holdings(shares: dict[str, float], cash: float) -> PortfolioState:
         raise RuntimeError("Cannot sync while a recommendation is pending")
     state.shares = dict(shares)
     state.cash_balance = float(cash)
-    state.executed_tqqq_active = (
-        shares.get(GROWTH_EQUITY, 0.0) > 0
-        and shares.get(DEFENSIVE_EQUITY, 0.0) <= 0
-    )
+    state.executed_btal_active = shares.get(CRISIS_HEDGE, 0.0) > 0
     save_state(state)
     return state
 
@@ -1870,11 +1948,12 @@ def disable_contribution_plan() -> PortfolioState:
 
 def log_decision(run: StrategyRun) -> None:
     logger.info(
-        "signal=%s router=%s trend=%s transition=%s lifecycle=%s "
+        "signal=%s hedge=%s extreme=%s recovery=%s transition=%s lifecycle=%s "
         "rebalance=%s reason=%s turnover=%.4f strategy=%s data=%s",
         run.signal_date.date(),
-        GROWTH_EQUITY if run.decision.router_state.tqqq_active else DEFENSIVE_EQUITY,
-        run.decision.trend_positive,
+        "ACTIVE" if run.decision.hedge_state.btal_active else "OFF",
+        run.decision.extreme_bearish,
+        run.decision.recovery_confirmed,
         run.decision.transition_reason,
         run.decision.lifecycle_stage,
         run.rebalance_plan.rebalance_due,
@@ -1893,10 +1972,11 @@ _LIFECYCLE_CEILING_LABEL = {
 _REASON_LABELS = {
     "STRATEGY_REVISION_TRANSITION": "portfolio initialization",
     "LIFECYCLE_STAGE_ADVANCE": "lifecycle risk reduction",
-    "MISSING_EQUITY_POSITION": "equity position missing",
-    "EQUITY_ROUTER_REALIGNMENT": "equity fund needs to be switched",
-    "TREND_SWITCH_TO_TQQQ": "bullish trend confirmed",
-    "TREND_SWITCH_TO_UPRO": "QQQ trend failed",
+    "MISSING_TACTICAL_POSITION": "TQQQ position missing",
+    "CRISIS_HEDGE_REALIGNMENT": "crisis hedge needs to be realigned",
+    "LEGACY_UPRO_LIQUIDATION": "legacy UPRO position must be replaced",
+    "EXTREME_HEDGE_ENTRY": "extreme-bear hedge activated",
+    "EXTREME_HEDGE_EXIT": "market recovery confirmed",
     "ANNUAL_REBALANCE": "annual rebalance",
     "ANNUAL_REVIEW": "annual review complete",
     "CONFIRMED_TARGET_STATE": "confirmed holdings match",
@@ -1939,10 +2019,9 @@ def _contribution_reason(plan: ContributionPlan) -> str:
 def build_dashboard(run: StrategyRun) -> str:
     decision = run.decision
     plan = run.rebalance_plan
-    active_fund = GROWTH_EQUITY if decision.router_state.tqqq_active else DEFENSIVE_EQUITY
-    active_weight = decision.target_weights.get(active_fund, 0.0)
     trend_gap = decision.qqq_close / decision.qqq_sma_200 - 1.0
-    short_status = "above" if decision.qqq_close > decision.qqq_sma_50 else "below"
+    spy_long_gap = decision.spy_close / decision.spy_sma_200 - 1.0
+    spy_short_gap = decision.spy_close / decision.spy_sma_50 - 1.0
     contribution_plan = run.contribution_plan
     contribution_due = contribution_plan.notification_due
     status = "ACTION REQUIRED" if plan.rebalance_due or contribution_due else "NO ACTION"
@@ -1979,7 +2058,12 @@ def build_dashboard(run: StrategyRun) -> str:
         "",
         "TARGET",
         _dashboard_rule(),
-        _dashboard_field("Equity", f"{active_fund} at {active_weight:.0%}"),
+        _dashboard_field(
+            "Crisis hedge",
+            "ACTIVE: TQQQ 30% + BTAL 10%"
+            if decision.hedge_state.btal_active
+            else "OFF: TQQQ 40%",
+        ),
         _dashboard_field(
             "Allocation",
             "  ".join(
@@ -1992,14 +2076,17 @@ def build_dashboard(run: StrategyRun) -> str:
         "SIGNAL",
         _dashboard_rule(),
         _dashboard_field(
-            "Trend",
-            f"QQQ {trend_gap:+.1%} vs 200-day average "
-            f"({'bullish' if decision.trend_positive else 'bearish'})",
+            "QQQ / SMA200",
+            f"{trend_gap:+.1%}  |  hedge entry at -8.0%",
         ),
         _dashboard_field(
-            "Confirmation",
-            f"{short_status} 50-day average  |  "
-            f"12-month momentum {decision.qqq_momentum_252:+.1%}",
+            "SPY confirms",
+            f"{spy_long_gap:+.1%} vs SMA200  |  {spy_short_gap:+.1%} vs SMA50",
+        ),
+        _dashboard_field(
+            "Signal state",
+            f"entry {decision.hedge_state.entry_streak}/2  |  "
+            f"exit {decision.hedge_state.exit_streak}/2",
         ),
         _dashboard_field(
             "Lifecycle",
@@ -2181,8 +2268,7 @@ def build_email_html(run: StrategyRun, notification: NotificationDecision) -> st
     decision = run.decision
     plan = run.rebalance_plan
     visible = _visible_execution_rows(run.execution_table)
-    active = GROWTH_EQUITY if decision.router_state.tqqq_active else DEFENSIVE_EQUITY
-    active_weight = decision.target_weights.get(active, 0.0)
+    hedge_status = "TQQQ 30% + BTAL 10%" if decision.hedge_state.btal_active else "TQQQ 40%"
     status = NOTIFICATION_STATUS_LABELS[notification.kind]
     accent = NOTIFICATION_ACCENTS[notification.kind]
 
@@ -2213,7 +2299,7 @@ def build_email_html(run: StrategyRun, notification: NotificationDecision) -> st
         + _email_metric("Signal close", str(run.signal_date.date()))
         + _email_metric("Account value", f"${run.portfolio_value:,.2f}")
         + "</tr><tr>"
-        + _email_metric("Equity selection", f"{active} at {active_weight:.0%}")
+        + _email_metric("Tactical sleeve", hedge_status)
         + _email_metric("Lifecycle", decision.lifecycle_stage)
         + "</tr>"
     )
@@ -2317,10 +2403,11 @@ def build_email_html(run: StrategyRun, notification: NotificationDecision) -> st
     Why this signal</div>
   <div style="font-size:15px;color:#374151;line-height:1.55">
     QQQ is <strong>{decision.qqq_close / decision.qqq_sma_200 - 1:+.1%}</strong>
-    versus its 200-day average. It is
-    <strong>{'above' if decision.qqq_close > decision.qqq_sma_50 else 'below'}</strong>
-    its 50-day average, with 12-month momentum of
-    <strong>{decision.qqq_momentum_252:+.1%}</strong>.
+    versus its 200-day average (BTAL entry threshold: -8.0%). SPY is
+    <strong>{decision.spy_close / decision.spy_sma_200 - 1:+.1%}</strong>
+    versus its 200-day average and
+    <strong>{decision.spy_close / decision.spy_sma_50 - 1:+.1%}</strong>
+    versus its 50-day average.
   </div>
 </td></tr>
 {contribution_html}
@@ -2393,7 +2480,7 @@ def parse_signal_date(value: str | None) -> str | None:
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="ROTH IRA TQQQ/UPRO allocation engine")
+    parser = argparse.ArgumentParser(description="ROTH IRA TQQQ/BTAL crisis-hedge engine")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--confirm-execution", action="store_true")
     mode.add_argument("--sync-holdings", action="store_true")

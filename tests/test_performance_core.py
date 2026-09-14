@@ -11,8 +11,9 @@ def synthetic_prices(sessions: int = 900, seed: int = 5) -> pd.DataFrame:
     index = pd.bdate_range("2021-01-04", periods=sessions)
     spec = {
         "QQQ": (0.0004, 0.013),
+        "SPY": (0.00035, 0.011),
         "TQQQ": (0.0009, 0.039),
-        "UPRO": (0.0008, 0.030),
+        "BTAL": (-0.00001, 0.009),
         "DBMF": (0.0002, 0.006),
         "ZROZ": (0.0001, 0.012),
         "UGL": (0.0002, 0.019),
@@ -119,9 +120,11 @@ class ReportTests(unittest.TestCase):
                 "permanent_growth": {"TQQQ": .4, "DBMF": .2, "ZROZ": .2, "UGL": .2},
             },
             live_book={"TQQQ": .4, "DBMF": .2, "ZROZ": .2, "UGL": .2},
-            index_ticker="QQQ", growth="TQQQ", defensive="UPRO",
-            cash_proxy="SGOV", sma_window=200,
-            multipliers={"TQQQ": 3.0, "UPRO": 3.0, "UGL": 2.0, "DBMF": 1.0, "ZROZ": 1.0},
+            index_ticker="QQQ", confirmation_ticker="SPY",
+            growth="TQQQ", hedge="BTAL",
+            cash_proxy="SGOV", sma_window=200, short_sma_window=50,
+            entry_ratio=.92, exit_ratio=.98,
+            multipliers={"TQQQ": 3.0, "BTAL": 1.0, "UGL": 2.0, "DBMF": 1.0, "ZROZ": 1.0},
             current_weights={"TQQQ": .4, "DBMF": .2, "ZROZ": .2, "UGL": .2},
         )
         kwargs.update(overrides)
@@ -153,8 +156,10 @@ class ReportTests(unittest.TestCase):
             tiny,
             reference_books={"unlevered_qqq": {"QQQ": 1.0}},
             live_book={"TQQQ": 1.0},
-            index_ticker="QQQ", growth="TQQQ", defensive="UPRO",
-            cash_proxy="SGOV", sma_window=200,
+            index_ticker="QQQ", confirmation_ticker="SPY",
+            growth="TQQQ", hedge="BTAL",
+            cash_proxy="SGOV", sma_window=200, short_sma_window=50,
+            entry_ratio=.92, exit_ratio=.98,
             multipliers={"TQQQ": 3.0}, current_weights={"TQQQ": 1.0},
         )
         self.assertEqual(report.sample_sessions, 0)
@@ -173,9 +178,11 @@ class ReportTests(unittest.TestCase):
                 },
             },
             live_book={"TQQQ": .4, "DBMF": .2, "ZROZ": .2, "UGL": .2},
-            index_ticker="QQQ", growth="TQQQ", defensive="UPRO",
-            cash_proxy="SGOV", sma_window=200,
-            multipliers={"TQQQ": 3.0, "UPRO": 3.0, "UGL": 2.0},
+            index_ticker="QQQ", confirmation_ticker="SPY",
+            growth="TQQQ", hedge="BTAL",
+            cash_proxy="SGOV", sma_window=200, short_sma_window=50,
+            entry_ratio=.92, exit_ratio=.98,
+            multipliers={"TQQQ": 3.0, "BTAL": 1.0, "UGL": 2.0},
             current_weights={"TQQQ": .4, "DBMF": .2, "ZROZ": .2, "UGL": .2},
         )
         self.assertEqual(delayed_proxy.sample_sessions, baseline.sample_sessions)
@@ -191,8 +198,10 @@ class ReportTests(unittest.TestCase):
                 synthetic_prices().drop(columns=["DBMF"]),
                 reference_books={"live": {"TQQQ": .5, "DBMF": .5}},
                 live_book={"TQQQ": .5, "DBMF": .5},
-                index_ticker="QQQ", growth="TQQQ", defensive="UPRO",
-                cash_proxy="SGOV", sma_window=200,
+                index_ticker="QQQ", confirmation_ticker="SPY",
+                growth="TQQQ", hedge="BTAL",
+                cash_proxy="SGOV", sma_window=200, short_sma_window=50,
+                entry_ratio=.92, exit_ratio=.98,
                 multipliers={"TQQQ": 3.0}, current_weights={},
             )
 
