@@ -65,17 +65,19 @@ class StaticEngineTests(unittest.TestCase):
         self.assertFalse(plan.rebalance_due)
         self.assertEqual(plan.reason, "HOLD")
 
-    def test_old_upro_is_explicitly_removed(self):
+    def test_unsupported_holdings_are_rejected(self):
         state = portfolio.PortfolioState(
-            shares={"UPRO": 10.0}, cash_balance=0.0,
+            shares={"TQQQ": 10.0}, cash_balance=0.0,
             last_completed_annual_rebalance_year=2026,
             executed_strategy_fingerprint=portfolio.STRATEGY_FINGERPRINT,
         )
-        current = portfolio.existing_weights(state, prices().assign(UPRO=100.0))
-        decision = portfolio.calculate_strategy_decision(prices().assign(UPRO=100.0), state)
+        current = portfolio.existing_weights(state, prices())
+        decision = portfolio.calculate_strategy_decision(prices(), state)
         plan = portfolio.build_rebalance_plan(current, decision, state)
-        self.assertTrue(plan.rebalance_due)
-        self.assertEqual(plan.execution_weights.get("UPRO", 0.0), 0.0)
+        self.assertFalse(plan.rebalance_due)
+
+        with self.assertRaises(ValueError):
+            portfolio.parse_executed_shares(["SOXL=10", "CASH=0"])
 
     def test_parse_complete_holdings(self):
         shares, cash = portfolio.parse_executed_shares(["TQQQ=1.5", "CASH=20"])
@@ -103,17 +105,17 @@ class StaticEngineTests(unittest.TestCase):
             portfolio.main()
         self.assertFalse(self.state_path.exists())
 
-    def test_migration_preserves_real_holdings_and_forces_revision(self):
+    def test_migration_preserves_supported_holdings_and_forces_revision(self):
         self.state_path.write_text(json.dumps({
             "state_version": 19,
-            "shares": {"UPRO": 2.0},
+            "shares": {"TQQQ": 2.0},
             "cash_balance": 4.0,
             "portfolio_value": 204.0,
             "contribution_plan_year": 0,
         }), encoding="utf-8")
         state = portfolio.load_state()
         self.assertEqual(state.state_version, portfolio.STATE_VERSION)
-        self.assertEqual(state.shares, {"UPRO": 2.0})
+        self.assertEqual(state.shares, {"TQQQ": 2.0})
         self.assertEqual(state.executed_strategy_fingerprint, "")
 
 

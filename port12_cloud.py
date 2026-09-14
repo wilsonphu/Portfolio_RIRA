@@ -31,7 +31,7 @@ import alpha_core as core
 import contribution_core as contribution
 
 
-STRATEGY_REVISION = "static-annual-tqqq35-dbmf25-ugl20-zroz15-btal5-v1"
+STRATEGY_REVISION = "static-annual-tqqq35-dbmf25-ugl20-zroz15-btal5-v2"
 STATE_VERSION = 20
 AUDIT_SCHEMA_VERSION = 12
 MODEL_START_DATE = core.MODEL_HISTORY_START
@@ -48,16 +48,14 @@ TQQQ, DBMF, UGL, ZROZ, BTAL, CASH = (
     core.BTAL,
     core.CASH,
 )
-LEGACY_UPRO = "UPRO"
 TREASURY_RESERVE = "SGOV"
 STRATEGIC_TICKERS = (TQQQ, DBMF, UGL, ZROZ, BTAL)
-VALUATION_TICKERS = (*STRATEGIC_TICKERS, LEGACY_UPRO)
+VALUATION_TICKERS = STRATEGIC_TICKERS
 ALL_TICKERS = STRATEGIC_TICKERS
 TRADED_TICKERS = frozenset(VALUATION_TICKERS)
 PORTFOLIO_COMPONENTS = TRADED_TICKERS | {CASH}
 ADVERTISED_DAILY_MULTIPLIERS = {
     **core.ADVERTISED_DAILY_MULTIPLIERS,
-    LEGACY_UPRO: 3.0,
 }
 
 APP_DIR = Path(__file__).resolve().parent
@@ -181,7 +179,6 @@ def strategy_manifest() -> dict[str, object]:
         "execution": "next-session_manual_orders_then_confirm_holdings",
         "target": core.target_weights(),
         "advertised_daily_exposure": core.advertised_daily_exposure(),
-        "legacy_migration": "UPRO_priceable_and_explicitly_liquidated",
     }
 
 
@@ -315,8 +312,8 @@ def _migrate_state(payload: dict[str, object]) -> PortfolioState:
         executed_strategy_fingerprint="",
     )
     # A strategy revision must produce one clean annual recommendation. Old
-    # pending signal actions are intentionally cleared, while real holdings
-    # (including legacy UPRO) remain priceable and sellable.
+    # pending signal actions are intentionally cleared while real holdings are
+    # preserved.
     return state
 
 
@@ -503,9 +500,9 @@ def build_rebalance_plan(existing: dict[str, float], decision: StaticDecision, s
     annual_due = year > state.last_completed_annual_rebalance_year
     strategy_changed = state.executed_strategy_fingerprint != STRATEGY_FINGERPRINT
     missing = sum(existing.get(ticker, 0.0) for ticker in STRATEGIC_TICKERS) <= 1e-12
-    full = strategy_changed or annual_due or missing or existing.get(LEGACY_UPRO, 0.0) > 1e-12
+    full = strategy_changed or annual_due or missing
     due = full
-    reason = "STRATEGY_REVISION_TRANSITION" if strategy_changed else "ANNUAL_REBALANCE" if annual_due else "MISSING_TACTICAL_POSITION" if missing else "LEGACY_UPRO_LIQUIDATION" if existing.get(LEGACY_UPRO, 0.0) > 1e-12 else "HOLD"
+    reason = "STRATEGY_REVISION_TRANSITION" if strategy_changed else "ANNUAL_REBALANCE" if annual_due else "MISSING_TACTICAL_POSITION" if missing else "HOLD"
     execution = target_with_cash() if due else dict(existing)
     turnover = _one_way_turnover(existing, execution) if due else 0.0
     orders = _individual_orders(existing, execution) if due else 0

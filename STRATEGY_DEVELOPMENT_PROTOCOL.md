@@ -26,8 +26,8 @@ first completed NYSE session of a new calendar year.
 - Missing, stale, partial, zero, infinite, or NaN prices fail closed.
 - State is saved atomically and privately as a workflow artifact.
 - A duplicate run cannot send a duplicate annual recommendation.
-- Legacy UPRO shares remain priceable until explicitly sold during adoption of
-  this static target; no holding is silently discarded.
+- The supported production universe is limited to the five target holdings and
+  CASH; no unused legacy equity sleeve is retained.
 
 ## Contributions
 
