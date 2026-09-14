@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import json
 import logging
 import os
@@ -798,8 +799,85 @@ def build_dashboard(run: StrategyRun) -> str:
 
 
 def build_email_html(run: StrategyRun, notification: NotificationDecision) -> str:
-    dashboard = build_dashboard(run).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    return f"<html><body style='font-family:Arial,sans-serif'><h2>{notification.kind}: Roth IRA static annual update</h2><pre>{dashboard}</pre></body></html>"
+    plan = run.rebalance_plan
+    contribution = run.contribution_plan
+    status_labels = {
+        "ACTION": "ANNUAL ACTION REQUIRED",
+        "UPDATE": "ALLOCATION UPDATE REQUIRED",
+        "ANNUAL_REVIEW": "ANNUAL REVIEW",
+        "CONTRIBUTION": "CONTRIBUTION DUE",
+        "SNAPSHOT": "LIVE DASHBOARD SNAPSHOT",
+        "CANCELLATION": "PREVIOUS ACTION CANCELLED",
+    }
+    accents = {
+        "ACTION": "#b45309", "UPDATE": "#b45309", "ANNUAL_REVIEW": "#15803d",
+        "CONTRIBUTION": "#1d4ed8", "SNAPSHOT": "#2563eb", "CANCELLATION": "#6b7280",
+    }
+    accent = accents.get(notification.kind, "#2563eb")
+    status = status_labels.get(notification.kind, "ROTH IRA UPDATE")
+    cell = "padding:10px 12px;border-bottom:1px solid #e5e7eb;font-size:14px"
+    head = "padding:9px 12px;border-bottom:2px solid #d1d5db;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:#6b7280;font-weight:600"
+
+    def metric(label: str, value: str) -> str:
+        return (
+            '<td style="padding:10px 14px;border:1px solid #e5e7eb;background:#f9fafb;vertical-align:top">'
+            f'<div style="font-size:12px;letter-spacing:.04em;text-transform:uppercase;color:#6b7280">{html.escape(label)}</div>'
+            f'<div style="font-size:16px;color:#111827;padding-top:4px">{html.escape(value)}</div></td>'
+        )
+
+    current_rows = []
+    for ticker in sorted(set(run.planning_state.shares) | {CASH}):
+        if ticker == CASH:
+            units = run.planning_state.cash_balance
+            value = units
+            unit_text = "cash"
+        else:
+            units = run.planning_state.shares.get(ticker, 0.0)
+            value = units * float(run.price_data[ticker].iloc[-1])
+            unit_text = f"{units:,.4f} shares"
+        if units > 1e-12 or value > 0.01:
+            current_rows.append(
+                f'<tr><td style="{cell};font-weight:600;color:#111827">{html.escape(ticker)}</td>'
+                f'<td style="{cell};color:#374151">{unit_text}</td>'
+                f'<td style="{cell};text-align:right;color:#374151">${value:,.2f}</td>'
+                f'<td style="{cell};text-align:right;color:#374151">{run.current_weights.get(ticker, 0.0):.1%}</td></tr>'
+            )
+    current_table = "".join(current_rows)
+    target_table = "".join(
+        f'<tr><td style="{cell};font-weight:600;color:#111827">{ticker}</td>'
+        f'<td style="{cell};text-align:right;font-weight:600;color:#111827">{weight:.0%}</td></tr>'
+        for ticker, weight in core.target_weights().items()
+    )
+    order_rows = "".join(
+        f'<tr><td style="{cell};font-weight:700;color:{"#15803d" if row["Action"] == "BUY" else "#b91c1c"}">{row["Action"]}</td>'
+        f'<td style="{cell};font-weight:600">{row["Ticker"]}</td>'
+        f'<td style="{cell};text-align:right">{row["TargetPct"]:.0%}</td>'
+        f'<td style="{cell};text-align:right">${abs(row["DeltaValue"]):,.2f}</td>'
+        f'<td style="{cell};text-align:right">{abs(row["DeltaUnits"]):,.4f}</td></tr>'
+        for _, row in _visible_rows(run.execution_table).iterrows() if row["Action"] != "HOLD"
+    )
+    if notification.kind == "SNAPSHOT":
+        action_text = "Live dashboard snapshot only. No portfolio state was changed."
+    elif plan.rebalance_due and contribution.notification_due:
+        action_text = f"Deposit ${contribution.due_amount:,.2f}, then place the annual portfolio orders using next-session prices."
+    elif plan.rebalance_due:
+        action_text = "Place the annual portfolio orders using next-session prices, then confirm completed holdings and CASH."
+    elif contribution.notification_due:
+        action_text = f"Deposit ${contribution.due_amount:,.2f} and allocate it to the target percentages."
+    else:
+        action_text = "No portfolio trades are required."
+    orders_html = ""
+    if plan.rebalance_due:
+        orders_html = f'''<tr><td style="padding:0 24px 18px"><div style="font-size:17px;font-weight:700;color:#111827;padding-bottom:9px">Annual orders</div><table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;border:1px solid #e5e7eb"><tr style="background:#f9fafb"><th style="{head};text-align:left">Action</th><th style="{head};text-align:left">Ticker</th><th style="{head};text-align:right">Target</th><th style="{head};text-align:right">Trade value</th><th style="{head};text-align:right">Est. shares</th></tr>{order_rows}</table><div style="font-size:14px;color:#374151;padding-top:9px">Quantities are estimates. Recalculate at execution and confirm full holdings afterward.</div></td></tr>'''
+    contribution_html = ""
+    if contribution.notification_due:
+        contribution_rows = "".join(
+            f'<tr><td style="{cell};font-weight:600">{ticker}</td><td style="{cell};text-align:right">${dollars:,.2f}</td><td style="{cell};text-align:right">{contribution.estimated_units[ticker]:,.4f}</td></tr>'
+            for ticker, dollars in contribution.allocation_dollars.items()
+        )
+        contribution_html = f'''<tr><td style="padding:0 24px 18px"><div style="font-size:17px;font-weight:700;color:#1d4ed8;padding-bottom:8px">Annual contribution: ${contribution.due_amount:,.2f}</div><table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;border:1px solid #e5e7eb"><tr style="background:#f9fafb"><th style="{head};text-align:left">Ticker</th><th style="{head};text-align:right">Buy dollars</th><th style="{head};text-align:right">Est. units</th></tr>{contribution_rows}</table></td></tr>'''
+    metrics = "<tr>" + metric("Completed session", str(run.session_date.date())) + metric("Account value", f"${run.portfolio_value:,.2f}") + "</tr><tr>" + metric("Annual target", "TQQQ 35% / DBMF 25% / UGL 20% / ZROZ 15% / BTAL 5%") + metric("Decision", "Static annual hold") + "</tr>"
+    return f'''<!doctype html><html><body style="margin:0;padding:24px 12px;background:#f3f4f6;font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif"><table width="100%" cellpadding="0" cellspacing="0" style="max-width:720px;margin:0 auto;background:#fff;border:1px solid #e5e7eb"><tr><td style="padding:20px 24px;border-bottom:3px solid {accent}"><div style="font-size:21px;font-weight:600;color:{accent}">{status}</div><div style="font-size:15px;color:#374151;padding-top:5px">{html.escape(plan.reason if plan.rebalance_due else notification.reason)}</div></td></tr><tr><td style="padding:18px 24px 8px"><table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse">{metrics}</table></td></tr><tr><td style="padding:8px 24px 18px"><div style="padding:14px 16px;background:#eff6ff;border-left:4px solid {accent};font-size:16px;color:#111827;line-height:1.55;font-weight:600">{html.escape(action_text)}</div></td></tr><tr><td style="padding:0 24px 18px"><div style="font-size:17px;font-weight:700;color:#111827;padding-bottom:9px">Current holdings</div><table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;border:1px solid #e5e7eb"><tr style="background:#f9fafb"><th style="{head};text-align:left">Ticker</th><th style="{head};text-align:left">Units</th><th style="{head};text-align:right">Value</th><th style="{head};text-align:right">Weight</th></tr>{current_table}</table></td></tr><tr><td style="padding:0 24px 18px"><div style="font-size:17px;font-weight:700;color:#111827;padding-bottom:9px">Target allocation</div><table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;border:1px solid #e5e7eb"><tr style="background:#f9fafb"><th style="{head};text-align:left">Holding</th><th style="{head};text-align:right">Weight</th></tr>{target_table}</table></td></tr>{contribution_html}{orders_html}</table></body></html>'''
 
 
 def notification_subject(run: StrategyRun, notification: NotificationDecision) -> str:

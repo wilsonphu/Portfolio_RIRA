@@ -114,6 +114,9 @@ class StaticEngineTests(unittest.TestCase):
             portfolio.main()
         send_email.assert_called_once()
         self.assertIn("CURRENT HOLDINGS", send_email.call_args.args[1])
+        self.assertIn("Current holdings", send_email.call_args.args[2])
+        self.assertIn("Target allocation", send_email.call_args.args[2])
+        self.assertIn("<table", send_email.call_args.args[2])
         self.assertFalse(self.state_path.exists())
 
     def test_dashboard_shows_current_holdings_and_orders(self):
