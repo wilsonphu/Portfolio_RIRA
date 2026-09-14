@@ -762,6 +762,22 @@ def build_dashboard(run: StrategyRun) -> str:
         f"Status             {status}",
         f"Reason             {plan.reason if plan.rebalance_due else ('ANNUAL CONTRIBUTION' if contribution.notification_due else 'HOLD')}",
         "",
+        "CURRENT HOLDINGS",
+        "-" * 72,
+    ]
+    for ticker in sorted(set(run.planning_state.shares) | {CASH}):
+        if ticker == CASH:
+            units = run.planning_state.cash_balance
+            value = run.planning_state.cash_balance
+        else:
+            units = run.planning_state.shares.get(ticker, 0.0)
+            value = units * float(run.price_data[ticker].iloc[-1])
+        weight = run.current_weights.get(ticker, 0.0)
+        if units > 1e-12 or value > 0.01:
+            unit_label = "cash" if ticker == CASH else f"{units:,.4f} shares"
+            lines.append(f"{ticker:<6} {unit_label:>18}  ${value:>10,.2f}  {weight:>6.1%}")
+    lines += [
+        "",
         "TARGET ALLOCATION",
         "-" * 72,
         "  ".join(f"{ticker} {weight:.0%}" for ticker, weight in core.target_weights().items()),

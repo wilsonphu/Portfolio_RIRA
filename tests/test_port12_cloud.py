@@ -105,6 +105,17 @@ class StaticEngineTests(unittest.TestCase):
             portfolio.main()
         self.assertFalse(self.state_path.exists())
 
+    def test_dashboard_shows_current_holdings_and_orders(self):
+        with patch.object(portfolio, "download_market_data", return_value=prices()), patch.object(
+            portfolio, "ROTH_IRA_AMOUNT", 10000.0
+        ):
+            run = portfolio.run_strategy(10000.0)
+        dashboard = portfolio.build_dashboard(run)
+        self.assertIn("CURRENT HOLDINGS", dashboard)
+        self.assertIn("CASH", dashboard)
+        self.assertIn("ORDERS", dashboard)
+        self.assertIn("TQQQ", dashboard)
+
     def test_migration_preserves_supported_holdings_and_forces_revision(self):
         self.state_path.write_text(json.dumps({
             "state_version": 19,
