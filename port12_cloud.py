@@ -340,6 +340,8 @@ def save_state(state: PortfolioState) -> None:
 
 
 def configure_logging(*, persist_log: bool) -> None:
+    for existing in logger.handlers:
+        existing.close()
     logger.handlers.clear()
     handler: logging.Handler = logging.FileHandler(LOG_FILE) if persist_log else logging.StreamHandler(sys.stdout)
     handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
@@ -838,6 +840,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     mode.add_argument("--configure-contributions", action="store_true")
     mode.add_argument("--disable-contributions", action="store_true")
     mode.add_argument("--send-test-email", action="store_true")
+    mode.add_argument("--send-dashboard-email", action="store_true")
     parser.add_argument("--test", action="store_true", help="Report without persistence or email")
     parser.add_argument("--roth-amount", type=float)
     parser.add_argument("--executed-shares", nargs="+", metavar="TICKER=SHARES")
@@ -857,6 +860,18 @@ def main() -> None:
             parser.error("--send-test-email cannot be combined with other inputs")
         send_test_email()
         print("Test email sent.")
+        return
+    if args.send_dashboard_email:
+        if args.test or any(value is not None for value in (args.executed_signal_date, args.contribution_budget, args.contribution_year)) or args.executed_shares:
+            parser.error("--send-dashboard-email cannot be combined with other inputs")
+        run = run_strategy(args.roth_amount)
+        dashboard = build_dashboard(run)
+        send_email(
+            f"ROTH IRA dashboard snapshot ({run.session_date.date()})",
+            dashboard,
+            build_email_html(run, NotificationDecision("SNAPSHOT", "MANUAL_DASHBOARD_SNAPSHOT")),
+        )
+        print("Dashboard snapshot email sent.")
         return
     try:
         executed_shares, executed_cash = parse_executed_shares(args.executed_shares)

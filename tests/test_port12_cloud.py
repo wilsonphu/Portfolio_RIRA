@@ -105,6 +105,17 @@ class StaticEngineTests(unittest.TestCase):
             portfolio.main()
         self.assertFalse(self.state_path.exists())
 
+    def test_dashboard_snapshot_sends_without_persisting(self):
+        with patch.object(portfolio, "download_market_data", return_value=prices()), patch.object(
+            portfolio, "ROTH_IRA_AMOUNT", 10000.0
+        ), patch.object(portfolio, "send_email") as send_email, patch(
+            "sys.argv", ["port12_cloud.py", "--send-dashboard-email"]
+        ):
+            portfolio.main()
+        send_email.assert_called_once()
+        self.assertIn("CURRENT HOLDINGS", send_email.call_args.args[1])
+        self.assertFalse(self.state_path.exists())
+
     def test_dashboard_shows_current_holdings_and_orders(self):
         with patch.object(portfolio, "download_market_data", return_value=prices()), patch.object(
             portfolio, "ROTH_IRA_AMOUNT", 10000.0
