@@ -1,178 +1,70 @@
-"""Pure signal and allocation rules for the Roth crisis hedge.
-
-This module has no filesystem, network, email, environment, or production
-state side effects. Production and tests import the same state transition.
-"""
+"""Pure rules for the static annual Roth IRA allocation."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-
-import numpy as np
-import pandas as pd
+import math
 
 
-QQQ = "QQQ"
-SPY = "SPY"
 TQQQ = "TQQQ"
-BTAL = "BTAL"
 DBMF = "DBMF"
-ZROZ = "ZROZ"
 UGL = "UGL"
+ZROZ = "ZROZ"
+BTAL = "BTAL"
 CASH = "CASH"
 
-DECISION_SEMANTIC_REVISION = "tqqq40-btal10-extreme-bear-v1"
-MODEL_HISTORY_START = "2010-03-11"
-SMA_WINDOW = 200
-SHORT_SMA_WINDOW = 50
-EXTREME_BEAR_RATIO = 0.92
-RECOVERY_RATIO = 0.98
-CONFIRMATION_CLOSES = 2
-TQQQ_WEIGHT = 0.40
-HEDGED_TQQQ_WEIGHT = 0.30
-BTAL_WEIGHT = 0.10
-DIVERSIFIER_WEIGHT = 0.20
-MAX_ADVERTISED_DAILY_EXPOSURE = 2.00
-HEDGED_ADVERTISED_DAILY_EXPOSURE = 1.80
+DECISION_SEMANTIC_REVISION = "static-annual-tqqq35-dbmf25-ugl20-zroz15-btal5-v1"
+MODEL_HISTORY_START = "2019-01-01"
+
+STATIC_WEIGHTS = {
+    TQQQ: 0.35,
+    DBMF: 0.25,
+    UGL: 0.20,
+    ZROZ: 0.15,
+    BTAL: 0.05,
+}
+
+ADVERTISED_DAILY_MULTIPLIERS = {
+    TQQQ: 3.0,
+    DBMF: 1.0,
+    UGL: 2.0,
+    ZROZ: 1.0,
+    BTAL: 1.0,
+    CASH: 0.0,
+}
 
 
-@dataclass(frozen=True)
-class CrisisHedgeState:
-    """State required for distinct-close BTAL entry and exit confirmation."""
-
-    btal_active: bool = False
-    entry_streak: int = 0
-    exit_streak: int = 0
-    last_processed_signal_date: str = ""
-    switch_date: str = ""
+def target_weights() -> dict[str, float]:
+    """Return a fresh copy of the immutable 35/25/20/15/5 target."""
+    return dict(STATIC_WEIGHTS)
 
 
-@dataclass(frozen=True)
-class CrisisHedgeTransition:
-    state: CrisisHedgeState
-    reason: str
-    structural_change: bool
-
-
-def _strict_bool(value: object, name: str) -> bool:
-    if not isinstance(value, (bool, np.bool_)):
-        raise ValueError(f"{name} must be a boolean")
-    return bool(value)
-
-
-def target_weights(btal_active: bool) -> dict[str, float]:
-    """Return the exact normal or extreme-bear strategic allocation."""
-    hedged = _strict_bool(btal_active, "btal_active")
-    weights = {
-        TQQQ: HEDGED_TQQQ_WEIGHT if hedged else TQQQ_WEIGHT,
-        DBMF: DIVERSIFIER_WEIGHT,
-        ZROZ: DIVERSIFIER_WEIGHT,
-        UGL: DIVERSIFIER_WEIGHT,
-    }
-    if hedged:
-        weights[BTAL] = BTAL_WEIGHT
-    return weights
-
-
-def advertised_daily_exposure(btal_active: bool) -> float:
-    """Return advertised gross daily exposure for the selected hedge state."""
-    hedged = _strict_bool(btal_active, "btal_active")
-    return HEDGED_ADVERTISED_DAILY_EXPOSURE if hedged else MAX_ADVERTISED_DAILY_EXPOSURE
-
-
-def crisis_conditions(
-    *,
-    qqq_close: float,
-    qqq_sma_200: float,
-    spy_close: float,
-    spy_sma_200: float,
-    spy_sma_50: float,
-) -> tuple[bool, bool]:
-    """Return the extreme-entry and recovery-exit conditions."""
-    values = (qqq_close, qqq_sma_200, spy_close, spy_sma_200, spy_sma_50)
-    if not all(
-        not isinstance(value, bool)
-        and isinstance(value, (int, float, np.number))
-        and np.isfinite(value)
-        and value > 0
-        for value in values
-    ):
-        raise ValueError("Crisis-hedge inputs must be positive and finite")
-    extreme = qqq_close <= EXTREME_BEAR_RATIO * qqq_sma_200 and spy_close < spy_sma_200
-    recovery = qqq_close >= RECOVERY_RATIO * qqq_sma_200 and spy_close > spy_sma_50
-    return bool(extreme), bool(recovery)
-
-
-def advance_crisis_hedge(
-    state: CrisisHedgeState,
-    *,
-    signal_date: pd.Timestamp,
-    extreme_bearish: bool,
-    recovery_confirmed: bool,
-    confirmation_closes: int = CONFIRMATION_CLOSES,
-) -> CrisisHedgeTransition:
-    """Process one completed close without same-date double counting.
-
-    BTAL enters only after two distinct extreme-bear closes and exits only
-    after two distinct recovery closes. The conditions use separate asymmetric
-    thresholds, creating an explicit deadband.
-    """
-    if not isinstance(state, CrisisHedgeState):
-        raise ValueError("state must be a CrisisHedgeState")
-    if (
-        not isinstance(confirmation_closes, int)
-        or isinstance(confirmation_closes, bool)
-        or confirmation_closes < 1
-    ):
-        raise ValueError("confirmation_closes must be a positive integer")
-    extreme = _strict_bool(extreme_bearish, "extreme_bearish")
-    recovery = _strict_bool(recovery_confirmed, "recovery_confirmed")
-    session = pd.Timestamp(signal_date).normalize()
-    session_text = session.date().isoformat()
-    if state.last_processed_signal_date:
-        previous = pd.Timestamp(state.last_processed_signal_date).normalize()
-        if previous > session:
-            raise ValueError("Crisis-hedge state is ahead of the signal date")
-        if previous == session:
-            return CrisisHedgeTransition(state, "SAME_DATE", False)
-
-    if state.btal_active:
-        exit_streak = state.exit_streak + 1 if recovery else 0
-        if exit_streak >= confirmation_closes:
-            next_state = replace(
-                state,
-                btal_active=False,
-                entry_streak=0,
-                exit_streak=0,
-                last_processed_signal_date=session_text,
-                switch_date=session_text,
-            )
-            return CrisisHedgeTransition(next_state, "EXTREME_HEDGE_EXIT", True)
-        next_state = replace(
-            state,
-            entry_streak=0,
-            exit_streak=exit_streak,
-            last_processed_signal_date=session_text,
-        )
-        reason = "EXTREME_HEDGE_EXIT_PENDING" if recovery else "EXTREME_HEDGE_HOLD"
-        return CrisisHedgeTransition(next_state, reason, False)
-
-    entry_streak = state.entry_streak + 1 if extreme else 0
-    if entry_streak >= confirmation_closes:
-        next_state = replace(
-            state,
-            btal_active=True,
-            entry_streak=0,
-            exit_streak=0,
-            last_processed_signal_date=session_text,
-            switch_date=session_text,
-        )
-        return CrisisHedgeTransition(next_state, "EXTREME_HEDGE_ENTRY", True)
-    next_state = replace(
-        state,
-        entry_streak=entry_streak,
-        exit_streak=0,
-        last_processed_signal_date=session_text,
+def advertised_daily_exposure(weights: dict[str, float] | None = None) -> float:
+    """Return the advertised gross daily exposure of the supplied allocation."""
+    selected = target_weights() if weights is None else dict(weights)
+    unknown = set(selected) - set(ADVERTISED_DAILY_MULTIPLIERS)
+    if unknown:
+        raise ValueError(f"Unknown exposure components: {sorted(unknown)}")
+    exposure = sum(
+        float(weight) * ADVERTISED_DAILY_MULTIPLIERS[ticker]
+        for ticker, weight in selected.items()
     )
-    reason = "EXTREME_HEDGE_ENTRY_PENDING" if extreme else "TQQQ_HOLD"
-    return CrisisHedgeTransition(next_state, reason, False)
+    if not math.isfinite(exposure):
+        raise ValueError("Advertised exposure is invalid")
+    return float(exposure)
+
+
+def validate_target() -> None:
+    if set(STATIC_WEIGHTS) != {TQQQ, DBMF, UGL, ZROZ, BTAL}:
+        raise RuntimeError("Static target universe is invalid")
+    if not math.isclose(sum(STATIC_WEIGHTS.values()), 1.0, abs_tol=1e-12):
+        raise RuntimeError("Static target must sum to one")
+    if any(
+        not isinstance(weight, (int, float))
+        or isinstance(weight, bool)
+        or not math.isfinite(weight)
+        or weight < 0
+        for weight in STATIC_WEIGHTS.values()
+    ):
+        raise RuntimeError("Static target contains invalid weights")
+    if not math.isclose(advertised_daily_exposure(), 1.90, abs_tol=1e-12):
+        raise RuntimeError("Static target exposure is invalid")

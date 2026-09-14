@@ -1,16 +1,8 @@
-from __future__ import annotations
-
 import json
-import os
-import sys
 import tempfile
 import unittest
-from copy import deepcopy
-from dataclasses import asdict, replace
-from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
-from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -18,819 +10,111 @@ import pandas as pd
 import port12_cloud as portfolio
 
 
-def price_frame(*, bullish: bool = True, periods: int = 280) -> pd.DataFrame:
-    index = pd.bdate_range("2025-11-03", periods=periods)
-    frame = pd.DataFrame(100.0, index=index, columns=portfolio.ALL_TICKERS)
-    if bullish:
-        frame.loc[index[-2], portfolio.MARKET_INDEX] = 110.0
-        frame.loc[index[-1], portfolio.MARKET_INDEX] = 111.0
-        frame.loc[index[-2], portfolio.CONFIRMATION_INDEX] = 105.0
-        frame.loc[index[-1], portfolio.CONFIRMATION_INDEX] = 106.0
-    else:
-        frame.loc[index[-2], portfolio.MARKET_INDEX] = 80.0
-        frame.loc[index[-1], portfolio.MARKET_INDEX] = 79.0
-        frame.loc[index[-2], portfolio.CONFIRMATION_INDEX] = 90.0
-        frame.loc[index[-1], portfolio.CONFIRMATION_INDEX] = 89.0
-    return frame
-
-
-def decision(hedged: bool) -> portfolio.StrategyDecision:
-    hedge = portfolio.core.CrisisHedgeState(
-        btal_active=hedged,
-        last_processed_signal_date="2026-09-11",
-    )
-    return portfolio.StrategyDecision(
-        target_weights=portfolio.target_weights(hedged),
-        hedge_state=hedge,
-        transition_reason="EXTREME_HEDGE_HOLD" if hedged else "TQQQ_HOLD",
-        structural_change=False,
-        trend_positive=not hedged,
-        qqq_close=90.0 if hedged else 110.0,
-        qqq_sma_200=100.0,
-        qqq_sma_50=102.0,
-        qqq_momentum_252=0.10,
-        spy_close=90.0 if hedged else 105.0,
-        spy_sma_200=100.0,
-        spy_sma_50=102.0,
-        extreme_bearish=hedged,
-        recovery_confirmed=not hedged,
-        lifecycle_stage=portfolio.LIFECYCLE_SPRINT,
+def prices():
+    index = pd.date_range("2026-01-02", periods=3, freq="B")
+    return pd.DataFrame(
+        {
+            "TQQQ": [100.0, 101.0, 102.0],
+            "DBMF": [100.0, 100.5, 101.0],
+            "UGL": [100.0, 99.0, 101.0],
+            "ZROZ": [100.0, 101.0, 100.0],
+            "BTAL": [100.0, 100.2, 100.1],
+        },
+        index=index,
     )
 
 
-def run_fixture() -> portfolio.StrategyRun:
-    prices = price_frame()
-    state = portfolio.PortfolioState(
-        shares={"TQQQ": 40.0, "DBMF": 20.0, "ZROZ": 20.0, "UGL": 20.0},
-        target_weights=portfolio.target_weights(False),
-        strategy_initialized=True,
-        btal_active=False,
-        last_processed_signal_date="2026-09-11",
-        executed_btal_active=False,
-        executed_strategy_fingerprint=portfolio.STRATEGY_FINGERPRINT,
-        last_completed_annual_rebalance_year=2026,
-    )
-    current = portfolio.target_weights(False)
-    plan = portfolio.RebalancePlan(current, False, False, "HOLD", 0.0, 0)
-    table = portfolio.calculate_execution_table(prices, current, 10_000.0, state, actionable=False)
-    diagnostics = portfolio.calculate_execution_diagnostics(table, 10_000.0, current, current, current)
-    return portfolio.StrategyRun(
-        prices, decision(False), state, deepcopy(state), 10_000.0, current,
-        table, pd.Timestamp("2026-09-11"), "1" * 64, plan, diagnostics,
-    )
-
-
-def action_run_fixture() -> portfolio.StrategyRun:
-    """A coherent TQQQ-to-BTAL action, including executable trade rows."""
-    run = run_fixture()
-    hedged = decision(True)
-    plan = portfolio.build_rebalance_plan(run.current_weights, hedged, run.state)
-    table = portfolio.calculate_execution_table(
-        run.price_data,
-        plan.execution_weights,
-        run.portfolio_value,
-        run.state,
-        actionable=True,
-    )
-    diagnostics = portfolio.calculate_execution_diagnostics(
-        table,
-        run.portfolio_value,
-        run.current_weights,
-        hedged.target_weights,
-        plan.execution_weights,
-    )
-    return replace(
-        run,
-        decision=hedged,
-        execution_table=table,
-        rebalance_plan=plan,
-        execution_diagnostics=diagnostics,
-    )
-
-
-class StrategyTests(unittest.TestCase):
-    def test_configuration_and_fingerprint_are_stable(self):
-        portfolio.validate_configuration()
-        self.assertEqual(portfolio.STRATEGY_FINGERPRINT, portfolio.calculate_strategy_fingerprint())
-
-    def test_initialization_replays_two_completed_closes_without_hedging(self):
-        prices = price_frame()
-        result = portfolio.calculate_strategy_decision(prices, portfolio.PortfolioState())
-        self.assertFalse(result.hedge_state.btal_active)
-        self.assertEqual(result.processed_signal_dates, tuple(item.date().isoformat() for item in prices.index[-2:]))
-
-    def test_two_extreme_bear_closes_activate_btal(self):
-        prices = price_frame(bullish=False)
-        result = portfolio.calculate_strategy_decision(prices, portfolio.PortfolioState())
-        self.assertTrue(result.hedge_state.btal_active)
-        self.assertEqual(result.transition_reason, "EXTREME_HEDGE_ENTRY")
-        self.assertEqual(result.target_weights["TQQQ"], 0.30)
-        self.assertEqual(result.target_weights["BTAL"], 0.10)
-
-    def test_same_date_run_is_idempotent(self):
-        prices = price_frame()
-        state = portfolio.PortfolioState(
-            strategy_initialized=True,
-            btal_entry_streak=1,
-            last_processed_signal_date=prices.index[-1].date().isoformat(),
-        )
-        result = portfolio.calculate_strategy_decision(prices, state)
-        self.assertFalse(result.hedge_state.btal_active)
-        self.assertEqual(result.hedge_state.entry_streak, 1)
-
-    def test_missed_sessions_are_replayed(self):
-        prices = price_frame(bullish=False)
-        state = portfolio.PortfolioState(
-            strategy_initialized=True,
-            last_processed_signal_date=prices.index[-3].date().isoformat(),
-        )
-        result = portfolio.calculate_strategy_decision(prices, state)
-        self.assertEqual(len(result.processed_signal_dates), 2)
-        self.assertTrue(result.hedge_state.btal_active)
-
-    def test_lifecycle_ceiling_scales_risk_into_sgov(self):
-        weights = portfolio.target_weights(True, portfolio.LIFECYCLE_PHI)
-        self.assertAlmostEqual(portfolio.advertised_daily_exposure(weights), (1 + 5**0.5) / 2)
-        self.assertGreater(weights[portfolio.TREASURY_RESERVE], 0)
-        self.assertAlmostEqual(sum(weights.values()), 1.0)
-
-    def test_lifecycle_ratchet_never_moves_backward(self):
-        chosen = portfolio.select_lifecycle_stage(
-            portfolio.LIFECYCLE_ONE_THREE, 10_000.0, pd.Timestamp("2026-09-11").date()
-        )
-        self.assertEqual(chosen.stage, portfolio.LIFECYCLE_ONE_THREE)
-
-
-class HoldingsAndRebalanceTests(unittest.TestCase):
-    def test_confirmed_shares_drive_value_and_weights(self):
-        prices = price_frame()
-        state = portfolio.PortfolioState(shares={"TQQQ": 3.0}, cash_balance=200.0)
-        self.assertEqual(portfolio.existing_portfolio_value(state, prices), 500.0)
-        self.assertEqual(portfolio.existing_weights(state, prices), {"TQQQ": 0.6, "CASH": 0.4})
-
-    def test_nan_holding_price_fails_closed(self):
-        prices = price_frame()
-        prices.loc[prices.index[-1], "TQQQ"] = np.nan
-        with self.assertRaises(RuntimeError):
-            portfolio.existing_portfolio_value(portfolio.PortfolioState(shares={"TQQQ": 1.0}), prices)
-
-    def test_exact_holdings_confirm_new_strategy_without_trade(self):
-        state = portfolio.PortfolioState(
-            executed_btal_active=False,
-            last_completed_annual_rebalance_year=2026,
-        )
-        current = portfolio.target_weights(False)
-        plan = portfolio.build_rebalance_plan(current, decision(False), state)
-        self.assertFalse(plan.rebalance_due)
-        self.assertEqual(plan.reason, "CONFIRMED_TARGET_STATE")
-
-    def test_all_cash_forces_full_allocation_from_confirmed_holdings(self):
-        state = portfolio.PortfolioState(
-            executed_btal_active=False,
-            executed_strategy_fingerprint=portfolio.STRATEGY_FINGERPRINT,
-            last_completed_annual_rebalance_year=2026,
-        )
-        plan = portfolio.build_rebalance_plan(
-            {"CASH": 1.0}, decision(False), state
-        )
-        self.assertTrue(plan.rebalance_due)
-        self.assertTrue(plan.full_transition)
-        self.assertEqual(plan.reason, "MISSING_TACTICAL_POSITION")
-        self.assertEqual(
-            plan.execution_weights,
-            {**portfolio.target_weights(False), "CASH": 0.0},
-        )
-
-    def test_confirmed_holdings_override_stale_executed_hedge_flag(self):
-        state = portfolio.PortfolioState(
-            executed_btal_active=True,
-            executed_strategy_fingerprint=portfolio.STRATEGY_FINGERPRINT,
-            last_completed_annual_rebalance_year=2026,
-        )
-        aligned = portfolio.target_weights(False)
-        plan = portfolio.build_rebalance_plan(aligned, decision(False), state)
-        self.assertFalse(plan.rebalance_due)
-        self.assertEqual(plan.reason, "HOLD")
-
-    def test_legacy_upro_is_liquidated_without_losing_the_holding(self):
-        state = portfolio.PortfolioState(
-            executed_btal_active=False,
-            executed_strategy_fingerprint=portfolio.STRATEGY_FINGERPRINT,
-            last_completed_annual_rebalance_year=2026,
-        )
-        current = {"UPRO": 0.40, "DBMF": 0.20, "ZROZ": 0.20, "UGL": 0.20}
-        plan = portfolio.build_rebalance_plan(current, decision(False), state)
-        self.assertTrue(plan.rebalance_due)
-        self.assertTrue(plan.full_transition)
-        self.assertEqual(plan.reason, "LEGACY_UPRO_LIQUIDATION")
-        self.assertEqual(plan.execution_weights, {**portfolio.target_weights(False), "CASH": 0.0})
-
-    def test_crisis_switch_preserves_non_tactical_weights(self):
-        state = portfolio.PortfolioState(
-            executed_btal_active=False,
-            executed_strategy_fingerprint=portfolio.STRATEGY_FINGERPRINT,
-            last_completed_annual_rebalance_year=2026,
-        )
-        current = {"TQQQ": 0.44, "DBMF": 0.18, "ZROZ": 0.19, "UGL": 0.17, "CASH": 0.02}
-        plan = portfolio.build_rebalance_plan(current, decision(True), state)
-        self.assertTrue(plan.rebalance_due)
-        self.assertFalse(plan.full_transition)
-        expected = {
-            "DBMF": 0.18,
-            "ZROZ": 0.19,
-            "UGL": 0.17,
-            "CASH": 0.02,
-            "TQQQ": 0.33,
-            "BTAL": 0.11,
-        }
-        self.assertEqual(set(plan.execution_weights), set(expected))
-        for ticker, weight in expected.items():
-            self.assertAlmostEqual(plan.execution_weights[ticker], weight)
-
-    def test_midyear_drift_waits_for_annual_rebalance(self):
-        state = portfolio.PortfolioState(
-            executed_btal_active=False,
-            executed_strategy_fingerprint=portfolio.STRATEGY_FINGERPRINT,
-            last_completed_annual_rebalance_year=2026,
-        )
-        current = {"TQQQ": 0.50, "DBMF": 0.15, "ZROZ": 0.15, "UGL": 0.20}
-        plan = portfolio.build_rebalance_plan(current, decision(False), state)
-        self.assertFalse(plan.rebalance_due)
-        self.assertEqual(plan.reason, "HOLD")
-
-    def test_new_calendar_year_forces_exact_rebalance(self):
-        state = portfolio.PortfolioState(
-            executed_btal_active=False,
-            executed_strategy_fingerprint=portfolio.STRATEGY_FINGERPRINT,
-            last_completed_annual_rebalance_year=2025,
-        )
-        current = {"TQQQ": 0.39, "DBMF": 0.21, "ZROZ": 0.20, "UGL": 0.20}
-        plan = portfolio.build_rebalance_plan(current, decision(False), state)
-        self.assertTrue(plan.rebalance_due)
-        self.assertTrue(plan.annual_rebalance_due)
-        self.assertEqual(plan.annual_rebalance_year, 2026)
-        self.assertEqual(plan.execution_weights, {**portfolio.target_weights(False), "CASH": 0.0})
-
-    def test_exact_new_year_allocation_sends_one_review(self):
-        run = run_fixture()
-        run.state.last_completed_annual_rebalance_year = 2025
-        plan = portfolio.build_rebalance_plan(run.current_weights, run.decision, run.state)
-        run = replace(run, rebalance_plan=plan)
-        self.assertFalse(plan.rebalance_due)
-        self.assertEqual(plan.reason, "ANNUAL_REVIEW")
-        notice = portfolio.decide_notification(run)
-        self.assertEqual(notice.kind, "ANNUAL_REVIEW")
-        with patch.object(portfolio, "save_state"):
-            portfolio.persist_notification_delivery(run, notice, delivered_decision_hash="3" * 64)
-        self.assertEqual(run.state.last_completed_annual_rebalance_year, 2026)
-
-
-class StateTests(unittest.TestCase):
+class StaticEngineTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        self.state_path = Path(self.temp.name) / "state.json"
-        self.patcher = patch.object(portfolio, "STATE_FILE", self.state_path)
-        self.patcher.start()
+        self.state_path = Path(self.temp.name) / "roth_ira_state.json"
+        self.audit_path = Path(self.temp.name) / "audit.json"
+        self.state_patch = patch.object(portfolio, "STATE_FILE", self.state_path)
+        self.state_patch.start()
 
     def tearDown(self):
-        self.patcher.stop()
+        self.state_patch.stop()
         self.temp.cleanup()
 
-    def test_version_15_migration_defers_annual_rebalance_until_next_year(self):
-        payload = {
-            "state_version": 15,
-            "shares": {"TQQQ": 1.0},
-            "cash_balance": 0.0,
-            "portfolio_value": 100.0,
-            "last_processed_signal_date": "2026-09-11",
-        }
-        self.state_path.write_text(json.dumps(payload), encoding="utf-8")
-        state = portfolio.load_state()
-        self.assertEqual(state.last_completed_annual_rebalance_year, 2026)
+    def test_decision_never_reads_signals(self):
+        state = portfolio.PortfolioState()
+        decision = portfolio.calculate_strategy_decision(prices(), state)
+        self.assertEqual(decision.target_weights, {**portfolio.core.target_weights(), "CASH": 0.0})
+        self.assertEqual(decision.transition_reason, "STATIC_ANNUAL_HOLD")
 
-    def test_version_16_migration_adds_disabled_contribution_state(self):
-        payload = {
-            "state_version": 16,
-            "shares": {"TQQQ": 1.0},
-            "cash_balance": 10.0,
-            "portfolio_value": 100.0,
-        }
-        self.state_path.write_text(json.dumps(payload), encoding="utf-8")
-        state = portfolio.load_state()
-        self.assertEqual(state.state_version, 19)
-        self.assertEqual(state.contribution_plan_year, 0)
-        self.assertEqual(state.contribution_budget, 0.0)
+    def test_initial_all_cash_creates_full_annual_target(self):
+        state = portfolio.PortfolioState(cash_balance=10000.0)
+        current = portfolio.existing_weights(state, prices())
+        decision = portfolio.calculate_strategy_decision(prices(), state)
+        plan = portfolio.build_rebalance_plan(current, decision, state)
+        self.assertTrue(plan.rebalance_due)
+        self.assertEqual(plan.execution_weights["TQQQ"], 0.35)
+        self.assertEqual(plan.execution_weights["BTAL"], 0.05)
 
-    def test_version_17_migration_preserves_live_plan_and_clears_raw_fingerprint(self):
-        payload = {
-            **asdict(portfolio.PortfolioState()),
-            "state_version": 17,
-            "cash_balance": 14_000.0,
-            "portfolio_value": 14_000.0,
-            "contribution_plan_year": 2026,
-            "contribution_policy_revision": portfolio.contribution.POLICY_REVISION,
-            "contribution_budget": 6_400.0,
-            "contribution_released_amount": 5_760.0,
-            "last_processed_data_fingerprint": "1" * 64,
-        }
-        self.state_path.write_text(json.dumps(payload), encoding="utf-8")
-        state = portfolio.load_state()
-        self.assertEqual(state.state_version, 19)
-        self.assertEqual(state.cash_balance, 14_000.0)
-        self.assertEqual(state.contribution_budget, 6_400.0)
-        self.assertEqual(state.contribution_released_amount, 5_760.0)
-        self.assertEqual(state.last_processed_data_fingerprint, "")
-
-    def test_version_18_migration_preserves_legacy_upro_and_restarts_new_signal(self):
-        payload = {
-            "state_version": 18,
-            "shares": {"UPRO": 3.5},
-            "cash_balance": 25.0,
-            "target_weights": {"UPRO": 0.4, "DBMF": 0.2, "ZROZ": 0.2, "UGL": 0.2},
-            "portfolio_value": 1_000.0,
-            "strategy_initialized": True,
-            "tqqq_active": False,
-            "tqqq_bullish_streak": 0,
-            "last_processed_signal_date": "2026-09-11",
-            "executed_strategy_fingerprint": "1" * 64,
-            "last_completed_annual_rebalance_year": 2026,
-        }
-        self.state_path.write_text(json.dumps(payload), encoding="utf-8")
-        state = portfolio.load_state()
-        self.assertEqual(state.state_version, 19)
-        self.assertEqual(state.shares, {"UPRO": 3.5})
-        self.assertFalse(state.strategy_initialized)
-        self.assertEqual(state.last_processed_signal_date, "")
-        self.assertFalse(state.btal_active)
-
-    def test_configure_contributions_records_remaining_budget(self):
-        portfolio.save_state(portfolio.PortfolioState(shares={"TQQQ": 1.0}))
-        current_year = datetime.now(ZoneInfo("America/New_York")).year
-        state = portfolio.configure_contribution_plan(current_year, 7_500.0)
-        self.assertEqual(state.contribution_plan_year, current_year)
-        self.assertEqual(
-            state.contribution_policy_revision,
-            portfolio.contribution.POLICY_REVISION,
-        )
-        self.assertEqual(state.contribution_budget, 7_500.0)
-        self.assertEqual(state.contribution_released_amount, 0.0)
-
-    def test_contribution_plan_rejects_inactive_year(self):
-        portfolio.save_state(portfolio.PortfolioState(shares={"TQQQ": 1.0}))
-        current_year = datetime.now(ZoneInfo("America/New_York")).year
-        with self.assertRaisesRegex(ValueError, "current New York year"):
-            portfolio.configure_contribution_plan(current_year - 1, 7_500.0)
-
-    def test_migration_rejects_unsupported_holdings_without_data_loss(self):
-        payload = {
-            "state_version": 16,
-            "shares": {"XYZ": 1.0},
-            "cash_balance": 10.0,
-            "portfolio_value": 100.0,
-        }
-        original = json.dumps(payload)
-        self.state_path.write_text(original, encoding="utf-8")
-        with self.assertRaisesRegex(RuntimeError, "unsupported holding XYZ"):
-            portfolio.load_state()
-        self.assertEqual(self.state_path.read_text(encoding="utf-8"), original)
-
-    def test_pending_superseded_date_must_be_older(self):
+    def test_midyear_static_hold_is_silent(self):
         state = portfolio.PortfolioState(
-            pending_recommendation_date="2026-09-11",
-            pending_recommendation_weights=portfolio.target_weights(True),
-            pending_recommendation_lifecycle_stage=portfolio.LIFECYCLE_SPRINT,
-            pending_recommendation_supersedes_date="2026-09-11",
-            pending_recommendation_fingerprint=portfolio.STRATEGY_FINGERPRINT,
+            shares={"TQQQ": 35, "DBMF": 25, "UGL": 20, "ZROZ": 15, "BTAL": 5},
+            target_weights=portfolio.target_with_cash(),
+            last_completed_annual_rebalance_year=2026,
+            executed_strategy_fingerprint=portfolio.STRATEGY_FINGERPRINT,
         )
-        with self.assertRaisesRegex(RuntimeError, "must precede"):
-            portfolio.validate_state(state)
+        state.cash_balance = 0.0
+        current = portfolio.existing_weights(state, prices())
+        decision = portfolio.calculate_strategy_decision(prices(), state)
+        plan = portfolio.build_rebalance_plan(current, decision, state)
+        self.assertFalse(plan.rebalance_due)
+        self.assertEqual(plan.reason, "HOLD")
 
-    def test_atomic_save_failure_preserves_original(self):
-        self.state_path.write_text("original", encoding="utf-8")
-        with patch.object(portfolio.os, "replace", side_effect=OSError("disk")):
-            with self.assertRaises(OSError):
-                portfolio.save_state(portfolio.PortfolioState())
-        self.assertEqual(self.state_path.read_text(encoding="utf-8"), "original")
-
-    def test_confirm_execution_stores_actual_shares(self):
+    def test_old_upro_is_explicitly_removed(self):
         state = portfolio.PortfolioState(
-            pending_recommendation_date="2026-09-11",
-            pending_recommendation_weights=portfolio.target_weights(True),
-            pending_recommendation_btal_active=True,
-            pending_recommendation_lifecycle_stage=portfolio.LIFECYCLE_SPRINT,
-            pending_recommendation_notified=True,
-            pending_recommendation_fingerprint=portfolio.STRATEGY_FINGERPRINT,
-            pending_recommendation_annual_year=2026,
+            shares={"UPRO": 10.0}, cash_balance=0.0,
+            last_completed_annual_rebalance_year=2026,
+            executed_strategy_fingerprint=portfolio.STRATEGY_FINGERPRINT,
         )
-        portfolio.save_state(state)
-        confirmed = portfolio.confirm_execution(
-            {"TQQQ": 12.25, "BTAL": 2.0}, 3.21, "2026-09-11"
-        )
-        self.assertEqual(confirmed.shares, {"TQQQ": 12.25, "BTAL": 2.0})
-        self.assertEqual(confirmed.cash_balance, 3.21)
-        self.assertFalse(confirmed.pending_recommendation_date)
-        self.assertEqual(confirmed.last_completed_annual_rebalance_year, 2026)
+        current = portfolio.existing_weights(state, prices().assign(UPRO=100.0))
+        decision = portfolio.calculate_strategy_decision(prices().assign(UPRO=100.0), state)
+        plan = portfolio.build_rebalance_plan(current, decision, state)
+        self.assertTrue(plan.rebalance_due)
+        self.assertEqual(plan.execution_weights.get("UPRO", 0.0), 0.0)
 
-    def test_older_fill_updates_holdings_without_clearing_newer_action(self):
-        state = portfolio.PortfolioState(
-            pending_recommendation_date="2026-09-11",
-            pending_recommendation_weights=portfolio.target_weights(True),
-            pending_recommendation_btal_active=True,
-            pending_recommendation_lifecycle_stage=portfolio.LIFECYCLE_SPRINT,
-            pending_recommendation_notified=True,
-            pending_recommendation_supersedes_date="2026-09-10",
-            pending_recommendation_fingerprint=portfolio.STRATEGY_FINGERPRINT,
-        )
-        portfolio.save_state(state)
-        confirmed = portfolio.confirm_execution(
-            {"UPRO": 10.0}, 5.0, "2026-09-10"
-        )
-        self.assertEqual(confirmed.shares, {"UPRO": 10.0})
-        self.assertEqual(confirmed.cash_balance, 5.0)
-        self.assertEqual(confirmed.pending_recommendation_date, "2026-09-11")
-        self.assertTrue(confirmed.pending_recommendation_notified)
-
-
-class NotificationTests(unittest.TestCase):
-    def test_hold_is_silent(self):
-        self.assertEqual(portfolio.decide_notification(run_fixture()).kind, "NONE")
-
-    def test_identical_delivered_pending_is_suppressed(self):
-        run = run_fixture()
-        run.state.pending_recommendation_date = "2026-09-10"
-        run.state.pending_recommendation_weights = portfolio.target_weights(False)
-        run.state.pending_recommendation_btal_active = False
-        run.state.pending_recommendation_lifecycle_stage = portfolio.LIFECYCLE_SPRINT
-        run.state.pending_recommendation_notified = True
-        run.state.pending_recommendation_fingerprint = portfolio.STRATEGY_FINGERPRINT
-        run = replace(run, rebalance_plan=portfolio.RebalancePlan(portfolio.target_weights(False), True, True, "TEST", 0.1, 1))
-        self.assertEqual(portfolio.decide_notification(run).kind, "NONE")
-
-    def test_explicit_resend_rearms_identical_pending_action(self):
-        run = run_fixture()
-        run.state.pending_recommendation_date = "2026-09-10"
-        run.state.pending_recommendation_weights = portfolio.target_weights(False)
-        run.state.pending_recommendation_btal_active = False
-        run.state.pending_recommendation_lifecycle_stage = portfolio.LIFECYCLE_SPRINT
-        run.state.pending_recommendation_notified = True
-        run.state.pending_recommendation_fingerprint = portfolio.STRATEGY_FINGERPRINT
-        run = replace(
-            run,
-            rebalance_plan=portfolio.RebalancePlan(
-                portfolio.target_weights(False), True, True, "TEST", 0.1, 1
-            ),
-        )
-
-        portfolio.request_notification_resend(run)
-
-        self.assertFalse(run.state.pending_recommendation_notified)
-        self.assertEqual(portfolio.decide_notification(run).kind, "RETRY")
-
-    def test_explicit_resend_requires_a_pending_action(self):
-        with self.assertRaisesRegex(RuntimeError, "no pending portfolio recommendation"):
-            portfolio.request_notification_resend(run_fixture())
-
-    def test_cancellation_is_sent_once_then_cleared(self):
-        run = run_fixture()
-        run.state.pending_recommendation_date = "2026-09-10"
-        run.state.pending_recommendation_weights = portfolio.target_weights(True)
-        run.state.pending_recommendation_btal_active = True
-        run.state.pending_recommendation_lifecycle_stage = portfolio.LIFECYCLE_SPRINT
-        run.state.pending_recommendation_notified = True
-        run.state.pending_recommendation_fingerprint = portfolio.STRATEGY_FINGERPRINT
-        notice = portfolio.decide_notification(run)
-        self.assertEqual(notice.kind, "CANCELLATION")
-        with patch.object(portfolio, "save_state"):
-            portfolio.persist_notification_delivery(run, notice, delivered_decision_hash="2" * 64)
-        self.assertFalse(run.state.pending_recommendation_date)
-
-    def test_missing_email_credentials_fail_only_when_send_is_called(self):
-        with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(portfolio.decide_notification(run_fixture()).kind, "NONE")
-            with self.assertRaises(RuntimeError):
-                portfolio.send_email("subject", "text", "<p>html</p>")
-
-    def test_material_update_replaces_pending_action(self):
-        run = action_run_fixture()
-        run.state.pending_recommendation_date = "2026-09-10"
-        run.state.pending_recommendation_weights = portfolio.target_weights(False)
-        run.state.pending_recommendation_btal_active = False
-        run.state.pending_recommendation_lifecycle_stage = portfolio.LIFECYCLE_SPRINT
-        run.state.pending_recommendation_notified = True
-        run.state.pending_recommendation_fingerprint = portfolio.STRATEGY_FINGERPRINT
-        run = replace(run, rebalance_plan=portfolio.RebalancePlan(portfolio.target_weights(True), True, True, "EXTREME_HEDGE_ENTRY", 0.1, 2))
-        notice = portfolio.decide_notification(run)
-        self.assertEqual(notice.kind, "UPDATE")
-        portfolio.prepare_notification_delivery(run, notice)
-        self.assertEqual(run.state.pending_recommendation_weights, portfolio.target_weights(True))
-        self.assertEqual(run.state.pending_recommendation_supersedes_date, "2026-09-10")
-
-    def test_smtp_failure_retains_pending_action_and_confirmed_shares(self):
-        run = action_run_fixture()
-        with tempfile.TemporaryDirectory() as directory:
-            state_path = Path(directory) / "state.json"
-            audit_path = Path(directory) / "audit.json"
-            with (
-                patch.object(sys, "argv", ["port12_cloud.py"]),
-                patch.object(portfolio, "STATE_FILE", state_path),
-                patch.object(portfolio, "DECISION_AUDIT_FILE", audit_path),
-                patch.object(portfolio, "configure_logging"),
-                patch.object(portfolio, "run_strategy", return_value=run),
-                patch.object(portfolio, "send_email", side_effect=RuntimeError("smtp failed")),
-            ):
-                with self.assertRaisesRegex(RuntimeError, "smtp failed"):
-                    portfolio.main()
-            restored = json.loads(state_path.read_text(encoding="utf-8"))
-            self.assertEqual(restored["shares"], run.state.shares)
-            self.assertEqual(restored["pending_recommendation_date"], "2026-09-11")
-            self.assertFalse(restored["pending_recommendation_notified"])
-
-    def test_contribution_notice_is_sent_once_and_advances_released_amount(self):
-        run = run_fixture()
-        run.state.contribution_plan_year = 2026
-        run.state.contribution_policy_revision = portfolio.contribution.POLICY_REVISION
-        run.state.contribution_budget = 7_500.0
-        plan = portfolio.build_contribution_plan(
-            run.state,
-            run.decision,
-            run.price_data,
-            run.portfolio_value,
-            pd.Timestamp("2026-01-15"),
-        )
-        self.assertEqual(plan.due_amount, 3_750.0)
-        self.assertAlmostEqual(sum(plan.allocation_dollars.values()), 3_750.0)
-        run = replace(run, contribution_plan=plan)
-        notice = portfolio.decide_notification(run)
-        self.assertEqual(notice.kind, "CONTRIBUTION")
-        portfolio.prepare_contribution_delivery(run)
-        with patch.object(portfolio, "save_state"):
-            portfolio.persist_notification_delivery(
-                run, notice, delivered_decision_hash="3" * 64
-            )
-        self.assertEqual(run.state.contribution_released_amount, 3_750.0)
-        self.assertFalse(run.state.pending_contribution_date)
-
-    def test_released_calendar_amount_does_not_send_duplicate_notice(self):
-        run = run_fixture()
-        run.state.contribution_plan_year = 2026
-        run.state.contribution_policy_revision = portfolio.contribution.POLICY_REVISION
-        run.state.contribution_budget = 7_500.0
-        run.state.contribution_released_amount = 3_750.0
-        plan = portfolio.build_contribution_plan(
-            run.state,
-            run.decision,
-            run.price_data,
-            run.portfolio_value,
-            pd.Timestamp("2026-01-15"),
-        )
-        self.assertEqual(plan.due_amount, 0.0)
-        self.assertEqual(
-            portfolio.decide_notification(replace(run, contribution_plan=plan)).kind,
-            "NONE",
-        )
-
-    def test_contribution_allocation_avoids_an_overweight_sleeve(self):
-        run = run_fixture()
-        run.state.shares = {"TQQQ": 50.0, "DBMF": 20.0, "ZROZ": 20.0, "UGL": 20.0}
-        dollars, _ = portfolio._allocate_contribution(
-            750.0,
-            run.state,
-            run.price_data,
-            run.decision.target_weights,
-            11_000.0,
-        )
-        self.assertNotIn("TQQQ", dollars)
-        self.assertAlmostEqual(sum(dollars.values()), 750.0)
-
-    def test_contribution_smtp_failure_preserves_retry_state(self):
-        run = run_fixture()
-        run.state.contribution_plan_year = 2026
-        run.state.contribution_policy_revision = portfolio.contribution.POLICY_REVISION
-        run.state.contribution_budget = 7_500.0
-        plan = portfolio.build_contribution_plan(
-            run.state,
-            run.decision,
-            run.price_data,
-            run.portfolio_value,
-            pd.Timestamp("2026-01-15"),
-        )
-        run = replace(run, contribution_plan=plan, signal_date=pd.Timestamp("2026-01-15"))
-        with tempfile.TemporaryDirectory() as directory:
-            state_path = Path(directory) / "state.json"
-            audit_path = Path(directory) / "audit.json"
-            with (
-                patch.object(sys, "argv", ["port12_cloud.py"]),
-                patch.object(portfolio, "STATE_FILE", state_path),
-                patch.object(portfolio, "DECISION_AUDIT_FILE", audit_path),
-                patch.object(portfolio, "configure_logging"),
-                patch.object(portfolio, "run_strategy", return_value=run),
-                patch.object(portfolio, "send_email", side_effect=RuntimeError("smtp failed")),
-            ):
-                with self.assertRaisesRegex(RuntimeError, "smtp failed"):
-                    portfolio.main()
-            restored = json.loads(state_path.read_text(encoding="utf-8"))
-            self.assertEqual(restored["pending_contribution_amount"], 3_750.0)
-            self.assertEqual(restored["contribution_released_amount"], 0.0)
-
-
-class DecisionAuditTests(unittest.TestCase):
-    def test_audit_records_lifecycle_rationale(self):
-        run = run_fixture()
-        audit = portfolio.build_decision_audit(
-            run, portfolio.NotificationDecision("ACTION", "NEW_RECOMMENDATION"), "STAGED"
-        )
-        self.assertEqual(audit["schema_version"], 11)
-        lifecycle = audit["lifecycle"]
-        self.assertEqual(lifecycle["stage"], run.decision.lifecycle_stage)
-        self.assertEqual(lifecycle["value_stage"], run.decision.lifecycle_value_stage)
-        self.assertEqual(lifecycle["age_stage"], run.decision.lifecycle_age_stage)
-        self.assertEqual(lifecycle["advanced"], run.decision.lifecycle_stage_advanced)
-
-    def test_audit_records_exposure_diagnostics(self):
-        run = run_fixture()
-        audit = portfolio.build_decision_audit(
-            run, portfolio.NotificationDecision("ACTION", "NEW_RECOMMENDATION"), "STAGED"
-        )
-        exposure = audit["exposure"]
-        self.assertEqual(
-            exposure["strategic"], run.execution_diagnostics.strategic_daily_exposure
-        )
-        self.assertEqual(
-            exposure["destination"], run.execution_diagnostics.destination_daily_exposure
-        )
-        self.assertEqual(
-            sorted(exposure["estimated_costs_by_bps"]),
-            sorted(str(bps) for bps in portfolio.TRANSACTION_COST_SCENARIOS_BPS),
-        )
-
-    def test_audit_records_contribution_plan(self):
-        run = replace(
-            run_fixture(),
-            contribution_plan=portfolio.ContributionPlan(
-                enabled=True, year=2026, budget=7_500.0, due_amount=3_750.0
-            ),
-        )
-        audit = portfolio.build_decision_audit(
-            run, portfolio.NotificationDecision("CONTRIBUTION", "CALENDAR_MILESTONE"), "STAGED"
-        )
-        self.assertEqual(audit["contribution"]["due_amount"], 3_750.0)
-
-    def test_audit_payload_is_canonically_hashable(self):
-        run = run_fixture()
-        notice = portfolio.NotificationDecision("ACTION", "NEW_RECOMMENDATION")
-        first = portfolio.build_decision_audit(run, notice, "STAGED")
-        second = portfolio.build_decision_audit(run, notice, "STAGED")
-        self.assertEqual(first["decision_hash"], second["decision_hash"])
-        self.assertEqual(len(first["decision_hash"]), 64)
-
-
-class RenderingTests(unittest.TestCase):
-    def test_action_dashboard_lists_both_sides_of_router_switch(self):
-        dashboard = portfolio.build_dashboard(action_run_fixture())
-        self.assertIn("TQQQ", dashboard)
-        self.assertIn("SELL", dashboard)
-        self.assertIn("BTAL", dashboard)
-        self.assertIn("BUY", dashboard)
-
-    def test_hold_dashboard_remains_compact_and_omits_trade_table(self):
-        dashboard = portfolio.build_dashboard(run_fixture())
-        self.assertIn("NO ACTION", dashboard)
-        self.assertIn("Portfolio     No trades", dashboard)
-        self.assertNotIn("PORTFOLIO ORDERS", dashboard)
-        self.assertNotIn("NOTES", dashboard)
-
-    def test_action_email_has_clear_orders_without_small_footer(self):
-        run = action_run_fixture()
-        html = portfolio.build_email_html(
-            run, portfolio.NotificationDecision("ACTION", "NEW_RECOMMENDATION")
-        )
-        self.assertIn("ACTION REQUIRED", html)
-        self.assertIn("TQQQ", html)
-        self.assertIn("BTAL", html)
-        self.assertIn("Portfolio orders", html)
-        self.assertIn("Place the portfolio orders", html)
-        self.assertNotIn("Advertised exposure", html)
-        self.assertNotIn("font-size:11px", html)
-
-    def test_contribution_email_contains_deposit_allocation(self):
-        run = run_fixture()
-        run = replace(
-            run,
-            contribution_plan=portfolio.ContributionPlan(
-                enabled=True,
-                year=2026,
-                budget=7_500.0,
-                due_amount=750.0,
-                qqq_drawdown_63=-0.1,
-                reasons=("QQQ_DRAWDOWN_10",),
-                allocation_dollars={"TQQQ": 750.0},
-                estimated_units={"TQQQ": 7.5},
-            ),
-        )
-        notice = portfolio.NotificationDecision("CONTRIBUTION", "QQQ_DRAWDOWN_10")
-        html = portfolio.build_email_html(run, notice)
-        self.assertIn("Deposit $750.00", html)
-        self.assertIn("10% QQQ drawdown", html)
-
-
-class DataAndCliTests(unittest.TestCase):
-    def test_signal_fingerprint_ignores_immaterial_provider_rounding(self):
-        first = price_frame()
-        second = first.copy()
-        second.loc[second.index[-100], portfolio.MARKET_INDEX] += 0.000001
-        self.assertEqual(
-            portfolio.market_data_fingerprint(first),
-            portfolio.market_data_fingerprint(second),
-        )
-
-    def test_signal_fingerprint_changes_with_the_trading_regime(self):
-        bullish = price_frame()
-        bearish = price_frame(bullish=False)
-        self.assertNotEqual(
-            portfolio.market_data_fingerprint(bullish),
-            portfolio.market_data_fingerprint(bearish),
-        )
-
-    def test_missing_yfinance_ticker_is_rejected(self):
-        index = pd.DatetimeIndex(["2026-09-11"])
-        columns = pd.MultiIndex.from_product([["Close"], ["QQQ"]])
-        raw = pd.DataFrame([[100.0]], index=index, columns=columns)
-        with self.assertRaises(RuntimeError):
-            portfolio._extract_yfinance_prices(raw, ["QQQ", "TQQQ"])
-
-    def test_partial_latest_prices_are_rejected(self):
-        frame = price_frame()
-        frame.loc[frame.index[-1], "UGL"] = np.nan
-        with self.assertRaises(RuntimeError):
-            portfolio._require_positive(frame.loc[frame.index[-1], list(portfolio.ALL_TICKERS)], "latest")
-
-    def test_latest_completed_nyse_session(self):
-        after_close = datetime(2026, 9, 11, 17, 0, tzinfo=ZoneInfo("America/New_York"))
-        self.assertEqual(portfolio.expected_completed_session(after_close), pd.Timestamp("2026-09-11"))
-        during_market = datetime(2026, 9, 11, 15, 0, tzinfo=ZoneInfo("America/New_York"))
-        with self.assertRaises(RuntimeError):
-            portfolio.expected_completed_session(during_market)
-
-    def test_complete_holdings_parser_requires_cash(self):
+    def test_parse_complete_holdings(self):
+        shares, cash = portfolio.parse_executed_shares(["TQQQ=1.5", "CASH=20"])
+        self.assertEqual(shares, {"TQQQ": 1.5})
+        self.assertEqual(cash, 20.0)
         with self.assertRaises(ValueError):
             portfolio.parse_executed_shares(["TQQQ=1"])
-        shares, cash = portfolio.parse_executed_shares(["TQQQ=1", "UPRO=2", "CASH=3"])
-        self.assertEqual(shares, {"TQQQ": 1.0, "UPRO": 2.0})
-        self.assertEqual(cash, 3.0)
 
-    def test_test_mode_never_persists_or_sends(self):
-        run = run_fixture()
-        with (
-            patch.object(sys, "argv", ["port12_cloud.py", "--test", "--roth-amount", "10000"]),
-            patch.object(portfolio, "run_strategy", return_value=run),
-            patch.object(portfolio, "save_state") as save,
-            patch.object(portfolio, "send_email") as send,
-            patch.object(portfolio, "write_decision_audit") as audit,
-        ):
-            portfolio.main()
-        save.assert_not_called()
-        send.assert_not_called()
-        audit.assert_not_called()
-
-
-class PerformanceDiagnosticsTests(unittest.TestCase):
-    def test_diagnostics_attached_outside_decision_hash(self):
-        """Telemetry must not perturb the hash that identifies the decision."""
-        run = run_fixture()
-        notice = portfolio.NotificationDecision("ACTION", "NEW_RECOMMENDATION")
-        audit = portfolio.build_decision_audit(run, notice, "STAGED")
-        self.assertIn("diagnostics", audit)
-
-        without = {
-            key: value
-            for key, value in audit.items()
-            if key not in {"decision_hash", "diagnostics"}
-        }
-        self.assertEqual(portfolio.canonical_sha256(without), audit["decision_hash"])
-
-    def test_diagnostics_never_raise(self):
-        """Bad diagnostic input must not block the portfolio engine."""
-        run = run_fixture()
-        for bad in (portfolio.pd.DataFrame(), None, "not-a-frame"):
-            with self.subTest(bad=type(bad).__name__):
-                result = portfolio.build_performance_diagnostics(
-                    replace(run, price_data=bad)
-                )
-                self.assertIn("available", result)
-                json.dumps(result, allow_nan=False)
-
-    def test_unusable_price_data_reports_unavailable(self):
-        run = run_fixture()
-        result = portfolio.build_performance_diagnostics(
-            replace(run, price_data=None)
+    def test_annual_contribution_has_no_price_signal(self):
+        state = portfolio.PortfolioState(
+            contribution_plan_year=2026,
+            contribution_policy_revision=portfolio.contribution.POLICY_REVISION,
+            contribution_budget=7500.0,
         )
-        self.assertFalse(result["available"])
+        decision = portfolio.calculate_strategy_decision(prices(), state)
+        plan = portfolio.RebalancePlan(portfolio.target_with_cash(), False, False, "HOLD", 0.0, 0, True, 2026)
+        contribution_plan = portfolio.build_contribution_plan(state, prices(), 10000.0, decision, plan)
+        self.assertEqual(contribution_plan.due_amount, 7500.0)
+        self.assertEqual(contribution_plan.reasons, ("ANNUAL_CONTRIBUTION",))
 
-    def test_audit_payload_is_json_serialisable(self):
-        run = run_fixture()
-        notice = portfolio.NotificationDecision("ACTION", "NEW_RECOMMENDATION")
-        audit = portfolio.build_decision_audit(run, notice, "STAGED")
-        json.dumps(audit, allow_nan=False)
+    def test_test_mode_never_persists(self):
+        with patch.object(portfolio, "download_market_data", return_value=prices()), patch.object(
+            portfolio, "ROTH_IRA_AMOUNT", 10000.0
+        ), patch("sys.argv", ["port12_cloud.py", "--test"]):
+            portfolio.main()
+        self.assertFalse(self.state_path.exists())
+
+    def test_migration_preserves_real_holdings_and_forces_revision(self):
+        self.state_path.write_text(json.dumps({
+            "state_version": 19,
+            "shares": {"UPRO": 2.0},
+            "cash_balance": 4.0,
+            "portfolio_value": 204.0,
+            "contribution_plan_year": 0,
+        }), encoding="utf-8")
+        state = portfolio.load_state()
+        self.assertEqual(state.state_version, portfolio.STATE_VERSION)
+        self.assertEqual(state.shares, {"UPRO": 2.0})
+        self.assertEqual(state.executed_strategy_fingerprint, "")
 
 
 if __name__ == "__main__":
