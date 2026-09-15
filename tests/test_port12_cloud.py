@@ -42,6 +42,49 @@ class StaticEngineTests(unittest.TestCase):
         self.assertEqual(decision.target_weights, {**portfolio.core.target_weights(), "CASH": 0.0})
         self.assertEqual(decision.transition_reason, "STATIC_ANNUAL_HOLD")
 
+    def test_market_download_retries_partial_result_without_threads(self):
+        expected = pd.Timestamp("2026-01-06")
+        tickers = list(portfolio.ALL_TICKERS)
+        raw = pd.DataFrame(
+            [[100.0] * len(tickers)],
+            index=pd.DatetimeIndex([expected]),
+            columns=pd.MultiIndex.from_product([["Close"], tickers]),
+        )
+        partial = raw.copy()
+        partial.loc[expected, ("Close", "UGL")] = np.nan
+        with patch.object(
+            portfolio, "expected_completed_session", return_value=expected
+        ), patch(
+            "yfinance.download",
+            side_effect=[partial, raw],
+        ) as download:
+            result = portfolio.download_market_data(tickers)
+
+        self.assertEqual(download.call_count, 2)
+        self.assertFalse(download.call_args.kwargs["threads"])
+        pd.testing.assert_frame_equal(result, raw["Close"])
+
+    def test_market_download_fails_closed_after_partial_results(self):
+        expected = pd.Timestamp("2026-01-06")
+        tickers = list(portfolio.ALL_TICKERS)
+        partial = pd.DataFrame(
+            [[100.0] * (len(tickers) - 1) + [np.nan]],
+            index=pd.DatetimeIndex([expected]),
+            columns=pd.MultiIndex.from_product([["Close"], tickers]),
+        )
+        with patch.object(
+            portfolio, "MARKET_DATA_DOWNLOAD_ATTEMPTS", 2
+        ), patch.object(
+            portfolio, "expected_completed_session", return_value=expected
+        ), patch(
+            "yfinance.download", return_value=partial
+        ) as download, self.assertRaisesRegex(
+            RuntimeError, "Market data download failed after 2 attempts"
+        ):
+            portfolio.download_market_data(tickers)
+
+        self.assertEqual(download.call_count, 2)
+
     def test_initial_all_cash_creates_full_annual_target(self):
         state = portfolio.PortfolioState(cash_balance=10000.0)
         current = portfolio.existing_weights(state, prices())
