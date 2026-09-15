@@ -48,9 +48,10 @@ on:
         type: string
 
   schedule:
-    # Run at 4:25 PM New York time, Monday through Friday.
+    # Run at 6:30 PM New York time, Monday through Friday, after daily bars
+    # have had time to publish through the market-data provider.
     # The engine independently verifies exchange sessions and completed daily bars.
-    - cron: "25 16 * * 1-5"
+    - cron: "30 18 * * 1-5"
       timezone: "America/New_York"
 
 permissions:
