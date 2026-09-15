@@ -35,10 +35,10 @@ import contribution_core as contribution
 STRATEGY_REVISION = "static-annual-tqqq35-dbmf25-ugl20-zroz15-btal5-v2"
 STATE_VERSION = 20
 AUDIT_SCHEMA_VERSION = 12
-MODEL_START_DATE = core.MODEL_HISTORY_START
 NEW_YORK = ZoneInfo("America/New_York")
 MARKET_CLOSE_BUFFER_MINUTES = 15
 MARKET_DATA_DOWNLOAD_ATTEMPTS = 3
+VALUATION_LOOKBACK_DAYS = 14
 NOTIFICATION_WEIGHT_TOLERANCE = 0.005
 TRANSACTION_COST_SCENARIOS_BPS = (5, 10, 25)
 
@@ -345,7 +345,7 @@ def configure_logging(*, persist_log: bool) -> None:
     for existing in logger.handlers:
         existing.close()
     logger.handlers.clear()
-    handler: logging.Handler = logging.FileHandler(LOG_FILE) if persist_log else logging.StreamHandler(sys.stdout)
+    handler: logging.Handler = logging.FileHandler(LOG_FILE, mode="w") if persist_log else logging.StreamHandler(sys.stdout)
     handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
     logger.addHandler(handler)
 
@@ -393,48 +393,85 @@ def _extract_yfinance_prices(data: pd.DataFrame, tickers: Iterable[str]) -> pd.D
     return prices
 
 
+def _validate_latest_prices(
+    prices: pd.DataFrame,
+    requested: list[str],
+    expected: pd.Timestamp,
+) -> pd.DataFrame:
+    received = pd.Timestamp(prices.index[-1]).normalize()
+    if received != expected:
+        raise RuntimeError(
+            f"Market data is stale: expected {expected.date()}, received {received.date()}"
+        )
+    latest = prices.loc[received, requested]
+    invalid = [
+        ticker
+        for ticker, value in latest.items()
+        if not np.isfinite(float(value)) or float(value) <= 0
+    ]
+    if invalid:
+        raise RuntimeError(f"Latest valuation price is missing or invalid for: {', '.join(invalid)}")
+    return prices
+
+
+def _download_request(yf: object, tickers: str | list[str], expected: pd.Timestamp) -> pd.DataFrame:
+    return yf.download(
+        tickers,
+        start=(expected.date() - timedelta(days=VALUATION_LOOKBACK_DAYS)).isoformat(),
+        end=(expected.date() + timedelta(days=1)).isoformat(),
+        auto_adjust=True,
+        progress=False,
+        threads=False,
+    )
+
+
+def _download_tickers_individually(
+    yf: object,
+    requested: list[str],
+    expected: pd.Timestamp,
+) -> pd.DataFrame:
+    columns = []
+    for ticker in requested:
+        raw = _download_request(yf, ticker, expected)
+        prices = _extract_yfinance_prices(raw, [ticker])
+        columns.append(_validate_latest_prices(prices, [ticker], expected)[ticker])
+    combined = pd.concat(columns, axis=1, join="inner").sort_index()
+    combined.columns = requested
+    return _validate_latest_prices(combined, requested, expected)
+
+
 def download_market_data(tickers: Iterable[str] = ALL_TICKERS, *, now_new_york: datetime | None = None) -> pd.DataFrame:
     import yfinance as yf
 
     expected = expected_completed_session(now_new_york)
     requested = list(dict.fromkeys(tickers))
+    if not requested:
+        raise RuntimeError("At least one valuation ticker is required")
     last_error: Exception | None = None
     for attempt in range(1, MARKET_DATA_DOWNLOAD_ATTEMPTS + 1):
         try:
-            # yfinance's threaded workers share a SQLite-backed cache. GitHub-hosted
-            # runners have intermittently raised "database is locked" while those
-            # workers initialize it, leaving one ticker full of NaNs. Downloading this
-            # five-ticker universe sequentially avoids that concurrency failure.
-            raw = yf.download(
-                requested,
-                start=MODEL_START_DATE,
-                end=(expected.date() + timedelta(days=1)).isoformat(),
-                auto_adjust=True,
-                progress=False,
-                threads=False,
-            )
+            # Disable yfinance's shared-cache worker threads; they have intermittently
+            # locked SQLite on GitHub-hosted runners and returned partially blank rows.
+            raw = _download_request(yf, requested, expected)
             prices = _extract_yfinance_prices(raw, requested)
-            received = pd.Timestamp(prices.index[-1]).normalize()
-            if received != expected:
-                raise RuntimeError(
-                    f"Market data is stale: expected {expected.date()}, received {received.date()}"
-                )
-            latest = prices.loc[received, requested]
-            if not np.isfinite(latest.to_numpy(dtype=float)).all() or not (latest > 0).all():
-                raise RuntimeError("Latest valuation prices contain missing or invalid values")
-            return prices
+            return _validate_latest_prices(prices, requested, expected)
         except Exception as exc:
             last_error = exc
             logger.warning(
-                "Market-data attempt %d/%d failed: %s",
+                "Bulk market-data attempt %d/%d failed: %s",
                 attempt,
                 MARKET_DATA_DOWNLOAD_ATTEMPTS,
                 exc,
             )
 
-    raise RuntimeError(
-        f"Market data download failed after {MARKET_DATA_DOWNLOAD_ATTEMPTS} attempts"
-    ) from last_error
+    logger.warning("Bulk market-data download exhausted; retrying each ticker independently")
+    try:
+        return _download_tickers_individually(yf, requested, expected)
+    except Exception as exc:
+        raise RuntimeError(
+            "Market data download failed in both bulk and individual modes; "
+            f"bulk error: {last_error}; individual error: {exc}"
+        ) from exc
 
 
 def market_data_fingerprint(prices: pd.DataFrame) -> str:

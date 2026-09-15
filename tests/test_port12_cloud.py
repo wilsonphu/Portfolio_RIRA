@@ -79,11 +79,42 @@ class StaticEngineTests(unittest.TestCase):
         ), patch(
             "yfinance.download", return_value=partial
         ) as download, self.assertRaisesRegex(
-            RuntimeError, "Market data download failed after 2 attempts"
+            RuntimeError, "failed in both bulk and individual modes"
         ):
             portfolio.download_market_data(tickers)
 
-        self.assertEqual(download.call_count, 2)
+        self.assertEqual(download.call_count, 2 + len(tickers))
+
+    def test_market_download_recovers_with_individual_tickers(self):
+        expected = pd.Timestamp("2026-01-06")
+        tickers = list(portfolio.ALL_TICKERS)
+        partial = pd.DataFrame(
+            [[100.0] * (len(tickers) - 1) + [np.nan]],
+            index=pd.DatetimeIndex([expected]),
+            columns=pd.MultiIndex.from_product([["Close"], tickers]),
+        )
+
+        def download(requested, **_kwargs):
+            if isinstance(requested, list):
+                return partial
+            return pd.DataFrame(
+                [[100.0]],
+                index=pd.DatetimeIndex([expected]),
+                columns=pd.MultiIndex.from_product([["Close"], [requested]]),
+            )
+
+        with patch.object(
+            portfolio, "MARKET_DATA_DOWNLOAD_ATTEMPTS", 2
+        ), patch.object(
+            portfolio, "expected_completed_session", return_value=expected
+        ), patch(
+            "yfinance.download", side_effect=download
+        ) as market_download:
+            result = portfolio.download_market_data(tickers)
+
+        self.assertEqual(market_download.call_count, 2 + len(tickers))
+        self.assertEqual(list(result.columns), tickers)
+        self.assertTrue((result.iloc[-1] == 100.0).all())
 
     def test_initial_all_cash_creates_full_annual_target(self):
         state = portfolio.PortfolioState(cash_balance=10000.0)
@@ -172,6 +203,19 @@ class StaticEngineTests(unittest.TestCase):
         self.assertIn("CASH", dashboard)
         self.assertIn("ORDERS", dashboard)
         self.assertIn("TQQQ", dashboard)
+
+    def test_unavailable_dashboard_uses_professional_layout(self):
+        state = portfolio.PortfolioState(cash_balance=10000.0, portfolio_value=10000.0)
+        text_body, html_body = portfolio.build_unavailable_dashboard(
+            state, "Latest completed prices are temporarily unavailable"
+        )
+
+        self.assertIn("NO TRADES RECOMMENDED", text_body)
+        self.assertIn("ROTH IRA DASHBOARD", html_body)
+        self.assertIn("Persisted holdings", html_body)
+        self.assertIn("Target allocation", html_body)
+        self.assertIn("TQQQ", html_body)
+        self.assertIn("max-width:720px", html_body)
 
     def test_migration_preserves_supported_holdings_and_forces_revision(self):
         self.state_path.write_text(json.dumps({
