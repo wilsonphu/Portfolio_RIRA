@@ -847,19 +847,29 @@ def build_unavailable_dashboard(state: PortfolioState, reason: str) -> tuple[str
         "",
         "No prices or orders were used. Retry the dashboard after the market-data provider publishes a completed session.",
     ])
-    html_body = (
-        "<!doctype html><html><body style=\"font-family:Arial,sans-serif;padding:24px;color:#111827\">"
-        "<h2 style=\"color:#b45309\">ROTH IRA dashboard</h2>"
-        "<p><strong>Valuation unavailable — no trades recommended.</strong></p>"
-        f"<p>Last recorded portfolio value: ${state.portfolio_value:,.2f}</p>"
-        f"<p style=\"color:#92400e\">{html.escape(reason)}</p>"
-        "<h3>Persisted holdings</h3><pre>"
-        f"{html.escape(holdings_text)}"
-        "</pre><h3>Target allocation</h3><p>"
-        f"{html.escape(target_text)}"
-        "</p><p>No prices or orders were used. Retry after the data provider publishes a completed session.</p>"
-        "</body></html>"
+    cell = "padding:10px 12px;border-bottom:1px solid #e5e7eb;font-size:14px"
+    head = "padding:9px 12px;border-bottom:2px solid #d1d5db;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:#6b7280;font-weight:600"
+    current_rows = []
+    for ticker in sorted(set(state.shares) | {CASH}):
+        units = state.cash_balance if ticker == CASH else state.shares.get(ticker, 0.0)
+        if units <= 1e-12:
+            continue
+        unit_text = "cash" if ticker == CASH else f"{units:,.4f} shares"
+        current_rows.append(
+            f'<tr><td style="{cell};font-weight:600;color:#111827">{html.escape(ticker)}</td>'
+            f'<td style="{cell};color:#374151">{html.escape(unit_text)}</td>'
+            f'<td style="{cell};text-align:right;color:#6b7280">Unavailable</td>'
+            f'<td style="{cell};text-align:right;color:#6b7280">Unavailable</td></tr>'
+        )
+    current_rows_html = "".join(current_rows) or (
+        f'<tr><td colspan="4" style="{cell};color:#6b7280">No persisted holdings found</td></tr>'
     )
+    target_rows_html = "".join(
+        f'<tr><td style="{cell};font-weight:600;color:#111827">{html.escape(ticker)}</td>'
+        f'<td style="{cell};text-align:right;color:#374151">{weight:.0%}</td></tr>'
+        for ticker, weight in core.target_weights().items()
+    )
+    html_body = f'''<!doctype html><html><body style="margin:0;padding:24px 12px;background:#f3f4f6;font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif"><table width="100%" cellpadding="0" cellspacing="0" style="max-width:720px;margin:0 auto;background:#fff;border:1px solid #e5e7eb"><tr><td style="padding:20px 24px;border-bottom:3px solid #b45309"><div style="font-size:21px;font-weight:600;color:#b45309">ROTH IRA DASHBOARD</div><div style="font-size:15px;color:#374151;padding-top:5px">Valuation unavailable — no trades recommended</div></td></tr><tr><td style="padding:18px 24px 8px"><table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse"><tr><td style="padding:10px 14px;border:1px solid #e5e7eb;background:#f9fafb;vertical-align:top"><div style="font-size:12px;letter-spacing:.04em;text-transform:uppercase;color:#6b7280">Last recorded value</div><div style="font-size:16px;color:#111827;padding-top:4px">${state.portfolio_value:,.2f}</div></td><td style="padding:10px 14px;border:1px solid #e5e7eb;background:#f9fafb;vertical-align:top"><div style="font-size:12px;letter-spacing:.04em;text-transform:uppercase;color:#6b7280">Decision</div><div style="font-size:16px;color:#111827;padding-top:4px">No trades</div></td></tr></table></td></tr><tr><td style="padding:8px 24px 18px"><div style="padding:14px 16px;background:#fffbeb;border-left:4px solid #b45309;font-size:15px;color:#92400e;line-height:1.55;font-weight:600">{html.escape(reason)}<br><span style="font-weight:400;color:#374151">No prices, orders, or portfolio-state changes were used.</span></div></td></tr><tr><td style="padding:0 24px 18px"><div style="font-size:17px;font-weight:700;color:#111827;padding-bottom:9px">Persisted holdings</div><table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;border:1px solid #e5e7eb"><tr style="background:#f9fafb"><th style="{head};text-align:left">Ticker</th><th style="{head};text-align:left">Units</th><th style="{head};text-align:right">Value</th><th style="{head};text-align:right">Weight</th></tr>{current_rows_html}</table></td></tr><tr><td style="padding:0 24px 18px"><div style="font-size:17px;font-weight:700;color:#111827;padding-bottom:9px">Target allocation</div><table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;border:1px solid #e5e7eb"><tr style="background:#f9fafb"><th style="{head};text-align:left">Holding</th><th style="{head};text-align:right">Weight</th></tr>{target_rows_html}</table></td></tr><tr><td style="padding:0 24px 24px;font-size:13px;color:#6b7280">Retry the live dashboard after the market-data provider publishes a completed session.</td></tr></table></body></html>'''
     return text_body, html_body
 
 
