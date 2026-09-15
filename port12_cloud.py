@@ -820,6 +820,49 @@ def build_dashboard(run: StrategyRun) -> str:
     return "\n".join(lines)
 
 
+def build_unavailable_dashboard(state: PortfolioState, reason: str) -> tuple[str, str]:
+    """Build a read-only snapshot when the explicit dashboard request has no valid bar."""
+    holdings = []
+    for ticker in sorted(set(state.shares) | {CASH}):
+        units = state.cash_balance if ticker == CASH else state.shares.get(ticker, 0.0)
+        if units > 1e-12:
+            label = "cash" if ticker == CASH else f"{units:,.4f} shares"
+            holdings.append(f"{ticker:<6} {label:>18}")
+    holdings_text = "\n".join(holdings) if holdings else "(No persisted holdings found)"
+    target_text = "  ".join(f"{ticker} {weight:.0%}" for ticker, weight in core.target_weights().items())
+    text_body = "\n".join([
+        "ROTH IRA DASHBOARD SNAPSHOT",
+        "VALUATION UNAVAILABLE - NO TRADES RECOMMENDED",
+        "",
+        f"Last recorded portfolio value  ${state.portfolio_value:,.2f}",
+        f"Data warning                  {reason}",
+        "",
+        "PERSISTED HOLDINGS",
+        "-" * 72,
+        holdings_text,
+        "",
+        "TARGET ALLOCATION",
+        "-" * 72,
+        target_text,
+        "",
+        "No prices or orders were used. Retry the dashboard after the market-data provider publishes a completed session.",
+    ])
+    html_body = (
+        "<!doctype html><html><body style=\"font-family:Arial,sans-serif;padding:24px;color:#111827\">"
+        "<h2 style=\"color:#b45309\">ROTH IRA dashboard</h2>"
+        "<p><strong>Valuation unavailable — no trades recommended.</strong></p>"
+        f"<p>Last recorded portfolio value: ${state.portfolio_value:,.2f}</p>"
+        f"<p style=\"color:#92400e\">{html.escape(reason)}</p>"
+        "<h3>Persisted holdings</h3><pre>"
+        f"{html.escape(holdings_text)}"
+        "</pre><h3>Target allocation</h3><p>"
+        f"{html.escape(target_text)}"
+        "</p><p>No prices or orders were used. Retry after the data provider publishes a completed session.</p>"
+        "</body></html>"
+    )
+    return text_body, html_body
+
+
 def build_email_html(run: StrategyRun, notification: NotificationDecision) -> str:
     plan = run.rebalance_plan
     contribution = run.contribution_plan
@@ -964,7 +1007,14 @@ def main() -> None:
     if args.send_dashboard_email:
         if args.test or any(value is not None for value in (args.executed_signal_date, args.contribution_budget, args.contribution_year)) or args.executed_shares:
             parser.error("--send-dashboard-email cannot be combined with other inputs")
-        run = run_strategy(args.roth_amount)
+        try:
+            run = run_strategy(args.roth_amount)
+        except RuntimeError as exc:
+            state = load_state()
+            dashboard, dashboard_html = build_unavailable_dashboard(state, str(exc))
+            send_email("ROTH IRA dashboard snapshot: valuation unavailable", dashboard, dashboard_html)
+            print("Dashboard email sent with a valuation-unavailable warning; no trades were recommended.")
+            return
         dashboard = build_dashboard(run)
         send_email(
             f"ROTH IRA dashboard snapshot ({run.session_date.date()})",
