@@ -9,7 +9,7 @@ Production is the static annual allocation:
 25% DBMF
 20% UGL
 15% ZROZ
-8% BTAL
+5% BTAL
 ```
 
 The engine does not use market signals. It does not inspect moving averages,
