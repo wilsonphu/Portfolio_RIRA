@@ -16,11 +16,11 @@ DECISION_SEMANTIC_REVISION = "static-annual-tqqq35-dbmf25-ugl20-zroz15-btal5-v1"
 MODEL_HISTORY_START = "2019-01-01"
 
 STATIC_WEIGHTS = {
-    TQQQ: 0.35,
-    DBMF: 0.25,
-    UGL: 0.20,
-    ZROZ: 0.15,
-    BTAL: 0.05,
+    TQQQ: 0.40,
+    DBMF: 0.32,
+    UGL: 0.15,
+    ZROZ: 0.05,
+    BTAL: 0.08,
 }
 
 ADVERTISED_DAILY_MULTIPLIERS = {
