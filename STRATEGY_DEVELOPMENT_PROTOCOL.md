@@ -5,11 +5,11 @@
 Production is the static annual allocation:
 
 ```text
-35% TQQQ
-25% DBMF
-20% UGL
-15% ZROZ
- 5% BTAL
+40% TQQQ
+32% DBMF
+15% UGL
+5% ZROZ
+ 8% BTAL
 ```
 
 The engine does not use market signals. It does not inspect moving averages,
