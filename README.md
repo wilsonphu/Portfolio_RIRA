@@ -9,11 +9,11 @@ annual contribution requires attention.
 
 | Holding | Target |
 |---|---:|
-| TQQQ | 40% |
-| DBMF | 32% |
-| UGL | 15% |
-| ZROZ | 5% |
-| BTAL | 8% |
+| TQQQ | 35% |
+| DBMF | 25% |
+| UGL | 20% |
+| ZROZ | 15% |
+| BTAL | 5% |
 
 The target is static for the full calendar year. There are no SMA, volatility,
 regime, deadband, lifecycle, or tactical signals. The first completed NYSE
